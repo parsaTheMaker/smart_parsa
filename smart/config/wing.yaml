@@ -10,7 +10,7 @@ hydra:
 
 wandb:
   project: "smart"
-  entity: "janha"
+  entity: "parsa-vatani99-technical-university-of-munich"
 
 experiment:
   name: "Wing"

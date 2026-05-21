@@ -28,6 +28,8 @@ dependencies:
   - tzdata=2025b=h78e105d_0
   - wheel=0.45.1=pyhd8ed1ab_1
   - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+      - -f https://data.pyg.org/whl/torch-2.6.0+cu124.html
       - aiohappyeyeballs==2.6.1
       - aiohttp==3.12.13
       - aiosignal==1.4.0
@@ -116,7 +118,7 @@ dependencies:
       - torchaudio==2.6.0+cu124
       - torchvision==0.21.0+cu124
       - tqdm==4.67.1
-      - triton==3.4.0
+      - triton==3.2.0
       - typing-extensions==4.12.2
       - typing-inspection==0.4.1
       - urllib3==2.5.0

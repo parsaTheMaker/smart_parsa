@@ -2,13 +2,15 @@ from data.shapenetcar_dataset import ShapeNetCarDataset
 from data.ahmedml_dataset import AhmedMLDataset
 from data.shiftsuv_dataset import ShiftSUVDataset
 from data.shiftwing_dataset import ShiftWingDataset
+from data.naca4_dataset import NACA4Dataset
 
 
 # Mapping of dataset names to their corresponding classes and properties
 datasets = {"ShapeNetCar": {"dataset": ShapeNetCarDataset, "spatial_dim": 3, "surf_channels": 1, "vol_channels": 3, "params_dim": 0, "fields": {"surface": ["pressure"], "volume": ["velocity_x", "velocity_y", "velocity_z"]}},
             "AhmedML": {"dataset": AhmedMLDataset, "spatial_dim": 3, "surf_channels": 1, "vol_channels": 3, "params_dim": 0, "fields": {"surface": ["pressure"], "volume": ["velocity_x", "velocity_y", "velocity_z"]}},
             "ShiftSUV": {"dataset": ShiftSUVDataset, "spatial_dim": 3, "surf_channels": 1, "vol_channels": 3, "params_dim": 0, "fields": {"surface": ["pressure"], "volume": ["velocity_x", "velocity_y", "velocity_z"]}},
-            "ShiftWing": {"dataset": ShiftWingDataset, "spatial_dim": 3, "surf_channels": 1, "vol_channels": 3, "params_dim": 2, "fields": {"surface": ["pressure"], "volume": ["velocity_x", "velocity_y", "velocity_z"]}}
+            "ShiftWing": {"dataset": ShiftWingDataset, "spatial_dim": 3, "surf_channels": 1, "vol_channels": 3, "params_dim": 2, "fields": {"surface": ["pressure"], "volume": ["velocity_x", "velocity_y", "velocity_z"]}},
+            "NACA4": {"dataset": NACA4Dataset, "spatial_dim": 2, "surf_channels": 3, "vol_channels": 4, "params_dim": 0, "fields": {"surface": ["pressure", "normal_x", "normal_y"], "volume": ["pressure", "sdf", "velocity_x", "velocity_y"]}}
            }
 
 
@@ -39,18 +41,18 @@ def get_dataset(config):
         vol_channels = datasets[dataset]["vol_channels"]
         params_dim = datasets[dataset]["params_dim"]
         fields = datasets[dataset]["fields"]
+        dataset_kwargs = dict(geometry_points=config.num_body_points,
+                              surface_points=config.num_surface_points,
+                              volume_points=config.num_volume_points,
+                              scale_positions=config.scale_positions)
+        if dataset == "NACA4":
+            dataset_kwargs["manifest_variant"] = getattr(config, "manifest_variant", "full")
         train_data = datasets[dataset]["dataset"](data_path,
                                                   if_test=False,
-                                                  geometry_points=config.num_body_points,
-                                                  surface_points=config.num_surface_points,
-                                                  volume_points=config.num_volume_points,
-                                                  scale_positions=config.scale_positions)
+                                                  **dataset_kwargs)
         test_data = datasets[dataset]["dataset"](data_path,
                                                  if_test=True,
-                                                 geometry_points=config.num_body_points,
-                                                 surface_points=config.num_surface_points,
-                                                 volume_points=config.num_volume_points,
-                                                 scale_positions=config.scale_positions)
+                                                 **dataset_kwargs)
         stats = [train_data.mean_surf_data, train_data.std_surf_data,
                 train_data.mean_vol_data, train_data.std_vol_data]
     else:
@@ -72,8 +74,10 @@ def prepare_dataset(config):
     print(f"Preparing dataset {dataset} stored at {data_path}")
 
     if dataset in datasets:
-        train_data = datasets[dataset]["dataset"](data_path, if_test=False, prepare_data=True, copy_to_node=False)
+        dataset_kwargs = dict(if_test=False, prepare_data=True, copy_to_node=False)
+        if dataset == "NACA4":
+            dataset_kwargs["manifest_variant"] = getattr(config, "manifest_variant", "full")
+        train_data = datasets[dataset]["dataset"](data_path, **dataset_kwargs)
         print(f"Dataset length: {len(train_data)}")
     else:
         raise ValueError(f"Unknown dataset ({config.dataset}) which is not supported!")
-    

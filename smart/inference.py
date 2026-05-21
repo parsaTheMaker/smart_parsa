@@ -13,6 +13,26 @@ from loss.losses import CombinedLoss
 from models.smart.smart import SMART
 
 
+def init_metric_dict(surface_fields, volume_fields):
+    metrics = {
+        "loss": 0.0,
+        "rel_l2": 0.0,
+        "rel_l2_surf": 0.0,
+        "rel_l2_vol": 0.0,
+    }
+    for field_name in surface_fields:
+        metrics[f"rel_l2_surf_{field_name}"] = 0.0
+    for field_name in volume_fields:
+        metrics[f"rel_l2_vol_{field_name}"] = 0.0
+    return metrics
+
+
+def accumulate_channel_metrics(metrics, prefix, pred, gt, field_names, rel_l2_loss_fn, batch_size):
+    for channel_idx, field_name in enumerate(field_names):
+        channel_loss = rel_l2_loss_fn(pred[..., channel_idx:channel_idx + 1], gt[..., channel_idx:channel_idx + 1])
+        metrics[f"{prefix}_{field_name}"] += channel_loss.item() * batch_size
+
+
 @hydra.main(version_base="1.2", config_path="config", config_name="car")
 def main(cfg: DictConfig):
     # Extract config
@@ -53,24 +73,22 @@ def main(cfg: DictConfig):
     std_vol = stats[3].to(device)
     
     # Extract one training sample for inspection
+    sample = train_data[0]
     if params_dim > 0:
-        sample_geo_mesh, sample_surf_mesh, sample_pressure, sample_vol_mesh, sample_velocity, params = train_data[0]
-        print("Sample geo_mesh shape:", sample_geo_mesh.shape)
-        print("Sample surf_mesh shape:", sample_surf_mesh.shape)
-        print("Sample pressure shape:", sample_pressure.shape)
-        print("Sample vol_mesh shape:", sample_vol_mesh.shape)
-        print("Sample velocity shape:", sample_velocity.shape)
-        print("Sample params shape:", params.shape)
+        sample_geo_mesh, sample_surf_mesh, sample_surf_data, sample_vol_mesh, sample_vol_data, params = sample
     else:
-        sample_geo_mesh, sample_surf_mesh, sample_pressure, sample_vol_mesh, sample_velocity = train_data[0]
-        print("Sample geo_mesh shape:", sample_geo_mesh.shape)
-        print("Sample surf_mesh shape:", sample_surf_mesh.shape)
-        print("Sample pressure shape:", sample_pressure.shape)
-        print("Sample vol_mesh shape:", sample_vol_mesh.shape)
-        print("Sample velocity shape:", sample_velocity.shape)
+        sample_geo_mesh, sample_surf_mesh, sample_surf_data, sample_vol_mesh, sample_vol_data = sample
+        params = None
+    print("Sample geo_mesh shape:", sample_geo_mesh.shape)
+    print("Sample surf_mesh shape:", sample_surf_mesh.shape)
+    print("Sample surface fields shape:", sample_surf_data.shape, "fields:", fields["surface"])
+    print("Sample vol_mesh shape:", sample_vol_mesh.shape)
+    print("Sample volume fields shape:", sample_vol_data.shape, "fields:", fields["volume"])
+    if params is not None:
+        print("Sample params shape:", params.shape)
     
     # Create model
-    models = {"SMART": (SMART, {"surface_channels": surf_channels, "volume_channels": vol_channels, "parameter_channels": params_dim})}
+    models = {"SMART": (SMART, {"spatial_dim": spatial_dim, "surface_channels": surf_channels, "volume_channels": vol_channels, "parameter_channels": params_dim})}
     
     if config.model_name in models:
         merged_kwargs = {**models[config.model_name][1], **config.architecture} if "architecture" in config else models[config.model_name][1]
@@ -93,10 +111,7 @@ def main(cfg: DictConfig):
     combined_loss_fn = CombinedLoss(loss_fn, fields)
     
     # Losses
-    test_losses = {"loss": 0, "rel_l2": 0,
-                    "rel_l2_surf": 0,  "rel_l2_vol": 0,
-                    "rel_l2_press": 0, "rel_l2_wall_shear_stress": 0,
-                    "rel_l2_velo": 0, "rel_l2_velo_x": 0, "rel_l2_velo_y": 0, "rel_l2_velo_z": 0}
+    test_losses = init_metric_dict(fields["surface"], fields["volume"])
 
     # Evaluation
     model.eval()
@@ -130,30 +145,22 @@ def main(cfg: DictConfig):
             gt_surf = surf_data * std_surf + mean_surf
             pred_vol = y_hat_vol[..., :] * std_vol + mean_vol
             gt_vol = vol_data * std_vol + mean_vol
-        
+
             # Metrics
             batch_size = surf_data.size(0)
-            
+
             # Combine loss
-            test_losses["loss"] += combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data).item() * batch_size
-            test_losses["rel_l2_surf"] += rel_l2_loss_fn(y_hat_surf, surf_data).item() * batch_size
-            test_losses["rel_l2_vol"] += rel_l2_loss_fn(y_hat_vol, vol_data).item() * batch_size
-            test_losses["rel_l2"] += test_losses["rel_l2_surf"] + test_losses["rel_l2_vol"]
-            
-            # Surface
-            if fields["surface"] == ["pressure"]:
-                test_losses["rel_l2_press"] += rel_l2_loss_fn(pred_surf, gt_surf).item() * batch_size
-            elif fields["surface"] == ["pressure", "wall_shear_stress_x", "wall_shear_stress_y", "wall_shear_stress_z"]:
-                test_losses["rel_l2_press"] += rel_l2_loss_fn(pred_surf[..., 0:1], gt_surf[..., 0:1]).item() * batch_size
-                test_losses["rel_l2_wall_shear_stress"] += rel_l2_loss_fn(pred_surf[..., 1:], gt_surf[..., 1:]).item() * batch_size
-            else:
-                raise ValueError("Unsupported fields for loss computation.")
-                
-            # Velocity
-            test_losses["rel_l2_velo"] += rel_l2_loss_fn(pred_vol, gt_vol).item() * batch_size
-            test_losses["rel_l2_velo_x"] += rel_l2_loss_fn(pred_vol[..., 0:1], gt_vol[..., 0:1]).item() * batch_size
-            test_losses["rel_l2_velo_y"] += rel_l2_loss_fn(pred_vol[..., 1:2], gt_vol[..., 1:2]).item() * batch_size
-            test_losses["rel_l2_velo_z"] += rel_l2_loss_fn(pred_vol[..., 2:3], gt_vol[..., 2:3]).item() * batch_size
+            batch_loss = combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data)
+            test_losses["loss"] += batch_loss.item() * batch_size
+
+            surface_rel_l2 = rel_l2_loss_fn(y_hat_surf, surf_data)
+            volume_rel_l2 = rel_l2_loss_fn(y_hat_vol, vol_data)
+            test_losses["rel_l2_surf"] += surface_rel_l2.item() * batch_size
+            test_losses["rel_l2_vol"] += volume_rel_l2.item() * batch_size
+            test_losses["rel_l2"] += (surface_rel_l2 + volume_rel_l2).item() * batch_size
+
+            accumulate_channel_metrics(test_losses, "rel_l2_surf", pred_surf, gt_surf, fields["surface"], rel_l2_loss_fn, batch_size)
+            accumulate_channel_metrics(test_losses, "rel_l2_vol", pred_vol, gt_vol, fields["volume"], rel_l2_loss_fn, batch_size)
 
         t2 = default_timer()
         print(f"Inference time: {t2 - t1} seconds")

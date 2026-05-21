@@ -8,7 +8,60 @@ from lion_pytorch import Lion
 from omegaconf import OmegaConf
 import os
 import json
+import re
 
+
+def _slugify(text):
+    text = str(text).strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    text = re.sub(r"-+", "-", text).strip("-")
+    return text or "run"
+
+
+def _join_nonempty(parts):
+    return "-".join(_slugify(part) for part in parts if part not in (None, "", []))
+
+
+def infer_fields_from_config(config):
+    dataset = getattr(config, "dataset", None)
+    if dataset == "NACA4":
+        return {"surface": ["pressure", "normal_x", "normal_y"], "volume": ["pressure", "sdf", "velocity_x", "velocity_y"]}
+    if dataset in {"ShapeNetCar", "AhmedML", "ShiftSUV"}:
+        return {"surface": ["pressure"], "volume": ["velocity_x", "velocity_y", "velocity_z"]}
+    if dataset == "ShiftWing":
+        return {"surface": ["pressure"], "volume": ["velocity_x", "velocity_y", "velocity_z"]}
+    return None
+
+
+def get_field_tag(fields):
+    if not fields:
+        return None
+    surface = fields.get("surface", [])
+    volume = fields.get("volume", [])
+    surface_tag = "+".join([
+        field.replace("velocity_", "v").replace("normal_", "n").replace("pressure", "p").replace("sdf", "sdf")
+        for field in surface
+    ])
+    volume_tag = "+".join([
+        field.replace("velocity_", "v").replace("normal_", "n").replace("pressure", "p").replace("sdf", "sdf")
+        for field in volume
+    ])
+    return f"s-{surface_tag}-v-{volume_tag}"
+
+
+def get_run_name(config, fields=None):
+    variant = getattr(config, "manifest_variant", None)
+    parts = [
+        config.model_name,
+        getattr(config, "dataset", None),
+        variant if variant and variant != "full" else None,
+        f"s{getattr(config, 'random_seed', 'na')}",
+    ]
+    return _join_nonempty(parts)
+
+
+def get_output_run_name(config, fields=None):
+    return get_run_name(config, fields)
 
 def initialize_gpu(random_seed, high_precision=True):
     """Initializes the GPU settings and sets the random seed."""
@@ -31,11 +84,25 @@ def initialize_gpu(random_seed, high_precision=True):
 
 def initialize_wandb(config, wandb_config, model_files=[]):
     """Initializes wandb with the given config."""
-    
-    run = wandb.init(name=f"{config.model_name}_seed{config.random_seed}",
-                    project=wandb_config.project,
-                    entity=wandb_config.entity,
-                    tags=[f"seed_{config.random_seed}", config.dataset, config.model_name])
+
+    fields = getattr(config, "fields", None) or infer_fields_from_config(config)
+    run_name = get_run_name(config, fields)
+    tags = [
+        f"seed_{config.random_seed}",
+        getattr(config, "dataset", "unknown"),
+        getattr(config, "model_name", "unknown"),
+    ]
+    if getattr(config, "manifest_variant", None) and getattr(config, "manifest_variant", "full") != "full":
+        tags.append(f"variant_{config.manifest_variant}")
+    if fields:
+        tags.append(f"fields_{get_field_tag(fields)}")
+
+    run = wandb.init(
+        name=run_name,
+        project=wandb_config.project,
+        entity=wandb_config.entity,
+        tags=tags,
+    )
     
     # Add config to wandb
     wandb.config.update(OmegaConf.to_container(config, resolve=True, throw_on_missing=True))
@@ -57,13 +124,18 @@ def initialize_wandb(config, wandb_config, model_files=[]):
 
 def get_model_checkpoint_name(config):
     """Returns the model checkpoint name based on the config."""
-    
+
     if not os.path.exists("checkpoints"):
         os.makedirs("checkpoints")
-    model_name = f"{config.model_name}_{config.model_tag}" if config.model_tag else config.model_name
-    model_checkpoint_name = f"{model_name}_seed_{config.random_seed}_dataset_{config.dataset}"
-    
-    return model_checkpoint_name
+    variant = getattr(config, "manifest_variant", None)
+    parts = [
+        config.model_name,
+        getattr(config, "model_tag", None) if getattr(config, "model_tag", "") else None,
+        getattr(config, "dataset", None),
+        variant if variant and variant != "full" else None,
+        f"s{getattr(config, 'random_seed', 'na')}",
+    ]
+    return _join_nonempty(parts)
 
 
 def count_model_params(model):
@@ -81,7 +153,7 @@ def count_model_params(model):
 
 
 def exclude_params_from_weight_decay(model,
-                                     exclude=["bias", "filter_bias", "norm", "query_pos", "modulation_weight", "B"],
+                                     exclude=["bias", "filter_bias", "norm", "query_pos", "modulation_weight", "B", "hash", "table"],
                                      verbose=False):
     """Excludes the given parameters from the weight decay."""
     

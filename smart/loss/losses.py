@@ -29,39 +29,20 @@ class RelL2Loss():
 
 
 class CombinedLoss():
-    """Computes a combined loss by summing over independent losses for the surface and volume fields.
-    
-    Args:
-        loss_fn: Loss function to be used for both surface and volume fields.
-        fields: Dictionary specifying the fields present in the dataset.
+    """Computes a combined loss by summing the surface and volume losses.
+
+    The loss function is applied to the full surface tensor and the full volume
+    tensor. This keeps the training objective consistent even when the dataset
+    has multiple channels per field group (for example NACA4 now has surface
+    pressure + normals and volume pressure + sdf + velocity).
     """
-    
+
     def __init__(self, loss_fn, fields):
         self.loss_fn = loss_fn
         self.fields = fields
-    
+
     def __call__(self, y_hat_surf, y_hat_vol, y_surf, y_vol):
-        """Computes the combined loss by summing over independent losses for surface and volume fields.
-        
-        Args:
-            y_hat_surf: Predicted surface data tensor.
-            y_hat_vol: Predicted volume data tensor.
-            y_surf: Ground truth surface data tensor.
-            y_vol: Ground truth volume data tensor.
-            
-        Returns:
-            torch.Tensor: The combined loss value.
-        """
-        if self.fields["surface"] == ["pressure"]:
-            loss_press = self.loss_fn(y_hat_surf, y_surf)
-            loss_velo = self.loss_fn(y_hat_vol, y_vol)
-            loss = loss_velo + loss_press
-        elif self.fields["surface"] == ["pressure", "wall_shear_stress_x", "wall_shear_stress_y", "wall_shear_stress_z"]:
-            loss_press = self.loss_fn(y_hat_surf[..., 0:1], y_surf[..., 0:1])
-            loss_wss = self.loss_fn(y_hat_surf[..., 1:4], y_surf[..., 1:4])
-            loss_velo = self.loss_fn(y_hat_vol[..., :], y_vol)
-            loss = loss_velo + loss_press + loss_wss
-        else:
-            raise ValueError("Unsupported fields for loss computation.")
-        
-        return loss
+        """Compute the combined surface and volume loss."""
+        loss_surf = self.loss_fn(y_hat_surf, y_surf)
+        loss_vol = self.loss_fn(y_hat_vol, y_vol)
+        return loss_surf + loss_vol

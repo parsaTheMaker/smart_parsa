@@ -1,10 +1,12 @@
 import hydra
 from omegaconf import DictConfig
 
+import os
 import torch
 import numpy as np
 import wandb
 from timeit import default_timer
+from tqdm.auto import tqdm
 
 # Dataset and loss functions
 from data.datasets import get_dataset
@@ -13,6 +15,26 @@ from loss.losses import CombinedLoss
 
 # SMART Model
 from models.smart.smart import SMART
+
+
+def init_metric_dict(surface_fields, volume_fields):
+    metrics = {
+        "loss": 0.0,
+        "rel_l2": 0.0,
+        "rel_l2_surf": 0.0,
+        "rel_l2_vol": 0.0,
+    }
+    for field_name in surface_fields:
+        metrics[f"rel_l2_surf_{field_name}"] = 0.0
+    for field_name in volume_fields:
+        metrics[f"rel_l2_vol_{field_name}"] = 0.0
+    return metrics
+
+
+def accumulate_channel_metrics(metrics, prefix, pred, gt, field_names, rel_l2_loss_fn, batch_size):
+    for channel_idx, field_name in enumerate(field_names):
+        channel_loss = rel_l2_loss_fn(pred[..., channel_idx:channel_idx + 1], gt[..., channel_idx:channel_idx + 1])
+        metrics[f"{prefix}_{field_name}"] += channel_loss.item() * batch_size
 
 
 @hydra.main(version_base="1.2", config_path="config", config_name="car")
@@ -53,24 +75,22 @@ def main(cfg: DictConfig):
     std_vol = stats[3].to(device)
     
     # Extract one training sample for inspection
+    sample = train_data[0]
     if params_dim > 0:
-        sample_geo_mesh, sample_surf_mesh, sample_pressure, sample_vol_mesh, sample_velocity, params = train_data[0]
-        print("Sample geo_mesh shape:", sample_geo_mesh.shape)
-        print("Sample surf_mesh shape:", sample_surf_mesh.shape)
-        print("Sample pressure shape:", sample_pressure.shape)
-        print("Sample vol_mesh shape:", sample_vol_mesh.shape)
-        print("Sample velocity shape:", sample_velocity.shape)
-        print("Sample params shape:", params.shape)
+        sample_geo_mesh, sample_surf_mesh, sample_surf_data, sample_vol_mesh, sample_vol_data, params = sample
     else:
-        sample_geo_mesh, sample_surf_mesh, sample_pressure, sample_vol_mesh, sample_velocity = train_data[0]
-        print("Sample geo_mesh shape:", sample_geo_mesh.shape)
-        print("Sample surf_mesh shape:", sample_surf_mesh.shape)
-        print("Sample pressure shape:", sample_pressure.shape)
-        print("Sample vol_mesh shape:", sample_vol_mesh.shape)
-        print("Sample velocity shape:", sample_velocity.shape)
+        sample_geo_mesh, sample_surf_mesh, sample_surf_data, sample_vol_mesh, sample_vol_data = sample
+        params = None
+    print("Sample geo_mesh shape:", sample_geo_mesh.shape)
+    print("Sample surf_mesh shape:", sample_surf_mesh.shape)
+    print("Sample surface fields shape:", sample_surf_data.shape, "fields:", fields["surface"])
+    print("Sample vol_mesh shape:", sample_vol_mesh.shape)
+    print("Sample volume fields shape:", sample_vol_data.shape, "fields:", fields["volume"])
+    if params is not None:
+        print("Sample params shape:", params.shape)
     
     # Create model
-    models = {"SMART": (SMART, {"surface_channels": surf_channels, "volume_channels": vol_channels, "parameter_channels": params_dim})}
+    models = {"SMART": (SMART, {"spatial_dim": spatial_dim, "surface_channels": surf_channels, "volume_channels": vol_channels, "parameter_channels": params_dim})}
     
     if config.model_name in models:
         merged_kwargs = {**models[config.model_name][1], **config.architecture} if "architecture" in config else models[config.model_name][1]
@@ -94,72 +114,19 @@ def main(cfg: DictConfig):
         
     # Training loop
     loss_test_min = np.inf
-    for ep in range(config.epochs):
-        t1 = default_timer()
-        train_losses = {"loss": 0, "rel_l2_vol": 0, "rel_l2_surf": 0}
-        test_losses = {"loss": 0, "rel_l2": 0,
-                       "rel_l2_surf": 0,  "rel_l2_vol": 0,
-                       "rel_l2_press": 0, "rel_l2_wall_shear_stress": 0,
-                       "rel_l2_velo": 0, "rel_l2_velo_x": 0, "rel_l2_velo_y": 0, "rel_l2_velo_z": 0}
+    global_step = 0
+    log_every_n_steps = getattr(config, "log_every_n_steps", 10)
+    interrupted = False
 
-        model.train()
-        for batch in train_loader:
-            # b, n, c
-            if params_dim > 0:
-                geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params = batch
-                params = params.to(device)
-            else:
-                geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data = batch
-                params = None
-            
-            # Move to device
-            geo_mesh = geo_mesh.to(device)
-            surf_mesh = surf_mesh.to(device)
-            surf_data = surf_data.to(device)
-            vol_mesh = vol_mesh.to(device)
-            vol_data = vol_data.to(device)
-            
-            # Forward pass
-            optimizer.zero_grad()
-            
-            if amp:
-                with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=True):
-                    y_hat_surf, y_hat_vol = model(geo_mesh, surf_mesh, vol_mesh, params)
-                
-                    # Rel l2 loss
-                    loss = combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data)
+    try:
+        for ep in tqdm(range(config.epochs), desc="Epochs", dynamic_ncols=True):
+            t1 = default_timer()
+            train_losses = init_metric_dict(fields["surface"], fields["volume"])
+            test_losses = init_metric_dict(fields["surface"], fields["volume"])
 
-                    scaler.scale(loss).backward()
-                    scaler.step(optimizer)
-                    scaler.update()
-                    scheduler.step()
-            else:
-                y_hat_surf, y_hat_vol = model(geo_mesh, surf_mesh, vol_mesh, params)
-                
-                # Rel l2 loss
-                loss = combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data)
-                loss.backward()
-                
-                # Gradient clipping
-                if gradient_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
-                
-                optimizer.step()
-                scheduler.step()
-
-            # Metrics
-            batch_size = surf_data.size(0)
-            train_losses["loss"] += loss.item() * batch_size
-            with torch.no_grad():
-                surface_loss = rel_l2_loss_fn(y_hat_surf, surf_data)
-                volume_loss = rel_l2_loss_fn(y_hat_vol, vol_data)
-                train_losses["rel_l2_surf"] += surface_loss.item() * batch_size
-                train_losses["rel_l2_vol"] += volume_loss.item() * batch_size
-                
-        # Evaluation
-        model.eval()
-        with torch.no_grad():
-            for batch in test_loader:
+            model.train()
+            train_pbar = tqdm(train_loader, desc=f"Train {ep + 1}/{config.epochs}", leave=False, dynamic_ncols=True)
+            for batch_idx, batch in enumerate(train_pbar):
                 # b, n, c
                 if params_dim > 0:
                     geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params = batch
@@ -167,50 +134,112 @@ def main(cfg: DictConfig):
                 else:
                     geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data = batch
                     params = None
-                
+
                 # Move to device
                 geo_mesh = geo_mesh.to(device)
                 surf_mesh = surf_mesh.to(device)
                 surf_data = surf_data.to(device)
                 vol_mesh = vol_mesh.to(device)
                 vol_data = vol_data.to(device)
-                
+
                 # Forward pass
+                optimizer.zero_grad()
+
                 if amp:
                     with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=True):
                         y_hat_surf, y_hat_vol = model(geo_mesh, surf_mesh, vol_mesh, params)
+
+                        # Rel l2 loss
+                        loss = combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data)
+
+                        scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+                        scheduler.step()
                 else:
                     y_hat_surf, y_hat_vol = model(geo_mesh, surf_mesh, vol_mesh, params)
-                
-                # Denormalize
-                pred_surf = y_hat_surf[..., :] * std_surf + mean_surf
-                gt_surf = surf_data * std_surf + mean_surf
-                pred_vol = y_hat_vol[..., :] * std_vol + mean_vol
-                gt_vol = vol_data * std_vol + mean_vol
-            
+
+                    # Rel l2 loss
+                    loss = combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data)
+                    loss.backward()
+
+                    # Gradient clipping
+                    if gradient_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
+
+                    optimizer.step()
+                    scheduler.step()
+
                 # Metrics
                 batch_size = surf_data.size(0)
-                
-                # Combine loss
-                test_losses["loss"] += combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data).item() * batch_size
-                test_losses["rel_l2_surf"] += rel_l2_loss_fn(y_hat_surf, surf_data).item() * batch_size
-                test_losses["rel_l2_vol"] += rel_l2_loss_fn(y_hat_vol, vol_data).item() * batch_size
-                test_losses["rel_l2"] += test_losses["rel_l2_surf"] + test_losses["rel_l2_vol"]
-                
-                # Surface
-                if fields["surface"] == ["pressure"]:
-                    test_losses["rel_l2_press"] += rel_l2_loss_fn(pred_surf, gt_surf).item() * batch_size
-                elif fields["surface"] == ["pressure", "wall_shear_stress_x", "wall_shear_stress_y", "wall_shear_stress_z"]:
-                    test_losses["rel_l2_press"] += rel_l2_loss_fn(pred_surf[..., 0:1], gt_surf[..., 0:1]).item() * batch_size
-                    test_losses["rel_l2_wall_shear_stress"] += rel_l2_loss_fn(pred_surf[..., 1:], gt_surf[..., 1:]).item() * batch_size
-                else:
-                    raise ValueError("Unsupported fields for loss computation.")
-                    
-                # Velocity
-                test_losses["rel_l2_velo"] += rel_l2_loss_fn(pred_vol, gt_vol).item() * batch_size
-                test_losses["rel_l2_velo_x"] += rel_l2_loss_fn(pred_vol[..., 0:1], gt_vol[..., 0:1]).item() * batch_size
-                test_losses["rel_l2_velo_y"] += rel_l2_loss_fn(pred_vol[..., 1:2], gt_vol[..., 1:2]).item() * batch_size
-                test_losses["rel_l2_velo_z"] += rel_l2_loss_fn(pred_vol[..., 2:3], gt_vol[..., 2:3]).item() * batch_size
+                train_losses["loss"] += loss.item() * batch_size
+                with torch.no_grad():
+                    surface_loss = rel_l2_loss_fn(y_hat_surf, surf_data)
+                    volume_loss = rel_l2_loss_fn(y_hat_vol, vol_data)
+                    train_losses["rel_l2_surf"] += surface_loss.item() * batch_size
+                    train_losses["rel_l2_vol"] += volume_loss.item() * batch_size
+                    train_losses["rel_l2"] += (surface_loss + volume_loss).item() * batch_size
+
+                global_step += 1
+                if batch_idx % log_every_n_steps == 0 or batch_idx == len(train_loader) - 1:
+                    wandb.log({
+                        "train/batch_loss": loss.item(),
+                        "train/batch_rel_l2": (surface_loss + volume_loss).item(),
+                        "lr": scheduler.get_last_lr()[0],
+                        "epoch": ep,
+                    }, step=global_step)
+                    train_pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
+
+            # Evaluation
+            model.eval()
+            test_pbar = tqdm(test_loader, desc=f"Eval  {ep + 1}/{config.epochs}", leave=False, dynamic_ncols=True)
+            with torch.no_grad():
+                for batch in test_pbar:
+                    # b, n, c
+                    if params_dim > 0:
+                        geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params = batch
+                        params = params.to(device)
+                    else:
+                        geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data = batch
+                        params = None
+
+                    # Move to device
+                    geo_mesh = geo_mesh.to(device)
+                    surf_mesh = surf_mesh.to(device)
+                    surf_data = surf_data.to(device)
+                    vol_mesh = vol_mesh.to(device)
+                    vol_data = vol_data.to(device)
+
+                    # Forward pass
+                    if amp:
+                        with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=True):
+                            y_hat_surf, y_hat_vol = model(geo_mesh, surf_mesh, vol_mesh, params)
+                    else:
+                        y_hat_surf, y_hat_vol = model(geo_mesh, surf_mesh, vol_mesh, params)
+
+                    # Denormalize
+                    pred_surf = y_hat_surf[..., :] * std_surf + mean_surf
+                    gt_surf = surf_data * std_surf + mean_surf
+                    pred_vol = y_hat_vol[..., :] * std_vol + mean_vol
+                    gt_vol = vol_data * std_vol + mean_vol
+
+                    # Metrics
+                    batch_size = surf_data.size(0)
+
+                    # Combine loss
+                    batch_loss = combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data)
+                    test_losses["loss"] += batch_loss.item() * batch_size
+
+                    surface_rel_l2 = rel_l2_loss_fn(y_hat_surf, surf_data)
+                    volume_rel_l2 = rel_l2_loss_fn(y_hat_vol, vol_data)
+                    test_losses["rel_l2_surf"] += surface_rel_l2.item() * batch_size
+                    test_losses["rel_l2_vol"] += volume_rel_l2.item() * batch_size
+                    test_losses["rel_l2"] += (surface_rel_l2 + volume_rel_l2).item() * batch_size
+
+                    accumulate_channel_metrics(test_losses, "rel_l2_surf", pred_surf, gt_surf, fields["surface"], rel_l2_loss_fn, batch_size)
+                    accumulate_channel_metrics(test_losses, "rel_l2_vol", pred_vol, gt_vol, fields["volume"], rel_l2_loss_fn, batch_size)
+
+                    test_pbar.set_postfix(loss=f"{batch_loss.item():.4f}")
 
             # Divide by total number of samples to get mean
             for loss_name in train_losses.keys():
@@ -228,8 +257,9 @@ def main(cfg: DictConfig):
                     "scheduler_state_dict": scheduler.state_dict(),
                     "loss": test_losses["loss"],
                     "rel_l2_loss": test_losses["rel_l2"],
-                    "rel_l2_press": test_losses["rel_l2_press"],
-                    "rel_l2_velo": test_losses["rel_l2_velo"]
+                    "surface_fields": fields["surface"],
+                    "volume_fields": fields["volume"],
+                    "metric_values": {k: v for k, v in test_losses.items() if k.startswith("rel_l2")},
                     }, "checkpoints/" + model_checkpoint_name + "_best.pt")
             # Store last run
             torch.save({
@@ -239,24 +269,44 @@ def main(cfg: DictConfig):
                 "scheduler_state_dict": scheduler.state_dict(),
                 "loss": test_losses["loss"],
                 "rel_l2_loss": test_losses["rel_l2"],
-                "rel_l2_press": test_losses["rel_l2_press"],
-                "rel_l2_velo": test_losses["rel_l2_velo"]
+                "surface_fields": fields["surface"],
+                "volume_fields": fields["volume"],
+                "metric_values": {k: v for k, v in test_losses.items() if k.startswith("rel_l2")},
                 }, "checkpoints/" + model_checkpoint_name + "_last.pt")
-                
-        t2 = default_timer()
-        print(f"epoch: {ep}, t2-t1 (epoch time): {t2-t1:.5f}, train loss: {train_losses['loss']:.5f}, test loss: {test_losses['loss']:.5f}")
-        wandb_dict = {"lr": scheduler.get_last_lr()[0]}
-        
-        wandb_dict.update({f"train/{key}": value for key, value in train_losses.items() if value != 0.0})
-        wandb_dict.update({f"test/{key}": value for key, value in test_losses.items() if value != 0.0})
-        wandb.log(wandb_dict)
 
-    # Save model weights
-    artifact = wandb.Artifact("model", type="model")
-    artifact.add_file("checkpoints/" + model_checkpoint_name + "_best.pt")
-    artifact.add_file("checkpoints/" + model_checkpoint_name + "_last.pt")
-    run.log_artifact(artifact)
-    run.finish()
+            t2 = default_timer()
+            print(f"epoch: {ep}, t2-t1 (epoch time): {t2-t1:.5f}, train loss: {train_losses['loss']:.5f}, test loss: {test_losses['loss']:.5f}")
+            wandb_dict = {"lr": scheduler.get_last_lr()[0]}
+
+            wandb_dict.update({f"train/{key}": value for key, value in train_losses.items() if value != 0.0})
+            wandb_dict.update({f"test/{key}": value for key, value in test_losses.items() if value != 0.0})
+            wandb.log(wandb_dict, step=global_step)
+
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nTraining interrupted by user (Ctrl+C). Saving current state and exiting cleanly...")
+        try:
+            emergency_state = {
+                "epoch": locals().get("ep", -1),
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
+            }
+            torch.save(emergency_state, "checkpoints/" + model_checkpoint_name + "_last.pt")
+            print("Saved the latest checkpoint before exiting.")
+        except Exception as exc:
+            print(f"Could not save an emergency checkpoint: {exc}")
+    finally:
+        best_ckpt = os.path.join("checkpoints", model_checkpoint_name + "_best.pt")
+        last_ckpt = os.path.join("checkpoints", model_checkpoint_name + "_last.pt")
+        if os.path.isfile(best_ckpt) or os.path.isfile(last_ckpt):
+            artifact = wandb.Artifact("model", type="model")
+            if os.path.isfile(best_ckpt):
+                artifact.add_file(best_ckpt)
+            if os.path.isfile(last_ckpt):
+                artifact.add_file(last_ckpt)
+            run.log_artifact(artifact)
+        run.finish()
 
 
 if __name__ == "__main__":

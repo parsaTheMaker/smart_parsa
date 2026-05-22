@@ -26,7 +26,7 @@ from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 
 from data.naca4_dataset import NACA4Dataset
-from models.smart.cat import CAT
+from models.smart.cat import CAT, LoopEncoder
 from utils.utils import get_model_checkpoint_name
 
 
@@ -331,39 +331,66 @@ def save_overview_figure(
     plt.close(fig)
 
 
-def predict_stage1_chunked(
+def build_stage1_cache(model: CAT, geo_norm: torch.Tensor):
+    n_pts = geo_norm.shape[1]
+    anchor_idx = LoopEncoder._sample_anchor_idx(n_pts, model.geometry_encoder.anchors, geo_norm.device)
+    latents, anchor_pos, _ = model.encode_geometry(geo_norm, anchor_idx=anchor_idx)
+    return latents, anchor_pos
+
+
+def build_stage2_cache(model: CAT, geo_norm: torch.Tensor):
+    n_pts = geo_norm.shape[1]
+    anchor_idx = LoopEncoder._sample_anchor_idx(n_pts, model.surface_encoder.anchors, geo_norm.device)
+    latents, anchor_pos, _ = model.encode_surface(geo_norm, anchor_idx=anchor_idx)
+    return latents, anchor_pos
+
+
+def build_stage3_cache(model: CAT, geo_norm: torch.Tensor):
+    n_pts = geo_norm.shape[1]
+    anchor_idx = LoopEncoder._sample_anchor_idx(n_pts, model.geometry_encoder.anchors, geo_norm.device)
+    geom_latents, anchor_pos, _ = model.encode_geometry(geo_norm, anchor_idx=anchor_idx)
+    surf_latents, _, _ = model.encode_surface(geo_norm, anchor_idx=anchor_idx)
+    fused_latents = model.fusion(geom_latents, surf_latents, anchor_pos)
+    return fused_latents, anchor_pos
+
+
+def predict_stage1_chunked_cached(
     model: CAT,
-    geo_norm: torch.Tensor,
+    stage1_cache,
     query_points_norm: torch.Tensor,
     chunk_size: int,
     device: torch.device,
 ) -> torch.Tensor:
+    latents, anchor_pos = stage1_cache
     outputs: List[torch.Tensor] = []
     for start, end in chunk_indices(query_points_norm.shape[0], chunk_size):
         chunk = query_points_norm[start:end].to(device).unsqueeze(0)
-        pred = model.forward_stage1(geo_norm, chunk)
+        q = model.stage1_decoder(model._scale(chunk), latents, anchor_pos)
+        pred = model.stage1_head(q)
         outputs.append(pred[0].detach().cpu())
     return torch.cat(outputs, dim=0) if outputs else query_points_norm.new_empty((0, 3))
 
 
-def predict_stage2_chunked(
+def predict_stage2_chunked_cached(
     model: CAT,
-    geo_norm: torch.Tensor,
+    stage2_cache,
     query_points_norm: torch.Tensor,
     chunk_size: int,
     device: torch.device,
 ) -> torch.Tensor:
+    latents, anchor_pos = stage2_cache
     outputs: List[torch.Tensor] = []
     for start, end in chunk_indices(query_points_norm.shape[0], chunk_size):
         chunk = query_points_norm[start:end].to(device).unsqueeze(0)
-        pred = model.forward_stage2(geo_norm, chunk)
+        q = model.stage2_decoder(model._scale(chunk), latents, anchor_pos)
+        pred = model.stage2_head(q)
         outputs.append(pred[0].detach().cpu())
     return torch.cat(outputs, dim=0) if outputs else query_points_norm.new_empty((0, 1))
 
 
-def predict_stage3_chunked(
+def predict_stage3_chunked_cached(
     model: CAT,
-    geo_norm: torch.Tensor,
+    stage3_cache,
     query_points_norm: torch.Tensor,
     chunk_size: int,
     device: torch.device,
@@ -371,10 +398,12 @@ def predict_stage3_chunked(
     if query_points_norm.numel() == 0:
         return query_points_norm.new_empty((0, len(VOLUME_FIELDS)))
 
+    fused_latents, anchor_pos = stage3_cache
     outputs: List[torch.Tensor] = []
     for start, end in chunk_indices(query_points_norm.shape[0], chunk_size):
         chunk = query_points_norm[start:end].to(device).unsqueeze(0)
-        pred = model.inference_stage3(geo_norm, chunk)
+        q = model.stage3_decoder(model._scale(chunk), fused_latents, anchor_pos)
+        pred = model.stage3_head(q)
         outputs.append(pred[0].detach().cpu())
     return torch.cat(outputs, dim=0)
 
@@ -507,7 +536,8 @@ def main():
 
                     input_norm = to_model_positions(input_points, dataset.min_pos, dataset.max_pos).to(device).unsqueeze(0)
                     query_norm = to_model_positions(query_points, dataset.min_pos, dataset.max_pos)
-                    pred_norm = predict_stage1_chunked(model, input_norm, query_norm, query_chunk_size, device)
+                    stage1_cache = build_stage1_cache(model, input_norm)
+                    pred_norm = predict_stage1_chunked_cached(model, stage1_cache, query_norm, query_chunk_size, device)
 
                     surf_pred = pred_norm[: surf_xy.shape[0], :2]
                     vol_pred = pred_norm[surf_xy.shape[0] :, 2:3]
@@ -612,7 +642,8 @@ def main():
 
                     input_norm = to_model_positions(input_points, dataset.min_pos, dataset.max_pos).to(device).unsqueeze(0)
                     query_norm = to_model_positions(surf_xy, dataset.min_pos, dataset.max_pos)
-                    pred_norm = predict_stage2_chunked(model, input_norm, query_norm, query_chunk_size, device)
+                    stage2_cache = build_stage2_cache(model, input_norm)
+                    pred_norm = predict_stage2_chunked_cached(model, stage2_cache, query_norm, query_chunk_size, device)
                     surf_pred = pred_norm * dataset.std_surf_data[0:1] + dataset.mean_surf_data[0:1]
                     surf_pred = surf_pred.numpy()
                     surf_gt_np = surf_gt.numpy()
@@ -678,7 +709,8 @@ def main():
 
                     input_norm = to_model_positions(input_points, dataset.min_pos, dataset.max_pos).to(device).unsqueeze(0)
                     query_norm = to_model_positions(vol_xy, dataset.min_pos, dataset.max_pos)
-                    pred_norm = predict_stage3_chunked(model, input_norm, query_norm, query_chunk_size, device)
+                    stage3_cache = build_stage3_cache(model, input_norm)
+                    pred_norm = predict_stage3_chunked_cached(model, stage3_cache, query_norm, query_chunk_size, device)
                     vol_pred = pred_norm * dataset.std_vol_data + dataset.mean_vol_data
                     vol_pred = vol_pred.numpy()
                     vol_gt_np = vol_gt.numpy()

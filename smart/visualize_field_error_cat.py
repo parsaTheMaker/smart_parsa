@@ -104,14 +104,11 @@ def sample_indices(n: int, k: int, generator: torch.Generator, disjoint_from: to
         candidate = torch.where(mask)[0]
         if candidate.numel() == 0:
             return torch.randint(0, n, (k,), generator=generator)
-        if k <= candidate.numel():
-            perm = torch.randperm(candidate.numel(), generator=generator)[:k]
-            return candidate[perm]
-        repl = candidate[torch.randint(0, candidate.numel(), (k,), generator=generator)]
-        return repl
+        # Pure random subsampling with replacement from the admissible set.
+        pick = torch.randint(0, candidate.numel(), (k,), generator=generator)
+        return candidate[pick]
 
-    if k <= n:
-        return torch.randperm(n, generator=generator)[:k]
+    # Pure random subsampling with replacement.
     return torch.randint(0, n, (k,), generator=generator)
 
 
@@ -286,12 +283,13 @@ def save_overview_figure(
     title: str,
     rows: Sequence[Tuple[str, str, np.ndarray, np.ndarray, np.ndarray]],
     roi: Sequence[float],
+    meta_line: str = "",
 ):
     n_rows = len(rows)
     fig, axes = plt.subplots(n_rows, 4, figsize=(20, 4.8 * n_rows), constrained_layout=True)
     if n_rows == 1:
         axes = np.expand_dims(axes, axis=0)
-    fig.suptitle(title, fontsize=15)
+    fig.suptitle(title + (f"\n{meta_line}" if meta_line else ""), fontsize=15)
 
     for row_idx, (group_name, field_name, xy, gt, pred) in enumerate(rows):
         abs_err = np.abs(pred - gt)
@@ -494,6 +492,8 @@ def main():
                 case_dir = out_root / f"case_{case_id}"
                 case_dir.mkdir(parents=True, exist_ok=True)
 
+                train_pts = (f"train: geo={int(config.num_body_points)}, surf={int(config.num_surface_points)}, vol={int(config.num_volume_points)}")
+
                 if stage == 1:
                     s_in = int(getattr(config, "stage1_surface_input_points", config.num_body_points))
 
@@ -518,6 +518,8 @@ def main():
                     vol_pred = vol_pred.numpy()
                     surf_gt_np = surf_gt.numpy()
                     vol_gt_np = vol_gt.numpy()
+                    infer_pts = f"infer(stage1): encoder_in={input_points.shape[0]}, surf_q={surf_xy.shape[0]}, vol_q={vol_xy.shape[0]}"
+                    meta_line = train_pts + " | " + infer_pts
 
                     rows = [
                         ("surface", "normal_x", surf_xy.numpy(), surf_gt_np[:, 0], surf_pred[:, 0]),
@@ -556,7 +558,7 @@ def main():
                             indent=2,
                         )
 
-                    save_overview_figure(case_dir / "stage1_overview_panel.png", f"CAT Stage 1 Case {case_id} - Overview ({tag})", rows, roi)
+                    save_overview_figure(case_dir / "stage1_overview_panel.png", f"CAT Stage 1 Case {case_id} - Overview ({tag})", rows, roi, meta_line=meta_line)
                     for group, field, units in stage_field_specs(stage):
                         if group == "surface":
                             idx = 0 if field == "normal_x" else 1
@@ -569,6 +571,7 @@ def main():
                                 field_name=f"surface/{field}",
                                 field_units=units,
                                 roi=roi,
+                                meta_line=meta_line,
                             )
                         else:
                             save_field_figure(
@@ -580,6 +583,7 @@ def main():
                                 field_name=f"volume/{field}",
                                 field_units=units,
                                 roi=roi,
+                                meta_line=meta_line,
                             )
 
                     summary_rows.append(
@@ -612,6 +616,8 @@ def main():
                     surf_pred = pred_norm * dataset.std_surf_data[0:1] + dataset.mean_surf_data[0:1]
                     surf_pred = surf_pred.numpy()
                     surf_gt_np = surf_gt.numpy()
+                    infer_pts = f"infer(stage2): encoder_in={input_points.shape[0]}, surf_q={surf_xy.shape[0]}"
+                    meta_line = train_pts + " | " + infer_pts
 
                     rows = [("surface", "pressure", surf_xy.numpy(), surf_gt_np[:, 0], surf_pred[:, 0])]
                     surf_metrics = {"pressure": field_metrics(surf_pred[:, 0], surf_gt_np[:, 0])}
@@ -639,7 +645,7 @@ def main():
                             indent=2,
                         )
 
-                    save_overview_figure(case_dir / "stage2_overview_panel.png", f"CAT Stage 2 Case {case_id} - Overview ({tag})", rows, roi)
+                    save_overview_figure(case_dir / "stage2_overview_panel.png", f"CAT Stage 2 Case {case_id} - Overview ({tag})", rows, roi, meta_line=meta_line)
                     save_field_figure(
                         case_dir / "surface_pressure_panel.png",
                         f"CAT Stage 2 Case {case_id} - Surface pressure ({tag})",
@@ -649,6 +655,7 @@ def main():
                         field_name="surface/pressure",
                         field_units="Pa",
                         roi=roi,
+                        meta_line=meta_line,
                     )
 
                     summary_rows.append(
@@ -675,6 +682,8 @@ def main():
                     vol_pred = pred_norm * dataset.std_vol_data + dataset.mean_vol_data
                     vol_pred = vol_pred.numpy()
                     vol_gt_np = vol_gt.numpy()
+                    infer_pts = f"infer(stage3): encoder_in={input_points.shape[0]}, vol_q={vol_xy.shape[0]}"
+                    meta_line = train_pts + " | " + infer_pts
 
                     rows = [("volume", field, vol_xy.numpy(), vol_gt_np[:, i], vol_pred[:, i]) for i, field in enumerate(VOLUME_FIELDS)]
                     vol_metrics = {field: field_metrics(vol_pred[:, i], vol_gt_np[:, i]) for i, field in enumerate(VOLUME_FIELDS)}
@@ -709,7 +718,7 @@ def main():
                             indent=2,
                         )
 
-                    save_overview_figure(case_dir / "stage3_overview_panel.png", f"CAT Stage 3 Case {case_id} - Overview ({tag})", rows, roi)
+                    save_overview_figure(case_dir / "stage3_overview_panel.png", f"CAT Stage 3 Case {case_id} - Overview ({tag})", rows, roi, meta_line=meta_line)
                     for _, field, units in stage_field_specs(stage):
                         idx = VOLUME_FIELDS.index(field)
                         save_field_figure(
@@ -758,6 +767,7 @@ def save_field_figure(
     field_name: str,
     field_units: str,
     roi: Sequence[float],
+    meta_line: str = "",
 ):
     abs_err = np.abs(pred - gt)
     rel_err = abs_err / np.maximum(np.abs(gt), 1e-8)
@@ -776,7 +786,7 @@ def save_field_figure(
         rel_vmax = rel_vmin * 10.0
 
     fig, axes = plt.subplots(1, 4, figsize=(20, 5), constrained_layout=True)
-    fig.suptitle(title, fontsize=14)
+    fig.suptitle(title + (f"\n{meta_line}" if meta_line else ""), fontsize=14)
 
     sc0 = scatter_panel(axes[0], xy, gt, f"{field_name} GT", cmap="coolwarm", roi=roi, vmin=gt_vmin, vmax=gt_vmax)
     sc1 = scatter_panel(axes[1], xy, pred, f"{field_name} Pred", cmap="coolwarm", roi=roi, vmin=gt_vmin, vmax=gt_vmax)

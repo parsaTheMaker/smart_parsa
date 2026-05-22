@@ -53,6 +53,7 @@ def get_run_name(config, fields=None):
     variant = getattr(config, "manifest_variant", None)
     parts = [
         config.model_name,
+        getattr(config, "model_tag", None) if getattr(config, "model_tag", "") else None,
         getattr(config, "dataset", None),
         variant if variant and variant != "full" else None,
         f"s{getattr(config, 'random_seed', 'na')}",

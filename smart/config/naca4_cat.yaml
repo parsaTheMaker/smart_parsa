@@ -19,17 +19,21 @@ experiment:
   random_seed: 42
   manifest_variant: "full"
 
-  # CAT stage: 1 (geometry pretrain), 2 (surface pretrain), 3 (volume training)
+  # Two-stage CAT controls
+  single_surface_input_points: -1
+  single_surface_query_points: -1
+  single_volume_query_points: 65536
+  surface_loss_weight: 1.0
+  volume_loss_weight: 1.0
+  resume_ckpt: ""
+  stage2_stage1_ckpt: ""
+
+  # Legacy CAT-stage fields kept for backward compatibility with older scripts.
   cat_stage: 1
-
-  # Stage query budget (stage1 volume query is auto-set equal to stage3).
   stage3_volume_query_points: 65536
-
-  # Stage 3 pretrained checkpoints (required when cat_stage=3)
   stage3_geometry_ckpt: ""
   stage3_surface_ckpt: ""
 
-  # Model configuration (kept aligned with naca4.yaml)
   architecture:
     latent_dim: 128
     num_encoder_decoder_blocks: 6
@@ -37,6 +41,7 @@ experiment:
     stage1_surface_attr_channels: 2
     stage1_volume_attr_channels: 1
     stage2_surface_channels: 1
+    volume_query_feature_channels: 1
 
   optimizer: "adamw"
   loss_fn: "rel_l2"

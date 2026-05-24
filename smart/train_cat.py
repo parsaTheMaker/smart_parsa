@@ -9,9 +9,16 @@ from omegaconf import DictConfig
 from tqdm.auto import tqdm
 
 from data.datasets import get_dataset
-from loss.losses import RelL2Loss
 from models.smart.cat import CAT
-from utils.utils import initialize_gpu, initialize_wandb, get_model_checkpoint_name, count_model_params, get_optimizer_scheduler_loss, apply_naca4_auto_point_budget, print_point_budget
+from utils.utils import (
+    initialize_gpu,
+    initialize_wandb,
+    get_model_checkpoint_name,
+    count_model_params,
+    get_optimizer_scheduler_loss,
+    apply_naca4_auto_point_budget,
+    print_point_budget,
+)
 
 CANON_SURF_FIELDS = ["pressure", "normal_x", "normal_y"]
 CANON_VOL_FIELDS = ["pressure", "sdf", "velocity_x", "velocity_y"]
@@ -20,7 +27,6 @@ CANON_VOL_FIELDS = ["pressure", "sdf", "velocity_x", "velocity_y"]
 def sample_indices(n: int, k: int, device: torch.device, disjoint_from: torch.Tensor | None = None) -> torch.Tensor:
     if k <= 0:
         return torch.empty((0,), dtype=torch.long, device=device)
-
     if disjoint_from is not None:
         mask = torch.ones((n,), dtype=torch.bool, device=device)
         mask[disjoint_from] = False
@@ -30,13 +36,10 @@ def sample_indices(n: int, k: int, device: torch.device, disjoint_from: torch.Te
         if k <= candidate.numel():
             perm = torch.randperm(candidate.numel(), device=device)[:k]
             return candidate[perm]
-        # Fallback only when k > candidate size.
         extra = candidate[torch.randint(0, candidate.numel(), (k - candidate.numel(),), device=device)]
         return torch.cat([candidate, extra], dim=0)
-
     if k <= n:
         return torch.randperm(n, device=device)[:k]
-    # Fallback only when k > n.
     extra = torch.randint(0, n, (k - n,), device=device)
     return torch.cat([torch.arange(n, device=device), extra], dim=0)
 
@@ -45,7 +48,13 @@ def gather_per_batch(x: torch.Tensor, idx_list: list[torch.Tensor]) -> torch.Ten
     return torch.stack([x[b, idx_list[b], :] for b in range(x.shape[0])], dim=0)
 
 
-
+def init_metric_dict(surface_fields, volume_fields):
+    metrics = {"loss": 0.0, "rel_l2": 0.0, "rel_l2_surf": 0.0, "rel_l2_vol": 0.0}
+    for field_name in surface_fields:
+        metrics[f"rel_l2_surf_{field_name}"] = 0.0
+    for field_name in volume_fields:
+        metrics[f"rel_l2_vol_{field_name}"] = 0.0
+    return metrics
 
 
 def add_canonical_field_metrics(wandb_dict, split, surface_fields, volume_fields, metric_values=None):
@@ -58,29 +67,37 @@ def add_canonical_field_metrics(wandb_dict, split, surface_fields, volume_fields
         wandb_dict[f"{split}/rel_l2_vol_{f}"] = metric_values.get(src_key, np.nan) if f in volume_fields else np.nan
 
 
-def resolve_stage3_volume_targets(fields: dict, mean_vol: torch.Tensor, std_vol: torch.Tensor):
-    vol_fields = list(fields.get("volume", []))
-    if len(vol_fields) == 0:
-        raise ValueError("No volume fields available for CAT stage3.")
+def resolve_targets(fields: dict, mean_vol: torch.Tensor, std_vol: torch.Tensor):
+    surface_fields = list(fields.get("surface", []))
+    if len(surface_fields) == 0:
+        raise ValueError("CAT requires at least one surface field.")
+    pressure_idx_s = surface_fields.index("pressure") if "pressure" in surface_fields else 0
+    surface_target_indices = [pressure_idx_s]
+    surface_target_fields = [surface_fields[pressure_idx_s]]
 
-    velocity_idx = [i for i, name in enumerate(vol_fields) if str(name).startswith("velocity_")]
-    if len(velocity_idx) == 0:
-        raise ValueError(f"CAT stage3 requires velocity channels in volume fields, got: {vol_fields}")
+    volume_fields = list(fields.get("volume", []))
+    if len(volume_fields) == 0:
+        raise ValueError("CAT requires at least one volume field.")
+    velocity_idx = [i for i, name in enumerate(volume_fields) if str(name).startswith("velocity_")]
+    pressure_idx_v = volume_fields.index("pressure") if "pressure" in volume_fields else None
 
-    pressure_idx = vol_fields.index("pressure") if "pressure" in vol_fields else None
     use_pressure = False
-    if pressure_idx is not None:
-        pressure_std = float(std_vol[pressure_idx].item()) if pressure_idx < len(std_vol) else 0.0
-        pressure_mean = float(mean_vol[pressure_idx].item()) if pressure_idx < len(mean_vol) else 0.0
+    if pressure_idx_v is not None:
+        pressure_std = float(std_vol[pressure_idx_v].item()) if pressure_idx_v < len(std_vol) else 0.0
+        pressure_mean = float(mean_vol[pressure_idx_v].item()) if pressure_idx_v < len(mean_vol) else 0.0
         use_pressure = not (abs(pressure_mean) < 1e-8 and pressure_std < 1e-8)
 
-    target_indices = ([pressure_idx] if use_pressure else []) + velocity_idx
-    target_fields = [vol_fields[i] for i in target_indices]
-    return target_indices, target_fields, use_pressure
+    volume_target_indices = ([pressure_idx_v] if (pressure_idx_v is not None and use_pressure) else []) + velocity_idx
+    if len(volume_target_indices) == 0:
+        volume_target_indices = list(range(len(volume_fields)))
 
-def prepare_stage_batch(stage: int, batch, config, device: torch.device, stage3_target_indices=None):
+    volume_target_fields = [volume_fields[i] for i in volume_target_indices]
+    return surface_target_indices, surface_target_fields, volume_target_indices, volume_target_fields
+
+
+def prepare_stage_batch(stage: int, batch, config, device, surface_target_indices, volume_target_indices):
     geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data = batch
-    geo_mesh = geo_mesh.to(device)
+    del geo_mesh
     surf_mesh = surf_mesh.to(device)
     surf_data = surf_data.to(device)
     vol_mesh = vol_mesh.to(device)
@@ -89,219 +106,98 @@ def prepare_stage_batch(stage: int, batch, config, device: torch.device, stage3_
     bsz, ns, _ = surf_mesh.shape
     nv = vol_mesh.shape[1]
 
-    if stage == 1:
-        s_in = int(getattr(config, "stage1_surface_input_points", config.num_body_points))
-        s_q = int(getattr(config, "stage1_surface_query_points", config.num_surface_points))
-        v_q = int(getattr(config, "stage1_volume_query_points", min(config.num_volume_points, 4 * config.num_surface_points)))
-        s_attr = int(getattr(config, "stage1_surface_attr_channels", 2))
-        v_attr = int(getattr(config, "stage1_volume_attr_channels", 1))
+    s_in = int(getattr(config, "single_surface_input_points", getattr(config, "num_body_points", ns)))
+    s_q = int(getattr(config, "single_surface_query_points", getattr(config, "num_surface_points", ns)))
+    v_q = int(getattr(config, "single_volume_query_points", getattr(config, "num_volume_points", nv)))
 
-        enc_idx, surf_q_idx, vol_q_idx = [], [], []
-        for b in range(bsz):
-            e = sample_indices(ns, s_in, device)
-            sq = sample_indices(ns, s_q, device, disjoint_from=e)
-            vq = sample_indices(nv, v_q, device)
-            enc_idx.append(e)
-            surf_q_idx.append(sq)
-            vol_q_idx.append(vq)
+    if s_in <= 0:
+        s_in = ns
+    if s_q <= 0:
+        s_q = ns
+    if v_q <= 0:
+        v_q = nv
 
-        surface_input = gather_per_batch(surf_mesh, enc_idx)
-        surf_query = gather_per_batch(surf_mesh, surf_q_idx)
-        vol_query = gather_per_batch(vol_mesh, vol_q_idx)
+    enc_idx, surf_q_idx = [], []
+    vol_q_idx = []
+    for _b in range(bsz):
+        e = sample_indices(ns, s_in, device)
+        sq = sample_indices(ns, s_q, device, disjoint_from=e)
+        enc_idx.append(e)
+        surf_q_idx.append(sq)
+        if stage == 2:
+            vol_q_idx.append(sample_indices(nv, v_q, device))
 
-        # stage1 surface attribute defaults to normals: surf_data[:, :, 1:3]
-        surf_target = gather_per_batch(surf_data[:, :, 1 : 1 + s_attr], surf_q_idx)
-        # stage1 volume attribute defaults to sdf: vol_data[:, :, 1:2]
-        vol_target = gather_per_batch(vol_data[:, :, 1 : 1 + v_attr], vol_q_idx)
-        query_points = torch.cat([surf_query, vol_query], dim=1)
+    surface_input_tokens = gather_per_batch(surf_mesh, enc_idx)
+    surface_query_tokens = gather_per_batch(surf_mesh, surf_q_idx)
 
-        return {
-            "surface_input": surface_input,
-            "query_points": query_points,
-            "surf_target": surf_target,
-            "vol_target": vol_target,
-            "surf_query_count": surf_query.shape[1],
-            "surf_attr_channels": s_attr,
-            "vol_attr_channels": v_attr,
-        }
+    s_idx = torch.tensor(surface_target_indices, dtype=torch.long, device=surf_data.device)
+    surface_target = gather_per_batch(surf_data.index_select(dim=2, index=s_idx), surf_q_idx)
+
+    out = {
+        "surface_input_tokens": surface_input_tokens,
+        "surface_query_tokens": surface_query_tokens,
+        "surface_target": surface_target,
+    }
 
     if stage == 2:
-        s_in = int(getattr(config, "stage2_surface_input_points", config.num_body_points))
-        s_q = int(getattr(config, "stage2_surface_query_points", config.num_surface_points))
-        s_field = int(getattr(config, "stage2_surface_channels", 1))
+        volume_query_tokens = gather_per_batch(vol_mesh, vol_q_idx)
+        v_idx = torch.tensor(volume_target_indices, dtype=torch.long, device=vol_data.device)
+        volume_target = gather_per_batch(vol_data.index_select(dim=2, index=v_idx), vol_q_idx)
+        out["volume_query_tokens"] = volume_query_tokens
+        out["volume_target"] = volume_target
 
-        enc_idx, surf_q_idx = [], []
-        for b in range(bsz):
-            e = sample_indices(ns, s_in, device)
-            sq = sample_indices(ns, s_q, device, disjoint_from=e)
-            enc_idx.append(e)
-            surf_q_idx.append(sq)
-
-        surface_input = gather_per_batch(surf_mesh, enc_idx)
-        surf_query = gather_per_batch(surf_mesh, surf_q_idx)
-        # stage2 defaults to pressure: surf_data[:, :, 0:1]
-        surf_target = gather_per_batch(surf_data[:, :, 0:s_field], surf_q_idx)
-
-        return {
-            "surface_input": surface_input,
-            "surf_query": surf_query,
-            "surf_target": surf_target,
-        }
-
-    # stage 3
-    s_in = int(getattr(config, "stage3_surface_input_points", config.num_body_points))
-    v_q = int(getattr(config, "stage3_volume_query_points", config.num_volume_points))
-
-    enc_idx, vol_q_idx = [], []
-    for b in range(bsz):
-        e = sample_indices(ns, s_in, device)
-        vq = sample_indices(nv, v_q, device)
-        enc_idx.append(e)
-        vol_q_idx.append(vq)
-
-    surface_input = gather_per_batch(surf_mesh, enc_idx)
-    vol_query = gather_per_batch(vol_mesh, vol_q_idx)
-    if stage3_target_indices is not None:
-        idx = torch.tensor(stage3_target_indices, dtype=torch.long, device=vol_data.device)
-        vol_target_data = vol_data.index_select(dim=2, index=idx)
-    else:
-        vol_target_data = vol_data
-
-    vol_target = gather_per_batch(vol_target_data, vol_q_idx)
-
-    return {
-        "surface_input": surface_input,
-        "vol_query": vol_query,
-        "vol_target": vol_target,
-    }
+    return out
 
 
 def accumulate_channel_rel(metrics_dict, prefix, pred, gt, field_names, rel_l2_fn, batch_size):
-    if pred is None or gt is None:
-        return
     for channel_idx, field_name in enumerate(field_names):
         v = rel_l2_fn(pred[..., channel_idx:channel_idx + 1], gt[..., channel_idx:channel_idx + 1])
         metrics_dict[f"{prefix}_{field_name}"] = metrics_dict.get(f"{prefix}_{field_name}", 0.0) + v.item() * batch_size
 
 
-def compute_stage_loss(model: CAT, stage_batch: dict, stage: int, loss_fn, rel_l2, surf_signals, vol_signals):
-    zero = torch.tensor(0.0, device=stage_batch["surface_input"].device)
-
+def compute_loss(stage: int, model: CAT, stage_batch, loss_fn, rel_l2, surf_fields, vol_fields):
+    zero = torch.tensor(0.0, device=stage_batch["surface_input_tokens"].device)
     if stage == 1:
-        pred = model.forward_stage1(stage_batch["surface_input"], stage_batch["query_points"])
-        qs = stage_batch["surf_query_count"]
-        s_attr = stage_batch["surf_attr_channels"]
-        v_attr = stage_batch["vol_attr_channels"]
+        pred_s = model.forward_stage1_only(stage_batch["surface_input_tokens"], stage_batch["surface_query_tokens"], return_aux=False)
+        loss_s = loss_fn(pred_s, stage_batch["surface_target"])
+        rel_s = rel_l2(pred_s, stage_batch["surface_target"])
+        channel_specs = [("rel_l2_surf", pred_s, stage_batch["surface_target"], surf_fields[:pred_s.shape[-1]])]
+        return loss_s, loss_s, zero, rel_s, rel_s, zero, channel_specs, None
 
-        pred_surf = pred[:, :qs, :s_attr]
-        pred_vol = pred[:, qs:, s_attr : s_attr + v_attr]
-        loss_surf = loss_fn(pred_surf, stage_batch["surf_target"])
-        loss_vol = loss_fn(pred_vol, stage_batch["vol_target"])
-        loss = loss_surf + loss_vol
-        rel_surf = rel_l2(pred_surf, stage_batch["surf_target"])
-        rel_vol = rel_l2(pred_vol, stage_batch["vol_target"])
-        rel = rel_surf + rel_vol
-        channel_specs = [
-            ("rel_l2_surf", pred_surf, stage_batch["surf_target"], surf_signals[:pred_surf.shape[-1]]),
-            ("rel_l2_vol", pred_vol, stage_batch["vol_target"], vol_signals[:pred_vol.shape[-1]]),
-        ]
-        return loss, rel, rel_surf, rel_vol, channel_specs
-
-    if stage == 2:
-        pred = model.forward_stage2(stage_batch["surface_input"], stage_batch["surf_query"])
-        loss = loss_fn(pred, stage_batch["surf_target"])
-        rel_surf = rel_l2(pred, stage_batch["surf_target"])
-        rel = rel_surf
-        channel_specs = [
-            ("rel_l2_surf", pred, stage_batch["surf_target"], surf_signals[:pred.shape[-1]]),
-        ]
-        return loss, rel, rel_surf, zero, channel_specs
-
-    pred = model.forward_stage3(stage_batch["surface_input"], stage_batch["vol_query"])
-    loss = loss_fn(pred, stage_batch["vol_target"])
-    rel_vol = rel_l2(pred, stage_batch["vol_target"])
-    rel = rel_vol
-    channel_specs = [
-        ("rel_l2_vol", pred, stage_batch["vol_target"], vol_signals[:pred.shape[-1]]),
-    ]
-    return loss, rel, zero, rel_vol, channel_specs
+    pred_v, aux = model.forward_stage2_only(
+        stage_batch["surface_input_tokens"],
+        stage_batch["surface_query_tokens"],
+        stage_batch["volume_query_tokens"],
+        return_aux=True,
+    )
+    loss_v = loss_fn(pred_v, stage_batch["volume_target"])
+    rel_v = rel_l2(pred_v, stage_batch["volume_target"])
+    channel_specs = [("rel_l2_vol", pred_v, stage_batch["volume_target"], vol_fields[:pred_v.shape[-1]])]
+    return loss_v, zero, loss_v, rel_v, zero, rel_v, channel_specs, aux
 
 
-def load_encoder_from_checkpoint(model: CAT, ckpt_path: str, which: str):
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    if which == "geometry":
-        if "geometry_encoder_state_dict" in ckpt:
-            model.geometry_encoder.load_state_dict(ckpt["geometry_encoder_state_dict"], strict=True)
-            return
-        if "model_state_dict" in ckpt:
-            sub = {k.replace("geometry_encoder.", "", 1): v for k, v in ckpt["model_state_dict"].items() if k.startswith("geometry_encoder.")}
-            if sub:
-                model.geometry_encoder.load_state_dict(sub, strict=True)
-                return
-    if which == "surface":
-        if "surface_encoder_state_dict" in ckpt:
-            model.surface_encoder.load_state_dict(ckpt["surface_encoder_state_dict"], strict=True)
-            return
-        if "model_state_dict" in ckpt:
-            sub = {k.replace("surface_encoder.", "", 1): v for k, v in ckpt["model_state_dict"].items() if k.startswith("surface_encoder.")}
-            if sub:
-                model.surface_encoder.load_state_dict(sub, strict=True)
-                return
-
-    raise ValueError(f"Could not load {which} encoder from checkpoint: {ckpt_path}")
+def build_model_payload(model: CAT):
+    return {
+        "geometry_encoder_state_dict": model.geometry_encoder.state_dict(),
+        "surface_decoder_state_dict": model.surface_decoder.state_dict(),
+        "stage2_head_state_dict": model.stage2_head.state_dict(),
+        "surface_physics_encoder_state_dict": model.surface_physics_encoder.state_dict(),
+        "volume_decoder_state_dict": model.volume_decoder.state_dict(),
+        "stage3_head_state_dict": model.stage3_head.state_dict(),
+        "stage3_decoder_state_dict": model.stage3_decoder.state_dict(),
+    }
 
 
-def build_stage_payload(model: CAT, stage: int):
-    payload = {}
-    if stage == 1:
-        payload["geometry_encoder_state_dict"] = model.geometry_encoder.state_dict()
-        payload["stage1_decoder_state_dict"] = model.stage1_decoder.state_dict()
-        payload["stage1_head_state_dict"] = model.stage1_head.state_dict()
-    elif stage == 2:
-        payload["surface_encoder_state_dict"] = model.surface_encoder.state_dict()
-        payload["stage2_decoder_state_dict"] = model.stage2_decoder.state_dict()
-        payload["stage2_head_state_dict"] = model.stage2_head.state_dict()
-    else:
-        payload["geometry_encoder_state_dict"] = model.geometry_encoder.state_dict()
-        payload["surface_encoder_state_dict"] = model.surface_encoder.state_dict()
-        if hasattr(model, "fusion"):
-            payload["fusion_state_dict"] = model.fusion.state_dict()
-        if hasattr(model, "stage3_decoder"):
-            payload["stage3_decoder_state_dict"] = model.stage3_decoder.state_dict()
-        if hasattr(model, "stage3_decoder_geom"):
-            payload["stage3_decoder_geom_state_dict"] = model.stage3_decoder_geom.state_dict()
-            # Backward-compatible alias for tooling expecting single key.
-            payload["stage3_decoder_state_dict"] = model.stage3_decoder_geom.state_dict()
-        if hasattr(model, "stage3_decoder_surf"):
-            payload["stage3_decoder_surf_state_dict"] = model.stage3_decoder_surf.state_dict()
-        payload["stage3_head_state_dict"] = model.stage3_head.state_dict()
-    return payload
-
-
-
-
-def load_stage3_resume_state(model: CAT, optimizer, scheduler, ckpt_path: str, device: torch.device):
+def load_stage1_weights(model: CAT, ckpt_path: str, device):
     ckpt = torch.load(ckpt_path, map_location=device)
-    if "model_state_dict" not in ckpt:
-        raise ValueError(f"Resume checkpoint has no model_state_dict: {ckpt_path}")
+    state = ckpt.get("model_state_dict", ckpt)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    print(f"Loaded stage1 checkpoint from {ckpt_path}")
+    if missing:
+        print(f"Missing keys (allowed): {len(missing)}")
+    if unexpected:
+        print(f"Unexpected keys (allowed): {len(unexpected)}")
 
-    model.load_state_dict(ckpt["model_state_dict"], strict=True)
-
-    if "optimizer_state_dict" in ckpt:
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    else:
-        print("Warning: resume checkpoint missing optimizer_state_dict; optimizer is freshly initialized.")
-
-    if "scheduler_state_dict" in ckpt:
-        scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-    else:
-        print("Warning: resume checkpoint missing scheduler_state_dict; scheduler is freshly initialized.")
-
-    start_epoch = int(ckpt.get("epoch", -1)) + 1
-    best_rel = float(ckpt.get("rel_l2_loss", np.inf)) if ckpt.get("rel_l2_loss", None) is not None else np.inf
-    print(f"Resumed from checkpoint: {ckpt_path}")
-    print(f"Resume start epoch: {start_epoch}")
-    return start_epoch, best_rel
 
 @hydra.main(version_base="1.2", config_path="config", config_name="naca4_cat")
 def main(cfg: DictConfig):
@@ -309,13 +205,8 @@ def main(cfg: DictConfig):
     wandb_config = cfg.wandb
 
     stage = int(getattr(config, "cat_stage", 1))
-    if stage not in (1, 2, 3):
-        raise ValueError("cat_stage must be 1, 2, or 3")
-
-    resume_stage3_ckpt = str(getattr(config, "resume_stage3_ckpt", "")).strip()
-
-    if getattr(config, "model_tag", "") in (None, ""):
-        config.model_tag = f"stage{stage}"
+    if stage not in (1, 2):
+        raise ValueError("cat_stage must be 1 or 2")
 
     run = initialize_wandb(config, wandb_config)
     device = initialize_gpu(config.random_seed, high_precision=False)
@@ -326,90 +217,42 @@ def main(cfg: DictConfig):
     amp = config.amp
 
     train_data, test_data, stats, spatial_dim, surf_channels, vol_channels, params_dim, fields = get_dataset(config)
-    stage3_target_indices = None
-    stage3_target_fields = []
-    stage3_use_pressure = False
-
     point_info = apply_naca4_auto_point_budget(config, train_data, for_cat=True)
     if point_info is not None:
         print_point_budget("CAT", point_info)
-        # Rebuild datasets with resolved point counts.
         train_data, test_data, stats, spatial_dim, surf_channels, vol_channels, params_dim, fields = get_dataset(config)
 
-    if stage == 3:
-        stage3_target_indices, stage3_target_fields, stage3_use_pressure = resolve_stage3_volume_targets(
-            fields,
-            train_data.mean_vol_data,
-            train_data.std_vol_data,
-        )
-        vol_channels = len(stage3_target_indices)
-        print(f"CAT stage3 target fields: {stage3_target_fields}")
-
+    s_idx, s_fields, v_idx, v_fields = resolve_targets(fields, train_data.mean_vol_data, train_data.std_vol_data)
     if stage == 1:
-        surf_signals = ["normal_x", "normal_y"]
-        vol_signals = ["sdf"]
-    elif stage == 2:
-        surf_signals = ["pressure"]
+        vol_channels = len(v_idx)
         vol_signals = []
     else:
-        surf_signals = []
-        vol_signals = stage3_target_fields
-    print(f"[CAT] stage {stage} training signals -> surface: {surf_signals} | volume: {vol_signals}")
+        vol_channels = len(v_idx)
+        vol_signals = v_fields
 
     if params_dim > 0:
         raise NotImplementedError("CAT train script currently supports params_dim=0 datasets.")
 
-    train_loader = torch.utils.data.DataLoader(
-        train_data,
-        batch_size=config.batch_size,
-        num_workers=config.num_workers,
-        shuffle=True,
-        prefetch_factor=56,
-    )
-    test_loader = torch.utils.data.DataLoader(
-        test_data,
-        batch_size=config.batch_size,
-        num_workers=config.num_workers,
-        shuffle=False,
-        prefetch_factor=56,
-    )
+    train_loader = torch.utils.data.DataLoader(train_data, batch_size=config.batch_size, num_workers=config.num_workers, shuffle=True, prefetch_factor=56)
+    test_loader = torch.utils.data.DataLoader(test_data, batch_size=config.batch_size, num_workers=config.num_workers, shuffle=False, prefetch_factor=56)
 
-    models = {
-        "CAT": (
-            CAT,
-            {
-                "spatial_dim": spatial_dim,
-                "surface_channels": surf_channels,
-                "volume_channels": vol_channels,
-                "parameter_channels": params_dim,
-            },
-        )
-    }
+    model = CAT(
+        spatial_dim=spatial_dim,
+        surface_channels=surf_channels,
+        volume_channels=vol_channels,
+        parameter_channels=params_dim,
+        **(dict(config.architecture) if "architecture" in config else {}),
+    ).to(device)
 
-    if config.model_name not in models:
-        raise ValueError("Unknown model class name for CAT train script")
+    if stage == 2:
+        stage1_ckpt = str(getattr(config, "stage2_stage1_ckpt", "")).strip()
+        if not stage1_ckpt:
+            raise ValueError("Stage 2 requires experiment.stage2_stage1_ckpt")
+        load_stage1_weights(model, stage1_ckpt, device)
+        model.freeze_stage1()
+        print("Stage 1 modules frozen for stage 2 training.")
 
-    merged_kwargs = {**models[config.model_name][1], **config.architecture} if "architecture" in config else models[config.model_name][1]
-    print(f"CAT stage {stage} model kwargs: {merged_kwargs}")
-    model = models[config.model_name][0](**merged_kwargs).to(device)
-
-    if stage == 3:
-        geom_ckpt = str(getattr(config, "stage3_geometry_ckpt", ""))
-        surf_ckpt = str(getattr(config, "stage3_surface_ckpt", ""))
-        if not geom_ckpt or not surf_ckpt:
-            raise ValueError("Stage 3 requires stage3_geometry_ckpt and stage3_surface_ckpt in config.")
-        load_encoder_from_checkpoint(model, geom_ckpt, which="geometry")
-        load_encoder_from_checkpoint(model, surf_ckpt, which="surface")
-        for p in model.geometry_encoder.parameters():
-            p.requires_grad = True
-        for p in model.surface_encoder.parameters():
-            p.requires_grad = True
-        print(f"Loaded encoders from: {geom_ckpt} and {surf_ckpt}")
-        print("Stage3 encoders are fully trainable (LoRA disabled).")
-
-    model_checkpoint_name = get_model_checkpoint_name(config)
-    model_checkpoint_name = f"{model_checkpoint_name}-cat-stage{stage}"
-
+    model_checkpoint_name = f"{get_model_checkpoint_name(config)}-cat-stage{stage}"
     print(f"Total parameters: {count_model_params(model)}")
     print(f"Checkpoint name: {model_checkpoint_name}")
 
@@ -419,127 +262,100 @@ def main(cfg: DictConfig):
     scaler = torch.amp.GradScaler("cuda")
 
     loss_test_min = np.inf
-    start_epoch = 0
-    if stage == 3 and resume_stage3_ckpt:
-        start_epoch, loss_test_min = load_stage3_resume_state(model, optimizer, scheduler, resume_stage3_ckpt, device)
-
-    global_step = start_epoch * len(train_loader)
+    global_step = 0
     log_every_n_steps = int(getattr(config, "log_every_n_steps", 10))
 
     try:
-        for ep in tqdm(range(start_epoch, config.epochs), desc="Epochs", dynamic_ncols=True):
+        for ep in tqdm(range(config.epochs), desc="Epochs", dynamic_ncols=True):
             t1 = default_timer()
             model.train()
-            train_loss_sum = 0.0
-            train_rel_sum = 0.0
-            train_rel_surf_sum = 0.0
-            train_rel_vol_sum = 0.0
-            train_channel_metrics = {}
-            test_channel_metrics = {}
+            train_metrics = init_metric_dict(s_fields, vol_signals)
+            test_metrics = init_metric_dict(s_fields, vol_signals)
 
             train_pbar = tqdm(train_loader, desc=f"Train S{stage} {ep + 1}/{config.epochs}", leave=False, dynamic_ncols=True)
             for batch_idx, batch in enumerate(train_pbar):
-                stage_batch = prepare_stage_batch(stage, batch, config, device, stage3_target_indices=stage3_target_indices)
+                stage_batch = prepare_stage_batch(stage, batch, config, device, s_idx, v_idx)
                 optimizer.zero_grad()
 
                 if amp:
                     with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=True):
-                        loss, rel, rel_surf, rel_vol, channel_specs = compute_stage_loss(model, stage_batch, stage, loss_fn, rel_l2, surf_signals, vol_signals)
+                        loss, loss_s, loss_v, rel, rel_s, rel_v, channel_specs, aux = compute_loss(stage, model, stage_batch, loss_fn, rel_l2, s_fields, vol_signals)
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
                     scheduler.step()
                 else:
-                    loss, rel, rel_surf, rel_vol, channel_specs = compute_stage_loss(model, stage_batch, stage, loss_fn, rel_l2, surf_signals, vol_signals)
+                    loss, loss_s, loss_v, rel, rel_s, rel_v, channel_specs, aux = compute_loss(stage, model, stage_batch, loss_fn, rel_l2, s_fields, vol_signals)
                     loss.backward()
                     if gradient_norm is not None:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
                     optimizer.step()
                     scheduler.step()
 
-                bsz = next(iter(stage_batch.values())).shape[0]
-                train_loss_sum += loss.item() * bsz
-                train_rel_sum += rel.item() * bsz
-                train_rel_surf_sum += rel_surf.item() * bsz
-                train_rel_vol_sum += rel_vol.item() * bsz
+                bsz = stage_batch["surface_input_tokens"].shape[0]
+                train_metrics["loss"] += loss.item() * bsz
+                train_metrics["rel_l2"] += rel.item() * bsz
+                train_metrics["rel_l2_surf"] += rel_s.item() * bsz
+                train_metrics["rel_l2_vol"] += rel_v.item() * bsz
 
                 for prefix, pred_ch, gt_ch, names in channel_specs:
-                    accumulate_channel_rel(train_channel_metrics, prefix, pred_ch, gt_ch, names, rel_l2, bsz)
+                    accumulate_channel_rel(train_metrics, prefix, pred_ch, gt_ch, names, rel_l2, bsz)
 
                 global_step += 1
                 if batch_idx % log_every_n_steps == 0 or batch_idx == len(train_loader) - 1:
                     batch_log = {
                         "train/batch_loss": loss.item(),
                         "train/batch_rel_l2": rel.item(),
-                        "train/batch_rel_l2_surf": rel_surf.item(),
-                        "train/batch_rel_l2_vol": rel_vol.item(),
+                        "train/batch_rel_l2_surf": rel_s.item(),
+                        "train/batch_rel_l2_vol": rel_v.item(),
+                        "train/batch_surface_loss": loss_s.item(),
+                        "train/batch_volume_loss": loss_v.item(),
                         "lr": scheduler.get_last_lr()[0],
                         "epoch": ep,
                         "stage": stage,
                     }
-                    batch_metric_values = {}
-                    for prefix, pred_ch, gt_ch, names in channel_specs:
-                        for channel_idx, field_name in enumerate(names):
-                            v = rel_l2(pred_ch[..., channel_idx:channel_idx + 1], gt_ch[..., channel_idx:channel_idx + 1])
-                            batch_metric_values[f"{prefix}_{field_name}"] = v.item()
-                    add_canonical_field_metrics(batch_log, "train", surf_signals, vol_signals, metric_values=batch_metric_values)
+                    if aux is not None:
+                        batch_log["model/surface_to_volume_skip_weight_mean"] = float(aux["skip_weight_mean"].detach().item())
+                        batch_log["model/surface_to_volume_skip_weight_std"] = float(aux["skip_weight_std"].detach().item())
                     wandb.log(batch_log, step=global_step)
                     train_pbar.set_postfix(loss=f"{loss.item():.4f}", rel=f"{rel.item():.4f}")
 
             model.eval()
-            test_loss_sum = 0.0
-            test_rel_sum = 0.0
-            test_rel_surf_sum = 0.0
-            test_rel_vol_sum = 0.0
             with torch.no_grad():
                 test_pbar = tqdm(test_loader, desc=f"Eval  S{stage} {ep + 1}/{config.epochs}", leave=False, dynamic_ncols=True)
                 for batch in test_pbar:
-                    stage_batch = prepare_stage_batch(stage, batch, config, device, stage3_target_indices=stage3_target_indices)
+                    stage_batch = prepare_stage_batch(stage, batch, config, device, s_idx, v_idx)
                     if amp:
                         with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=True):
-                            loss, rel, rel_surf, rel_vol, channel_specs = compute_stage_loss(model, stage_batch, stage, loss_fn, rel_l2, surf_signals, vol_signals)
+                            loss, _ls, _lv, rel, rel_s, rel_v, channel_specs, _aux = compute_loss(stage, model, stage_batch, loss_fn, rel_l2, s_fields, vol_signals)
                     else:
-                        loss, rel, rel_surf, rel_vol, channel_specs = compute_stage_loss(model, stage_batch, stage, loss_fn, rel_l2, surf_signals, vol_signals)
+                        loss, _ls, _lv, rel, rel_s, rel_v, channel_specs, _aux = compute_loss(stage, model, stage_batch, loss_fn, rel_l2, s_fields, vol_signals)
 
-                    bsz = next(iter(stage_batch.values())).shape[0]
-                    test_loss_sum += loss.item() * bsz
-                    test_rel_sum += rel.item() * bsz
-                    test_rel_surf_sum += rel_surf.item() * bsz
-                    test_rel_vol_sum += rel_vol.item() * bsz
-
+                    bsz = stage_batch["surface_input_tokens"].shape[0]
+                    test_metrics["loss"] += loss.item() * bsz
+                    test_metrics["rel_l2"] += rel.item() * bsz
+                    test_metrics["rel_l2_surf"] += rel_s.item() * bsz
+                    test_metrics["rel_l2_vol"] += rel_v.item() * bsz
                     for prefix, pred_ch, gt_ch, names in channel_specs:
-                        accumulate_channel_rel(test_channel_metrics, prefix, pred_ch, gt_ch, names, rel_l2, bsz)
+                        accumulate_channel_rel(test_metrics, prefix, pred_ch, gt_ch, names, rel_l2, bsz)
 
-                    test_pbar.set_postfix(loss=f"{loss.item():.4f}", rel=f"{rel.item():.4f}")
+            for k in train_metrics:
+                train_metrics[k] /= len(train_loader.dataset)
+            for k in test_metrics:
+                test_metrics[k] /= len(test_loader.dataset)
 
-            train_loss = train_loss_sum / len(train_loader.dataset)
-            train_rel = train_rel_sum / len(train_loader.dataset)
-            train_rel_surf = train_rel_surf_sum / len(train_loader.dataset)
-            train_rel_vol = train_rel_vol_sum / len(train_loader.dataset)
-            test_loss = test_loss_sum / len(test_loader.dataset)
-            test_rel = test_rel_sum / len(test_loader.dataset)
-            test_rel_surf = test_rel_surf_sum / len(test_loader.dataset)
-            test_rel_vol = test_rel_vol_sum / len(test_loader.dataset)
-
-            for k in list(train_channel_metrics.keys()):
-                train_channel_metrics[k] /= len(train_loader.dataset)
-            for k in list(test_channel_metrics.keys()):
-                test_channel_metrics[k] /= len(test_loader.dataset)
-
-            if test_rel < loss_test_min:
-                loss_test_min = test_rel
+            if test_metrics["rel_l2"] < loss_test_min:
+                loss_test_min = test_metrics["rel_l2"]
                 best_payload = {
                     "epoch": ep,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
-                    "loss": test_loss,
-                    "rel_l2_loss": test_rel,
+                    "loss": test_metrics["loss"],
+                    "rel_l2_loss": test_metrics["rel_l2"],
                     "stage": stage,
-                    "stage3_target_fields": stage3_target_fields,
-                    "stage3_use_pressure": stage3_use_pressure,
                 }
-                best_payload.update(build_stage_payload(model, stage))
+                best_payload.update(build_model_payload(model))
                 torch.save(best_payload, f"checkpoints/{model_checkpoint_name}_best.pt")
 
             last_payload = {
@@ -547,54 +363,36 @@ def main(cfg: DictConfig):
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
-                "loss": test_loss,
-                "rel_l2_loss": test_rel,
+                "loss": test_metrics["loss"],
+                "rel_l2_loss": test_metrics["rel_l2"],
                 "stage": stage,
-                "stage3_target_fields": stage3_target_fields,
-                "stage3_use_pressure": stage3_use_pressure,
             }
-            last_payload.update(build_stage_payload(model, stage))
+            last_payload.update(build_model_payload(model))
             torch.save(last_payload, f"checkpoints/{model_checkpoint_name}_last.pt")
 
             t2 = default_timer()
-            print(
-                f"stage: {stage}, epoch: {ep}, epoch_time: {t2 - t1:.4f}, "
-                f"train_loss: {train_loss:.5f}, train_rel: {train_rel:.5f}, "
-                f"test_loss: {test_loss:.5f}, test_rel: {test_rel:.5f}"
-            )
+            print(f"stage: {stage}, epoch: {ep}, epoch_time: {t2 - t1:.4f}, train_rel: {train_metrics['rel_l2']:.5f}, test_rel: {test_metrics['rel_l2']:.5f}")
 
             epoch_log = {
-                "train/loss": train_loss,
-                "train/rel_l2": train_rel,
-                "train/rel_l2_surf": train_rel_surf,
-                "train/rel_l2_vol": train_rel_vol,
-                "test/loss": test_loss,
-                "test/rel_l2": test_rel,
-                "test/rel_l2_surf": test_rel_surf,
-                "test/rel_l2_vol": test_rel_vol,
+                "train/loss": train_metrics["loss"],
+                "train/rel_l2": train_metrics["rel_l2"],
+                "train/rel_l2_surf": train_metrics["rel_l2_surf"],
+                "train/rel_l2_vol": train_metrics["rel_l2_vol"],
+                "test/loss": test_metrics["loss"],
+                "test/rel_l2": test_metrics["rel_l2"],
+                "test/rel_l2_surf": test_metrics["rel_l2_surf"],
+                "test/rel_l2_vol": test_metrics["rel_l2_vol"],
                 "lr": scheduler.get_last_lr()[0],
                 "epoch": ep,
                 "stage": stage,
-                "meta/training_surface_signals": ",".join(surf_signals),
-                "meta/training_volume_signals": ",".join(vol_signals),
             }
-            add_canonical_field_metrics(epoch_log, "train", surf_signals, vol_signals, metric_values=train_channel_metrics)
-            add_canonical_field_metrics(epoch_log, "test", surf_signals, vol_signals, metric_values=test_channel_metrics)
+            if stage == 2:
+                w = torch.clamp(model.surface_to_volume_skip_weights.detach(), min=0.0, max=1.0)
+                epoch_log["model/surface_to_volume_skip_weight_mean"] = float(w.mean().item())
+                epoch_log["model/surface_to_volume_skip_weight_std"] = float(w.std(unbiased=False).item())
+            add_canonical_field_metrics(epoch_log, "train", s_fields, vol_signals, metric_values=train_metrics)
+            add_canonical_field_metrics(epoch_log, "test", s_fields, vol_signals, metric_values=test_metrics)
             wandb.log(epoch_log, step=global_step)
-
-    except KeyboardInterrupt:
-        print("\nTraining interrupted by user (Ctrl+C). Saving last checkpoint...")
-        emergency = {
-            "epoch": locals().get("ep", -1),
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "stage": stage,
-            "stage3_target_fields": stage3_target_fields,
-            "stage3_use_pressure": stage3_use_pressure,
-        }
-        emergency.update(build_stage_payload(model, stage))
-        torch.save(emergency, f"checkpoints/{model_checkpoint_name}_last.pt")
 
     finally:
         best_ckpt = f"checkpoints/{model_checkpoint_name}_best.pt"

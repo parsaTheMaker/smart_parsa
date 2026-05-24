@@ -27,7 +27,7 @@ from tqdm.auto import tqdm
 
 from data.naca4_dataset import NACA4Dataset
 from models.smart.cat import CAT, LoopEncoder
-from utils.utils import get_model_checkpoint_name
+from utils.utils import get_model_checkpoint_name, apply_naca4_auto_point_budget, print_point_budget
 
 
 SURFACE_FIELDS = ["pressure", "normal_x", "normal_y"]
@@ -437,6 +437,20 @@ def main():
         raise ValueError("CAT visualization only supports stages 1, 2, and 3")
 
     device = initialize_gpu(config.random_seed, high_precision=False)
+
+    train_data = NACA4Dataset(
+        config.data_path,
+        if_test=False,
+        geometry_points=int(config.num_body_points),
+        surface_points=int(config.num_surface_points),
+        volume_points=int(config.num_volume_points),
+        scale_positions=bool(config.scale_positions),
+        manifest_variant=getattr(config, "manifest_variant", "full"),
+    )
+
+    point_info = apply_naca4_auto_point_budget(config, train_data, for_cat=True)
+    if point_info is not None:
+        print_point_budget("CAT-VIZ", point_info)
 
     train_data = NACA4Dataset(
         config.data_path,

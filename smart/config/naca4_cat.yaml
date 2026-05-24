@@ -22,6 +22,9 @@ experiment:
   # CAT stage: 1 (geometry pretrain), 2 (surface pretrain), 3 (volume training)
   cat_stage: 1
 
+  # Stage query budget (stage1 volume query is auto-set equal to stage3).
+  stage3_volume_query_points: 65536
+
   # Stage 3 pretrained checkpoints (required when cat_stage=3)
   stage3_geometry_ckpt: ""
   stage3_surface_ckpt: ""
@@ -29,42 +32,28 @@ experiment:
   # Model configuration (kept aligned with naca4.yaml)
   architecture:
     latent_dim: 128
-    latent_geometry_points: 2048
-    subsampled_geometry_points: 4096
     num_encoder_decoder_blocks: 6
     pos_scale_factor: 100
     stage1_surface_attr_channels: 2
     stage1_volume_attr_channels: 1
     stage2_surface_channels: 1
 
-  # CAT stage sampling (using naca4-scale numbers)
-  stage1_surface_input_points: 4096
-  stage1_surface_query_points: 4096
-  stage1_volume_query_points: 16384
-
-  stage2_surface_input_points: 4096
-  stage2_surface_query_points: 4096
-
-  stage3_surface_input_points: 4096
-  stage3_volume_query_points: 65536
-
-  optimizer: "lion"
+  optimizer: "adamw"
   loss_fn: "rel_l2"
   scheduler: "cosine"
   scheduler_warumup_fraction: 0.2
   batch_size: 8
-  epochs: 200
-  learning_rate: 1.e-4
+  epochs: 300
+  learning_rate: 2.e-4
   gradient_norm: null
   amp: True
   precision: "float16"
   log_every_n_steps: 10
 
-  # Data configuration
   dataset: "NACA4"
   data_path: "/mnt/data1/parsa/naca4_zenodo_airfrans_like/Dataset"
   num_workers: 8
-  num_body_points: 4096
-  num_surface_points: 4096
+  num_body_points: -1
+  num_surface_points: -1
   num_volume_points: 65536
   scale_positions: False

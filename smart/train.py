@@ -10,11 +10,14 @@ from tqdm.auto import tqdm
 
 # Dataset and loss functions
 from data.datasets import get_dataset
-from utils.utils import initialize_gpu, initialize_wandb, get_model_checkpoint_name, count_model_params, get_optimizer_scheduler_loss
+from utils.utils import initialize_gpu, initialize_wandb, get_model_checkpoint_name, count_model_params, get_optimizer_scheduler_loss, apply_naca4_auto_point_budget, print_point_budget
 from loss.losses import CombinedLoss
 
 # SMART Model
 from models.smart.smart import SMART
+
+CANON_SURF_FIELDS = ["pressure", "normal_x", "normal_y"]
+CANON_VOL_FIELDS = ["pressure", "sdf", "velocity_x", "velocity_y"]
 
 
 def init_metric_dict(surface_fields, volume_fields):
@@ -35,6 +38,19 @@ def accumulate_channel_metrics(metrics, prefix, pred, gt, field_names, rel_l2_lo
     for channel_idx, field_name in enumerate(field_names):
         channel_loss = rel_l2_loss_fn(pred[..., channel_idx:channel_idx + 1], gt[..., channel_idx:channel_idx + 1])
         metrics[f"{prefix}_{field_name}"] += channel_loss.item() * batch_size
+
+
+def add_canonical_field_metrics(wandb_dict, split, surface_fields, volume_fields, metric_values=None):
+    metric_values = metric_values or {}
+    for f in CANON_SURF_FIELDS:
+        key = f"{split}/rel_l2_surf_{f}"
+        src_key = f"rel_l2_surf_{f}"
+        wandb_dict[key] = metric_values.get(src_key, np.nan) if f in surface_fields else np.nan
+    for f in CANON_VOL_FIELDS:
+        key = f"{split}/rel_l2_vol_{f}"
+        src_key = f"rel_l2_vol_{f}"
+        wandb_dict[key] = metric_values.get(src_key, np.nan) if f in volume_fields else np.nan
+
 
 
 @hydra.main(version_base="1.2", config_path="config", config_name="car")
@@ -58,6 +74,29 @@ def main(cfg: DictConfig):
 
     # Load data
     train_data, test_data, stats, spatial_dim, surf_channels, vol_channels, params_dim, fields = get_dataset(config)
+
+    def apply_vanilla_smart_field_subset():
+        nonlocal fields, surf_channels, vol_channels
+        # Vanilla SMART on NACA4: surface pressure + volume velocity only.
+        if config.model_name == "SMART" and config.dataset == "NACA4":
+            fields = {"surface": [], "volume": ["pressure", "velocity_x", "velocity_y"]}
+            # Keep one surface output channel for model compatibility, but do not supervise it.
+            surf_channels = 1
+            vol_channels = 3
+
+    apply_vanilla_smart_field_subset()
+    print(f"[SMART] training signals -> surface: {fields['surface']} | volume: {fields['volume']}")
+
+    point_info = apply_naca4_auto_point_budget(config, train_data, for_cat=False)
+    if point_info is not None:
+        print_point_budget("SMART", point_info)
+        # Rebuild datasets with the resolved effective point counts.
+        train_data, test_data, stats, spatial_dim, surf_channels, vol_channels, params_dim, fields = get_dataset(config)
+        apply_vanilla_smart_field_subset()
+        print(f"[SMART] training signals -> surface: {fields['surface']} | volume: {fields['volume']}")
+
+    use_surface_supervision = len(fields["surface"]) > 0
+
     train_loader = torch.utils.data.DataLoader(train_data,
                                                batch_size=config.batch_size,
                                                num_workers=config.num_workers,
@@ -69,10 +108,17 @@ def main(cfg: DictConfig):
                                               shuffle=False,
                                               prefetch_factor=56)
     # Move stats to device
-    mean_surf = stats[0].to(device)
-    std_surf = stats[1].to(device)
-    mean_vol = stats[2].to(device)
-    std_vol = stats[3].to(device)
+    mean_surf = stats[0][:surf_channels].to(device)
+    std_surf = stats[1][:surf_channels].to(device)
+    if config.model_name == "SMART" and config.dataset == "NACA4" and vol_channels == 2:
+        mean_vol = stats[2][2:4].to(device)
+        std_vol = stats[3][2:4].to(device)
+    elif config.model_name == "SMART" and config.dataset == "NACA4" and vol_channels == 3:
+        mean_vol = torch.stack([stats[2][0], stats[2][2], stats[2][3]]).to(device)
+        std_vol = torch.stack([stats[3][0], stats[3][2], stats[3][3]]).to(device)
+    else:
+        mean_vol = stats[2][:vol_channels].to(device)
+        std_vol = stats[3][:vol_channels].to(device)
     
     # Extract one training sample for inspection
     sample = train_data[0]
@@ -110,7 +156,7 @@ def main(cfg: DictConfig):
     # Training and evaluation
     scaler = torch.amp.GradScaler("cuda")
     optimizer, scheduler, loss_fn, rel_l2_loss_fn = get_optimizer_scheduler_loss(model, config, train_loader, loss_dim=1)
-    combined_loss_fn = CombinedLoss(loss_fn, fields)
+    combined_loss_fn = CombinedLoss(loss_fn, fields) if use_surface_supervision else None
         
     # Training loop
     loss_test_min = np.inf
@@ -142,6 +188,10 @@ def main(cfg: DictConfig):
                 vol_mesh = vol_mesh.to(device)
                 vol_data = vol_data.to(device)
 
+                if config.model_name == "SMART" and config.dataset == "NACA4":
+                    surf_data = surf_data[..., :1]
+                    vol_data = torch.cat([vol_data[..., :1], vol_data[..., 2:4]], dim=-1)
+
                 # Forward pass
                 optimizer.zero_grad()
 
@@ -150,7 +200,10 @@ def main(cfg: DictConfig):
                         y_hat_surf, y_hat_vol = model(geo_mesh, surf_mesh, vol_mesh, params)
 
                         # Rel l2 loss
-                        loss = combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data)
+                        if use_surface_supervision:
+                            loss = combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data)
+                        else:
+                            loss = loss_fn(y_hat_vol, vol_data)
 
                         scaler.scale(loss).backward()
                         scaler.step(optimizer)
@@ -160,7 +213,10 @@ def main(cfg: DictConfig):
                     y_hat_surf, y_hat_vol = model(geo_mesh, surf_mesh, vol_mesh, params)
 
                     # Rel l2 loss
-                    loss = combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data)
+                    if use_surface_supervision:
+                        loss = combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data)
+                    else:
+                        loss = loss_fn(y_hat_vol, vol_data)
                     loss.backward()
 
                     # Gradient clipping
@@ -174,17 +230,30 @@ def main(cfg: DictConfig):
                 batch_size = surf_data.size(0)
                 train_losses["loss"] += loss.item() * batch_size
                 with torch.no_grad():
-                    surface_loss = rel_l2_loss_fn(y_hat_surf, surf_data)
+                    if use_surface_supervision:
+                        surface_loss = rel_l2_loss_fn(y_hat_surf, surf_data)
+                    else:
+                        surface_loss = torch.tensor(0.0, device=device)
                     volume_loss = rel_l2_loss_fn(y_hat_vol, vol_data)
                     train_losses["rel_l2_surf"] += surface_loss.item() * batch_size
                     train_losses["rel_l2_vol"] += volume_loss.item() * batch_size
                     train_losses["rel_l2"] += (surface_loss + volume_loss).item() * batch_size
+
+                    if use_surface_supervision:
+                        pred_surf_train = y_hat_surf[..., :] * std_surf + mean_surf
+                        gt_surf_train = surf_data * std_surf + mean_surf
+                        accumulate_channel_metrics(train_losses, "rel_l2_surf", pred_surf_train, gt_surf_train, fields["surface"], rel_l2_loss_fn, batch_size)
+                    pred_vol_train = y_hat_vol[..., :] * std_vol + mean_vol
+                    gt_vol_train = vol_data * std_vol + mean_vol
+                    accumulate_channel_metrics(train_losses, "rel_l2_vol", pred_vol_train, gt_vol_train, fields["volume"], rel_l2_loss_fn, batch_size)
 
                 global_step += 1
                 if batch_idx % log_every_n_steps == 0 or batch_idx == len(train_loader) - 1:
                     wandb.log({
                         "train/batch_loss": loss.item(),
                         "train/batch_rel_l2": (surface_loss + volume_loss).item(),
+                        "train/batch_rel_l2_surf": surface_loss.item(),
+                        "train/batch_rel_l2_vol": volume_loss.item(),
                         "lr": scheduler.get_last_lr()[0],
                         "epoch": ep,
                     }, step=global_step)
@@ -210,6 +279,10 @@ def main(cfg: DictConfig):
                     vol_mesh = vol_mesh.to(device)
                     vol_data = vol_data.to(device)
 
+                    if config.model_name == "SMART" and config.dataset == "NACA4":
+                        surf_data = surf_data[..., :1]
+                        vol_data = torch.cat([vol_data[..., :1], vol_data[..., 2:4]], dim=-1)
+
                     # Forward pass
                     if amp:
                         with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=True):
@@ -218,8 +291,9 @@ def main(cfg: DictConfig):
                         y_hat_surf, y_hat_vol = model(geo_mesh, surf_mesh, vol_mesh, params)
 
                     # Denormalize
-                    pred_surf = y_hat_surf[..., :] * std_surf + mean_surf
-                    gt_surf = surf_data * std_surf + mean_surf
+                    if use_surface_supervision:
+                        pred_surf = y_hat_surf[..., :] * std_surf + mean_surf
+                        gt_surf = surf_data * std_surf + mean_surf
                     pred_vol = y_hat_vol[..., :] * std_vol + mean_vol
                     gt_vol = vol_data * std_vol + mean_vol
 
@@ -227,16 +301,21 @@ def main(cfg: DictConfig):
                     batch_size = surf_data.size(0)
 
                     # Combine loss
-                    batch_loss = combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data)
+                    if use_surface_supervision:
+                        batch_loss = combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data)
+                        surface_rel_l2 = rel_l2_loss_fn(y_hat_surf, surf_data)
+                    else:
+                        batch_loss = loss_fn(y_hat_vol, vol_data)
+                        surface_rel_l2 = torch.tensor(0.0, device=device)
                     test_losses["loss"] += batch_loss.item() * batch_size
 
-                    surface_rel_l2 = rel_l2_loss_fn(y_hat_surf, surf_data)
                     volume_rel_l2 = rel_l2_loss_fn(y_hat_vol, vol_data)
                     test_losses["rel_l2_surf"] += surface_rel_l2.item() * batch_size
                     test_losses["rel_l2_vol"] += volume_rel_l2.item() * batch_size
                     test_losses["rel_l2"] += (surface_rel_l2 + volume_rel_l2).item() * batch_size
 
-                    accumulate_channel_metrics(test_losses, "rel_l2_surf", pred_surf, gt_surf, fields["surface"], rel_l2_loss_fn, batch_size)
+                    if use_surface_supervision:
+                        accumulate_channel_metrics(test_losses, "rel_l2_surf", pred_surf, gt_surf, fields["surface"], rel_l2_loss_fn, batch_size)
                     accumulate_channel_metrics(test_losses, "rel_l2_vol", pred_vol, gt_vol, fields["volume"], rel_l2_loss_fn, batch_size)
 
                     test_pbar.set_postfix(loss=f"{batch_loss.item():.4f}")
@@ -280,6 +359,10 @@ def main(cfg: DictConfig):
 
             wandb_dict.update({f"train/{key}": value for key, value in train_losses.items() if value != 0.0})
             wandb_dict.update({f"test/{key}": value for key, value in test_losses.items() if value != 0.0})
+            add_canonical_field_metrics(wandb_dict, "train", fields["surface"], fields["volume"], metric_values=train_losses)
+            add_canonical_field_metrics(wandb_dict, "test", fields["surface"], fields["volume"], metric_values=test_losses)
+            wandb_dict["meta/training_surface_signals"] = ",".join(fields["surface"])
+            wandb_dict["meta/training_volume_signals"] = ",".join(fields["volume"])
             wandb.log(wandb_dict, step=global_step)
 
     except KeyboardInterrupt:

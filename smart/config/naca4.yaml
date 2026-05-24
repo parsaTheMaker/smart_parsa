@@ -22,26 +22,23 @@ experiment:
   # Model configuration
   architecture:
     latent_dim: 128
-    latent_geometry_points: 2048
-    subsampled_geometry_points: 4096
     num_encoder_decoder_blocks: 6
     pos_scale_factor: 100
-  optimizer: "lion"
+  optimizer: "adamw"
   loss_fn: "rel_l2"
   scheduler: "cosine"
   scheduler_warumup_fraction: 0.2
   batch_size: 8
-  epochs: 200
-  learning_rate: 1.e-4
+  epochs: 300
+  learning_rate: 2.e-4
   gradient_norm: null
   amp: True
   precision: "float16"
 
-  # Data configuration
   dataset: "NACA4"
   data_path: "/mnt/data1/parsa/naca4_zenodo_airfrans_like/Dataset"
   num_workers: 8
-  num_body_points: 4096
-  num_surface_points: 4096
+  num_body_points: -1
+  num_surface_points: -1
   num_volume_points: 65536
   scale_positions: False

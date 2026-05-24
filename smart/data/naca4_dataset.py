@@ -72,6 +72,8 @@ class NACA4Dataset(Dataset):
         else:
             self.data = self.training_ids
 
+        self.bad_cases = set()
+
         if prepare_data:
             print("Precompute numpy arrays...")
             self.precompute_numpy_arrays()
@@ -166,6 +168,18 @@ class NACA4Dataset(Dataset):
             "volume_targets": case_dir / f"volume_targets_{self.CACHE_VERSION}.npy",
         }
 
+
+    @staticmethod
+    def _finite_mask(*arrays):
+        mask = None
+        for arr in arrays:
+            if arr.ndim == 1:
+                m = torch.isfinite(arr)
+            else:
+                m = torch.isfinite(arr).all(dim=-1)
+            mask = m if mask is None else (mask & m)
+        return mask
+
     def _load_case_arrays(self, case_id, write_cache=True):
         case_dir = self._case_dir(case_id)
         npz_path = self._npz_path(case_id)
@@ -178,6 +192,7 @@ class NACA4Dataset(Dataset):
             surf_data = torch.tensor(np.load(cache_paths["surface_targets"]), dtype=torch.float32)
             vol_mesh = torch.tensor(np.load(cache_paths["volume"]), dtype=torch.float32)
             vol_data = torch.tensor(np.load(cache_paths["volume_targets"]), dtype=torch.float32)
+            geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data = self._filter_invalid_rows(case_id, geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data)
             return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data
 
         with np.load(npz_path) as raw:
@@ -222,11 +237,24 @@ class NACA4Dataset(Dataset):
         vol_mesh = positions[vol_mask]
         vol_data = torch.cat([pressure[vol_mask], sdf[vol_mask], velocity[vol_mask]], dim=-1)
 
-        if geo_mesh.numel() == 0 or surf_mesh.numel() == 0 or vol_mesh.numel() == 0:
-            raise ValueError(f"Empty surface or volume subset in {npz_path}")
+        # Drop invalid rows to keep training stable.
+        surf_valid = self._finite_mask(surf_mesh, surf_data)
+        vol_valid = self._finite_mask(vol_mesh, vol_data)
+        geo_valid = self._finite_mask(geo_mesh)
 
-        if torch.any(sdf[vol_mask] < -1e-6):
+        geo_mesh = geo_mesh[geo_valid]
+        surf_mesh = surf_mesh[surf_valid]
+        surf_data = surf_data[surf_valid]
+        vol_mesh = vol_mesh[vol_valid]
+        vol_data = vol_data[vol_valid]
+
+        if geo_mesh.numel() == 0 or surf_mesh.numel() == 0 or vol_mesh.numel() == 0:
+            raise ValueError(f"Empty surface or volume subset after NaN/Inf filtering in {npz_path}")
+
+        if torch.any(vol_data[:, 1:2] < -1e-6):
             raise ValueError(f"Found negative signed-distance values in the volume subset for {npz_path}")
+
+        geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data = self._filter_invalid_rows(case_id, geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data)
 
         if write_cache:
             case_dir.mkdir(parents=True, exist_ok=True)
@@ -380,27 +408,120 @@ class NACA4Dataset(Dataset):
         _, _, _, vol_mesh, vol_data = self._load_case_arrays(case_id, write_cache=True)
         return vol_mesh, vol_data
 
+
+    def _load_or_compute_point_count_stats(self):
+        stats_file = Path(os.path.join(self.file_path, f"point_count_stats_{self.CACHE_VERSION}.json"))
+        if stats_file.is_file():
+            with open(stats_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+
+        min_surface_nonzero = None
+        min_volume_nonzero = None
+        for case_id in self.all_ids:
+            _, surf_mesh, _, vol_mesh, _ = self._load_case_arrays(case_id, write_cache=True)
+            ns = int(surf_mesh.shape[0])
+            nv = int(vol_mesh.shape[0])
+            if ns > 0:
+                min_surface_nonzero = ns if min_surface_nonzero is None else min(min_surface_nonzero, ns)
+            if nv > 0:
+                min_volume_nonzero = nv if min_volume_nonzero is None else min(min_volume_nonzero, nv)
+
+        stats = {
+            "min_surface_nonzero": int(min_surface_nonzero or 0),
+            "min_volume_nonzero": int(min_volume_nonzero or 0),
+            "num_cases": int(len(self.all_ids)),
+        }
+        with open(stats_file, "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2)
+        return stats
+
+    def get_min_surface_points_nonzero(self):
+        return int(self._load_or_compute_point_count_stats()["min_surface_nonzero"])
+
+    def get_min_volume_points_nonzero(self):
+        return int(self._load_or_compute_point_count_stats()["min_volume_nonzero"])
+
+
+    @staticmethod
+    def _finite_row_mask(*tensors):
+        mask = None
+        for tensor in tensors:
+            if tensor is None:
+                continue
+            cur = torch.isfinite(tensor).all(dim=-1)
+            mask = cur if mask is None else (mask & cur)
+        return mask
+
+    def _filter_invalid_rows(self, case_id, geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data):
+        surf_mask = self._finite_row_mask(geo_mesh, surf_mesh, surf_data)
+        vol_mask = self._finite_row_mask(vol_mesh, vol_data)
+
+        if surf_mask is not None and not bool(surf_mask.all()):
+            dropped = int((~surf_mask).sum().item())
+            print(f"Warning: dropped {dropped} invalid surface rows in case {case_id}")
+            geo_mesh = geo_mesh[surf_mask]
+            surf_mesh = surf_mesh[surf_mask]
+            surf_data = surf_data[surf_mask]
+
+        if vol_mask is not None and not bool(vol_mask.all()):
+            dropped = int((~vol_mask).sum().item())
+            print(f"Warning: dropped {dropped} invalid volume rows in case {case_id}")
+            vol_mesh = vol_mesh[vol_mask]
+            vol_data = vol_data[vol_mask]
+
+        if geo_mesh.shape[0] == 0 or surf_mesh.shape[0] == 0 or vol_mesh.shape[0] == 0:
+            self.bad_cases.add(str(case_id))
+            raise ValueError(f"Case {case_id} has no valid points after NaN/Inf filtering.")
+
+        return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data
+
+    def _next_valid_case_index(self, idx):
+        if len(self.bad_cases) >= len(self.data):
+            raise RuntimeError("All dataset cases are marked bad after filtering.")
+
+        n = len(self.data)
+        for step in range(n):
+            j = (idx + step) % n
+            if str(self.data[j]) not in self.bad_cases:
+                return j
+        raise RuntimeError("No valid dataset case found.")
+
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         """Retrieves a sample for a given index with geometry, surface mesh and data, and volume mesh and data."""
-        case_id = self.data[idx]
-        geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data = self._load_case_arrays(case_id, write_cache=True)
+        tried = 0
+        n = len(self.data)
+        while tried < n:
+            idx = self._next_valid_case_index(idx)
+            case_id = self.data[idx]
+            try:
+                geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data = self._load_case_arrays(case_id, write_cache=True)
+                break
+            except Exception as exc:
+                self.bad_cases.add(str(case_id))
+                print(f"Warning: skipping problematic case {case_id}: {exc}")
+                idx = (idx + 1) % n
+                tried += 1
+        else:
+            raise RuntimeError("No valid samples available after filtering problematic cases.")
 
         if self.geometry_points > 0:
-            if not self.fast_approx_sampling and self.geometry_points <= geo_mesh.shape[0]:
+            if self.geometry_points <= geo_mesh.shape[0]:
                 geo_points = torch.randperm(geo_mesh.shape[0])[:self.geometry_points]
             else:
+                # Fallback only when k > n.
                 geo_points = torch.randint(0, geo_mesh.shape[0], (self.geometry_points,))
         else:
             geo_points = torch.arange(geo_mesh.shape[0])
         geo_mesh = (geo_mesh[geo_points, :] - self.min_pos) / (self.max_pos - self.min_pos)
 
         if self.surface_points > 0:
-            if not self.fast_approx_sampling and self.surface_points <= surf_mesh.shape[0]:
+            if self.surface_points <= surf_mesh.shape[0]:
                 surface_points = torch.randperm(surf_mesh.shape[0])[:self.surface_points]
             else:
+                # Fallback only when k > n.
                 surface_points = torch.randint(0, surf_mesh.shape[0], (self.surface_points,))
         else:
             surface_points = torch.arange(surf_mesh.shape[0])
@@ -408,9 +529,10 @@ class NACA4Dataset(Dataset):
         surf_data = (surf_data[surface_points, :] - self.mean_surf_data) / self.std_surf_data
 
         if self.volume_points > 0:
-            if not self.fast_approx_sampling and self.volume_points <= vol_mesh.shape[0]:
+            if self.volume_points <= vol_mesh.shape[0]:
                 vol_points = torch.randperm(vol_mesh.shape[0])[:self.volume_points]
             else:
+                # Fallback only when k > n.
                 vol_points = torch.randint(0, vol_mesh.shape[0], (self.volume_points,))
         else:
             vol_points = torch.arange(vol_mesh.shape[0])

@@ -28,11 +28,11 @@ from tqdm.auto import tqdm
 
 from data.naca4_dataset import NACA4Dataset
 from models.smart.smart import SMART
-from utils.utils import get_model_checkpoint_name
+from utils.utils import get_model_checkpoint_name, apply_naca4_auto_point_budget, print_point_budget
 
 
-SURFACE_FIELDS = ["pressure", "normal_x", "normal_y"]
-VOLUME_FIELDS = ["pressure", "sdf", "velocity_x", "velocity_y"]
+FULL_SURFACE_FIELDS = ["pressure", "normal_x", "normal_y"]
+FULL_VOLUME_FIELDS = ["pressure", "sdf", "velocity_x", "velocity_y"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -114,8 +114,8 @@ def select_geometry(geo_points: torch.Tensor, target_points: int, seed: int) -> 
 
     generator = torch.Generator(device="cpu")
     generator.manual_seed(seed)
-    perm = torch.randperm(geo_points.shape[0], generator=generator)
-    return geo_points[perm[:target_points]]
+    idx = torch.randint(0, geo_points.shape[0], (target_points,), generator=generator)
+    return geo_points[idx]
 
 
 def load_case_raw(dataset, case_id: str):
@@ -150,8 +150,8 @@ def predict_chunked(
 ) -> torch.Tensor:
     if query_points.numel() == 0:
         if field_kind == "surface":
-            return query_points.new_empty((0, len(SURFACE_FIELDS)))
-        return query_points.new_empty((0, len(VOLUME_FIELDS)))
+            return query_points.new_empty((0, model.surface_channels))
+        return query_points.new_empty((0, model.volume_channels))
 
     outputs: List[torch.Tensor] = []
     for start, end in chunk_indices(query_points.shape[0], chunk_size):
@@ -455,6 +455,20 @@ def main():
         scale_positions=bool(config.scale_positions),
         manifest_variant=getattr(config, "manifest_variant", "full"),
     )
+
+    point_info = apply_naca4_auto_point_budget(config, train_data, for_cat=False)
+    if point_info is not None:
+        print_point_budget("SMART-VIZ", point_info)
+
+    train_data = NACA4Dataset(
+        config.data_path,
+        if_test=False,
+        geometry_points=int(config.num_body_points),
+        surface_points=int(config.num_surface_points),
+        volume_points=int(config.num_volume_points),
+        scale_positions=bool(config.scale_positions),
+        manifest_variant=getattr(config, "manifest_variant", "full"),
+    )
     test_data = NACA4Dataset(
         config.data_path,
         if_test=True,
@@ -495,6 +509,20 @@ def main():
     print(f"Loaded checkpoint: {checkpoint_path}")
     print(f"Total parameters: {count_model_params(model)}")
 
+    if model.surface_channels == 1:
+        surface_fields = ["pressure"]
+    else:
+        surface_fields = FULL_SURFACE_FIELDS[:model.surface_channels]
+
+    if model.volume_channels == 2:
+        volume_fields = ["velocity_x", "velocity_y"]
+        vol_channel_idx = [2, 3]  # from raw/full volume targets
+    else:
+        volume_fields = FULL_VOLUME_FIELDS[:model.volume_channels]
+        vol_channel_idx = list(range(model.volume_channels))
+
+    print(f"Visualization fields: surface={surface_fields}, volume={volume_fields}")
+
     dataset = test_data if args.split == "test" else train_data
     case_ids = list(dataset.data)
     if args.case_ids:
@@ -503,7 +531,7 @@ def main():
     else:
         case_ids = case_ids[: args.num_cases]
 
-    query_chunk_size = args.chunk_size or max(int(config.num_surface_points), int(config.num_volume_points))
+    query_chunk_size = args.chunk_size or max(int(config.num_volume_points), 1)
     roi_specs = [("full", [-5.0, 5.0, -5.0, 5.0]), ("roi", args.roi)]
 
     root_dir = Path(config.output_dir or os.path.join("results", "field_error", config.dataset, checkpoint_name))
@@ -528,9 +556,9 @@ def main():
                 vol_roi_mask = roi_mask(vol_mesh, roi)
 
                 surf_xy = surf_mesh[surf_roi_mask]
-                surf_gt = surf_data[surf_roi_mask]
+                surf_gt = surf_data[surf_roi_mask][:, :model.surface_channels]
                 vol_xy = vol_mesh[vol_roi_mask]
-                vol_gt = vol_data[vol_roi_mask]
+                vol_gt = vol_data[vol_roi_mask][:, vol_channel_idx]
 
                 if surf_xy.numel() == 0 or vol_xy.numel() == 0:
                     print(f"Skipping {case_id} [{tag}]: no points found in ROI {roi}")
@@ -564,9 +592,9 @@ def main():
                     device=device,
                 )
 
-                surf_pred = (surf_pred_norm * dataset.std_surf_data + dataset.mean_surf_data).numpy()
+                surf_pred = (surf_pred_norm * dataset.std_surf_data[:model.surface_channels] + dataset.mean_surf_data[:model.surface_channels]).numpy()
                 surf_gt_np = surf_gt.numpy()
-                vol_pred = (vol_pred_norm * dataset.std_vol_data + dataset.mean_vol_data).numpy()
+                vol_pred = (vol_pred_norm * dataset.std_vol_data[vol_channel_idx] + dataset.mean_vol_data[vol_channel_idx]).numpy()
                 vol_gt_np = vol_gt.numpy()
 
                 surface_field_metrics = {
@@ -594,8 +622,8 @@ def main():
                     vol_xy=vol_xy.numpy(),
                     vol_gt=vol_gt_np,
                     vol_pred=vol_pred,
-                    surface_fields=np.array(SURFACE_FIELDS),
-                    volume_fields=np.array(VOLUME_FIELDS),
+                    surface_fields=np.array(surface_fields),
+                    volume_fields=np.array(volume_fields),
                     roi=np.array(roi, dtype=np.float32),
                     chunk_size=np.array([query_chunk_size], dtype=np.int64),
                     checkpoint=np.array([checkpoint_path]),
@@ -617,7 +645,7 @@ def main():
                         indent=2,
                     )
 
-                for idx, field_name in enumerate(SURFACE_FIELDS):
+                for idx, field_name in enumerate(surface_fields):
                     save_field_figure(
                         case_dir / f"surface_{field_name}_panel.png",
                         f"Case {case_id} - Surface {field_name} over {tag}",
@@ -628,7 +656,7 @@ def main():
                         field_units=("Pa" if field_name == "pressure" else "unitless"),
                         roi=roi,
                     )
-                for idx, field_name in enumerate(VOLUME_FIELDS):
+                for idx, field_name in enumerate(volume_fields):
                     save_field_figure(
                         case_dir / f"volume_{field_name}_panel.png",
                         f"Case {case_id} - Volume {field_name} over {tag}",
@@ -655,7 +683,7 @@ def main():
                     surf_xy.numpy(),
                     surf_gt_np,
                     surf_pred,
-                    SURFACE_FIELDS,
+                    surface_fields,
                     roi=roi,
                 )
                 save_group_overview_figure(
@@ -664,44 +692,39 @@ def main():
                     vol_xy.numpy(),
                     vol_gt_np,
                     vol_pred,
-                    VOLUME_FIELDS,
+                    volume_fields,
                     roi=roi,
                 )
-                save_combined_study_figure(
-                    case_dir / "study_panel.png",
-                    f"Case {case_id} - Combined study ({tag})",
-                    surf_xy.numpy(),
-                    surf_gt_np,
-                    surf_pred,
-                    vol_xy.numpy(),
-                    vol_gt_np,
-                    vol_pred,
-                    roi=roi,
-                )
+                if model.surface_channels >= 3 and model.volume_channels >= 4:
+                    save_combined_study_figure(
+                        case_dir / "study_panel.png",
+                        f"Case {case_id} - Combined study ({tag})",
+                        surf_xy.numpy(),
+                        surf_gt_np,
+                        surf_pred,
+                        vol_xy.numpy(),
+                        vol_gt_np,
+                        vol_pred,
+                        roi=roi,
+                    )
 
                 summary_row = {
                     "case_id": case_id,
-                    "surface_pressure_mae": surface_field_metrics["pressure"]["mae"],
-                    "surface_pressure_rel_l2": surface_field_metrics["pressure"]["rel_l2"],
-                    "surface_normal_x_mae": surface_field_metrics["normal_x"]["mae"],
-                    "surface_normal_x_rel_l2": surface_field_metrics["normal_x"]["rel_l2"],
-                    "surface_normal_y_mae": surface_field_metrics["normal_y"]["mae"],
-                    "surface_normal_y_rel_l2": surface_field_metrics["normal_y"]["rel_l2"],
-                    "surface_normals_rel_l2": surface_normals_metrics["rel_l2"],
-                    "volume_pressure_mae": volume_field_metrics["pressure"]["mae"],
-                    "volume_pressure_rel_l2": volume_field_metrics["pressure"]["rel_l2"],
-                    "volume_sdf_mae": volume_field_metrics["sdf"]["mae"],
-                    "volume_sdf_rel_l2": volume_field_metrics["sdf"]["rel_l2"],
-                    "volume_velocity_x_mae": volume_field_metrics["velocity_x"]["mae"],
-                    "volume_velocity_x_rel_l2": volume_field_metrics["velocity_x"]["rel_l2"],
-                    "volume_velocity_y_mae": volume_field_metrics["velocity_y"]["mae"],
-                    "volume_velocity_y_rel_l2": volume_field_metrics["velocity_y"]["rel_l2"],
-                    "volume_velocity_rel_l2": volume_velocity_metrics["rel_l2"],
-                    "speed_mae": speed_metrics["mae"],
-                    "speed_rel_l2": speed_metrics["rel_l2"],
                     "surf_points": int(surf_xy.shape[0]),
                     "vol_points": int(vol_xy.shape[0]),
                 }
+                for field_name in surface_fields:
+                    summary_row[f"surface_{field_name}_mae"] = surface_field_metrics[field_name]["mae"]
+                    summary_row[f"surface_{field_name}_rel_l2"] = surface_field_metrics[field_name]["rel_l2"]
+                for field_name in volume_fields:
+                    summary_row[f"volume_{field_name}_mae"] = volume_field_metrics[field_name]["mae"]
+                    summary_row[f"volume_{field_name}_rel_l2"] = volume_field_metrics[field_name]["rel_l2"]
+                if "normal_x" in surface_fields and "normal_y" in surface_fields:
+                    summary_row["surface_normals_rel_l2"] = surface_normals_metrics["rel_l2"]
+                if "velocity_x" in volume_fields and "velocity_y" in volume_fields:
+                    summary_row["volume_velocity_rel_l2"] = volume_velocity_metrics["rel_l2"]
+                    summary_row["speed_mae"] = speed_metrics["mae"]
+                    summary_row["speed_rel_l2"] = speed_metrics["rel_l2"]
                 summary_rows.append(summary_row)
 
             with open(out_root / "summary.json", "w", encoding="utf-8") as f:

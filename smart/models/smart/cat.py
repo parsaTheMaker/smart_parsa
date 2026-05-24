@@ -14,6 +14,39 @@ import torch.nn as nn
 from .smart import ModulatedPositionalEmbedding, CrossAttention, PlainMLP
 
 
+class LoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, rank: int = 16, alpha: float = 16.0):
+        super().__init__()
+        if rank <= 0:
+            raise ValueError("LoRA rank must be > 0")
+        self.base = base
+        self.rank = int(rank)
+        self.alpha = float(alpha)
+        self.scaling = self.alpha / self.rank
+
+        in_features = base.in_features
+        out_features = base.out_features
+
+        device = base.weight.device
+        dtype = base.weight.dtype
+        self.lora_a = nn.Parameter(torch.zeros(self.rank, in_features, device=device, dtype=dtype))
+        self.lora_b = nn.Parameter(torch.zeros(out_features, self.rank, device=device, dtype=dtype))
+
+        # Freeze base linear; train only LoRA adapters.
+        for p in self.base.parameters():
+            p.requires_grad = False
+
+        nn.init.kaiming_uniform_(self.lora_a, a=5 ** 0.5)
+        nn.init.zeros_(self.lora_b)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base_out = self.base(x)
+        # delta = (x @ A^T) @ B^T
+        delta = (x @ self.lora_a.t()) @ self.lora_b.t()
+        return base_out + self.scaling * delta
+
+
+
 class LoopEncoder(nn.Module):
     def __init__(
         self,
@@ -49,9 +82,14 @@ class LoopEncoder(nn.Module):
             return torch.randperm(n, device=device)[:anchors]
         return torch.randint(0, n, (anchors,), device=device)
 
-    def forward(self, surface_points_scaled: torch.Tensor, anchor_idx: torch.Tensor | None = None):
+    def forward(
+        self,
+        surface_points_scaled: torch.Tensor,
+        anchor_idx: torch.Tensor | None = None,
+        shared_chunks: list[torch.Tensor] | None = None,
+    ):
         # surface_points_scaled: [B, N, D]
-        bsz, n_pts, _ = surface_points_scaled.shape
+        _, n_pts, _ = surface_points_scaled.shape
         device = surface_points_scaled.device
 
         if anchor_idx is None:
@@ -60,9 +98,10 @@ class LoopEncoder(nn.Module):
         anchor_pos = surface_points_scaled[:, anchor_idx, :]
         latent = self.pos_encoder(anchor_pos)
 
-        chunks = self._chunk_indices(n_pts, self.loops, device)
+        chunks = shared_chunks if shared_chunks is not None else self._chunk_indices(n_pts, self.loops, device)
         intermediate_latents = []
-        for m, idx in enumerate(chunks):
+        for m in range(self.loops):
+            idx = chunks[m] if m < len(chunks) else torch.empty((0,), dtype=torch.long, device=device)
             if idx.numel() == 0:
                 intermediate_latents.append(latent)
                 continue
@@ -119,21 +158,82 @@ class LoopDecoder(nn.Module):
 
 
 class SharedFusion(nn.Module):
-    """Shared self-attention fusion block used at each CAT loop in Stage 3."""
+    """Cross-gated shared fusion block used at each CAT loop in Stage 3.
+
+    Improvements over the prior variant:
+    - Pre-norm each encoder stream before cross-gating.
+    - Residual-safe fusion with learnable scales initialized to near-identity.
+    - Stabilized gates initialized to weak coupling at startup.
+    """
 
     def __init__(self, latent_dim: int, num_heads: int, spatial_dim: int, dropout: float = 0.0):
         super().__init__()
+        self.norm_g = nn.LayerNorm(latent_dim, eps=1e-6)
+        self.norm_s = nn.LayerNorm(latent_dim, eps=1e-6)
+        self.norm_out = nn.LayerNorm(latent_dim, eps=1e-6)
+
+        # Bidirectional projections used by cross-gates.
+        self.geom_from_surf = nn.Linear(latent_dim, latent_dim)
+        self.surf_from_geom = nn.Linear(latent_dim, latent_dim)
+
+        # Token-wise/channel-wise gates computed from concatenated normalized latents.
+        self.gate_geom = nn.Sequential(
+            nn.Linear(2 * latent_dim, latent_dim),
+            nn.GELU(),
+            nn.Linear(latent_dim, latent_dim),
+            nn.Sigmoid(),
+        )
+        self.gate_surf = nn.Sequential(
+            nn.Linear(2 * latent_dim, latent_dim),
+            nn.GELU(),
+            nn.Linear(latent_dim, latent_dim),
+            nn.Sigmoid(),
+        )
+
         self.fuse_proj = nn.Linear(2 * latent_dim, latent_dim)
+
+        # Residual-safe scaling: start near identity and let training grow fusion contribution.
+        self.cross_delta_scale = nn.Parameter(torch.tensor(1e-2))
+        self.post_delta_scale = nn.Parameter(torch.tensor(1e-2))
+
         self.shared_attn = CrossAttention(dim=latent_dim, num_heads=num_heads, spatial_dim=spatial_dim, dropout=dropout)
         self.shared_ffn = PlainMLP(dim=latent_dim, hidden_dim=latent_dim * 4, dropout=dropout)
+
+        self._init_stable()
+
+    def _init_stable(self):
+        # Start with weak cross-stream gates to avoid noisy fusion early in training.
+        for gate in (self.gate_geom, self.gate_surf):
+            last = gate[-2]
+            if isinstance(last, nn.Linear):
+                nn.init.zeros_(last.weight)
+                nn.init.constant_(last.bias, -2.0)
 
     def forward(self, geom_latents: list[torch.Tensor], surf_latents: list[torch.Tensor], anchor_pos_scaled: torch.Tensor):
         fused = []
         loops = min(len(geom_latents), len(surf_latents))
         for m in range(loops):
-            z = self.fuse_proj(torch.cat([geom_latents[m], surf_latents[m]], dim=-1))
-            z = z + self.shared_attn(q=z, kv=z, q_pos=anchor_pos_scaled, kv_pos=anchor_pos_scaled)
-            z = z + self.shared_ffn(z, None)
+            g = geom_latents[m]
+            s = surf_latents[m]
+
+            g_n = self.norm_g(g)
+            s_n = self.norm_s(s)
+            cat = torch.cat([g_n, s_n], dim=-1)
+
+            # Cross-gated bidirectional feature injection.
+            gate_g = self.gate_geom(cat)
+            gate_s = self.gate_surf(cat)
+            g_tilde = g_n + gate_g * self.geom_from_surf(s_n)
+            s_tilde = s_n + gate_s * self.surf_from_geom(g_n)
+
+            base = 0.5 * (g + s)
+            cross_delta = self.fuse_proj(torch.cat([g_tilde, s_tilde], dim=-1))
+            z = base + torch.tanh(self.cross_delta_scale) * cross_delta
+
+            z_norm = self.norm_out(z)
+            post_delta = self.shared_attn(q=z_norm, kv=z_norm, q_pos=anchor_pos_scaled, kv_pos=anchor_pos_scaled)
+            post_delta = post_delta + self.shared_ffn(z_norm, None)
+            z = z + torch.tanh(self.post_delta_scale) * post_delta
             fused.append(z)
         return fused
 
@@ -199,11 +299,21 @@ class CAT(nn.Module):
     def _scale(self, pos: torch.Tensor):
         return pos * self.pos_scale_factor
 
-    def encode_geometry(self, surface_points: torch.Tensor, anchor_idx: torch.Tensor | None = None):
-        return self.geometry_encoder(self._scale(surface_points), anchor_idx=anchor_idx)
+    def encode_geometry(
+        self,
+        surface_points: torch.Tensor,
+        anchor_idx: torch.Tensor | None = None,
+        shared_chunks: list[torch.Tensor] | None = None,
+    ):
+        return self.geometry_encoder(self._scale(surface_points), anchor_idx=anchor_idx, shared_chunks=shared_chunks)
 
-    def encode_surface(self, surface_points: torch.Tensor, anchor_idx: torch.Tensor | None = None):
-        return self.surface_encoder(self._scale(surface_points), anchor_idx=anchor_idx)
+    def encode_surface(
+        self,
+        surface_points: torch.Tensor,
+        anchor_idx: torch.Tensor | None = None,
+        shared_chunks: list[torch.Tensor] | None = None,
+    ):
+        return self.surface_encoder(self._scale(surface_points), anchor_idx=anchor_idx, shared_chunks=shared_chunks)
 
     def forward_stage1(self, surface_points: torch.Tensor, query_points: torch.Tensor):
         geom_latents, anchor_pos, _ = self.encode_geometry(surface_points)
@@ -216,22 +326,38 @@ class CAT(nn.Module):
         return self.stage2_head(q)
 
     def forward_stage3(self, surface_points: torch.Tensor, volume_query_points: torch.Tensor):
-        # Same anchor index so latent_g_m and latent_s_m are aligned point-wise.
+        # Same anchor index and same per-loop surface chunks so latent_g_m and latent_s_m are aligned.
         n_pts = surface_points.shape[1]
-        anchor_idx = LoopEncoder._sample_anchor_idx(n_pts, self.geometry_encoder.anchors, surface_points.device)
+        device = surface_points.device
+        anchor_idx = LoopEncoder._sample_anchor_idx(n_pts, self.geometry_encoder.anchors, device)
+        shared_chunks = LoopEncoder._chunk_indices(n_pts, self.loops, device)
 
-        geom_latents, anchor_pos, _ = self.encode_geometry(surface_points, anchor_idx=anchor_idx)
-        surf_latents, _, _ = self.encode_surface(surface_points, anchor_idx=anchor_idx)
+        geom_latents, anchor_pos, _ = self.encode_geometry(surface_points, anchor_idx=anchor_idx, shared_chunks=shared_chunks)
+        surf_latents, _, _ = self.encode_surface(surface_points, anchor_idx=anchor_idx, shared_chunks=shared_chunks)
 
         fused_latents = self.fusion(geom_latents, surf_latents, anchor_pos)
         q = self.stage3_decoder(self._scale(volume_query_points), fused_latents, anchor_pos)
         return self.stage3_head(q)
+
+    @staticmethod
+    def _replace_linear_with_lora(module: nn.Module, rank: int, alpha: float):
+        for name, child in list(module.named_children()):
+            if isinstance(child, nn.Linear):
+                setattr(module, name, LoRALinear(child, rank=rank, alpha=alpha))
+            else:
+                CAT._replace_linear_with_lora(child, rank=rank, alpha=alpha)
 
     def freeze_stage3_encoders(self):
         for p in self.geometry_encoder.parameters():
             p.requires_grad = False
         for p in self.surface_encoder.parameters():
             p.requires_grad = False
+
+    def enable_stage3_encoder_lora(self, rank: int = 16, alpha: float = 16.0):
+        # Freeze encoder backbones first, then attach trainable LoRA to all encoder Linear layers.
+        self.freeze_stage3_encoders()
+        self._replace_linear_with_lora(self.geometry_encoder, rank=rank, alpha=alpha)
+        self._replace_linear_with_lora(self.surface_encoder, rank=rank, alpha=alpha)
 
     @torch.no_grad()
     def inference_stage3(self, surface_points: torch.Tensor, volume_query_points: torch.Tensor):

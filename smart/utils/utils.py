@@ -5,7 +5,7 @@ import numpy as np
 import random
 from loss.losses import RelL2Loss
 from lion_pytorch import Lion
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 import os
 import json
 import re
@@ -63,6 +63,94 @@ def get_run_name(config, fields=None):
 
 def get_output_run_name(config, fields=None):
     return get_run_name(config, fields)
+
+
+
+def apply_naca4_auto_point_budget(config, dataset_obj, for_cat=False):
+    """Auto-resolve point budgets from the minimum non-zero surface count across the dataset."""
+    if getattr(config, "dataset", None) != "NACA4":
+        return None
+
+    if not hasattr(dataset_obj, "get_min_surface_points_nonzero"):
+        return None
+
+    min_surface = int(dataset_obj.get_min_surface_points_nonzero())
+    if min_surface <= 0:
+        raise ValueError("Could not infer a positive minimum surface-point count from NACA4 dataset.")
+
+    num_blocks = int(getattr(getattr(config, "architecture", {}), "num_encoder_decoder_blocks", 1))
+    num_blocks = max(num_blocks, 1)
+
+    effective_surface_points = min_surface
+    anchor_points = max(1, effective_surface_points // num_blocks)
+
+    config.num_body_points = effective_surface_points
+    config.num_surface_points = effective_surface_points
+
+    if hasattr(config, "architecture"):
+        with open_dict(config.architecture):
+            config.architecture.subsampled_geometry_points = effective_surface_points
+            config.architecture.latent_geometry_points = anchor_points
+
+    info = {
+        "min_surface_points_nonzero": min_surface,
+        "effective_surface_points": effective_surface_points,
+        "num_blocks": num_blocks,
+        "anchor_points": anchor_points,
+    }
+
+    if for_cat:
+        with open_dict(config):
+            config.stage1_surface_input_points = effective_surface_points
+            config.stage1_surface_query_points = effective_surface_points
+            config.stage2_surface_input_points = effective_surface_points
+            config.stage2_surface_query_points = effective_surface_points
+            config.stage3_surface_input_points = effective_surface_points
+
+        stage3_vq = int(getattr(config, "stage3_volume_query_points", 0))
+        if stage3_vq <= 0:
+            stage3_vq = int(getattr(config, "num_volume_points", 0))
+        if stage3_vq <= 0 and hasattr(dataset_obj, "get_min_volume_points_nonzero"):
+            stage3_vq = int(dataset_obj.get_min_volume_points_nonzero())
+        if stage3_vq <= 0:
+            raise ValueError("Could not infer a positive stage3 volume query count.")
+
+        with open_dict(config):
+            config.stage3_volume_query_points = stage3_vq
+            # Request: stage1 volume query should be 4x old value and equal to stage3 volume query.
+            config.stage1_volume_query_points = stage3_vq
+
+        info.update({
+            "stage1_surface_input_points": int(config.stage1_surface_input_points),
+            "stage1_surface_query_points": int(config.stage1_surface_query_points),
+            "stage1_volume_query_points": int(config.stage1_volume_query_points),
+            "stage2_surface_input_points": int(config.stage2_surface_input_points),
+            "stage2_surface_query_points": int(config.stage2_surface_query_points),
+            "stage3_surface_input_points": int(config.stage3_surface_input_points),
+            "stage3_volume_query_points": int(config.stage3_volume_query_points),
+        })
+
+    return info
+
+
+def print_point_budget(prefix, info):
+    if not info:
+        return
+    print(f"[{prefix}] min surface points (non-zero across dataset): {info['min_surface_points_nonzero']}")
+    print(f"[{prefix}] effective surface points: {info['effective_surface_points']}")
+    print(f"[{prefix}] encoder/decoder blocks (M): {info['num_blocks']}")
+    print(f"[{prefix}] anchor points (effective_surface/M): {info['anchor_points']}")
+    for key in [
+        "stage1_surface_input_points",
+        "stage1_surface_query_points",
+        "stage1_volume_query_points",
+        "stage2_surface_input_points",
+        "stage2_surface_query_points",
+        "stage3_surface_input_points",
+        "stage3_volume_query_points",
+    ]:
+        if key in info:
+            print(f"[{prefix}] {key}: {info[key]}")
 
 def initialize_gpu(random_seed, high_precision=True):
     """Initializes the GPU settings and sets the random seed."""

@@ -287,9 +287,21 @@ class CAT(nn.Module):
 
         self.stage1_decoder = LoopDecoder(latent_dim=latent_dim, loops=self.loops, num_heads=num_heads, spatial_dim=spatial_dim, dropout=dropout)
         self.stage2_decoder = LoopDecoder(latent_dim=latent_dim, loops=self.loops, num_heads=num_heads, spatial_dim=spatial_dim, dropout=dropout)
-        self.stage3_decoder = LoopDecoder(latent_dim=latent_dim, loops=self.loops, num_heads=num_heads, spatial_dim=spatial_dim, dropout=dropout)
+
+        # Stage3: dual query decoders (geometry stream + surface stream), then learned query-level fusion.
+        self.stage3_decoder_geom = LoopDecoder(latent_dim=latent_dim, loops=self.loops, num_heads=num_heads, spatial_dim=spatial_dim, dropout=dropout)
+        self.stage3_decoder_surf = LoopDecoder(latent_dim=latent_dim, loops=self.loops, num_heads=num_heads, spatial_dim=spatial_dim, dropout=dropout)
 
         self.fusion = SharedFusion(latent_dim=latent_dim, num_heads=num_heads, spatial_dim=spatial_dim, dropout=dropout)
+
+        self.stage3_query_fuse_gate = nn.Sequential(
+            nn.LayerNorm(2 * latent_dim, eps=1e-6),
+            nn.Linear(2 * latent_dim, latent_dim),
+            nn.GELU(),
+            nn.Linear(latent_dim, latent_dim),
+            nn.Sigmoid(),
+        )
+        self.stage3_query_fuse_proj = nn.Linear(2 * latent_dim, latent_dim)
 
         stage1_out = stage1_surface_attr_channels + stage1_volume_attr_channels
         self.stage1_head = nn.Sequential(nn.Linear(latent_dim, 128), nn.GELU(), nn.Linear(128, 64), nn.GELU(), nn.Linear(64, stage1_out))
@@ -335,8 +347,16 @@ class CAT(nn.Module):
         geom_latents, anchor_pos, _ = self.encode_geometry(surface_points, anchor_idx=anchor_idx, shared_chunks=shared_chunks)
         surf_latents, _, _ = self.encode_surface(surface_points, anchor_idx=anchor_idx, shared_chunks=shared_chunks)
 
-        fused_latents = self.fusion(geom_latents, surf_latents, anchor_pos)
-        q = self.stage3_decoder(self._scale(volume_query_points), fused_latents, anchor_pos)
+        # Dual-stream query decoding before final head.
+        q_geom = self.stage3_decoder_geom(self._scale(volume_query_points), geom_latents, anchor_pos)
+        q_surf = self.stage3_decoder_surf(self._scale(volume_query_points), surf_latents, anchor_pos)
+
+        q_cat = torch.cat([q_geom, q_surf], dim=-1)
+        gate = self.stage3_query_fuse_gate(q_cat)
+        q_dual = gate * q_geom + (1.0 - gate) * q_surf
+        q_mix = self.stage3_query_fuse_proj(q_cat)
+
+        q = q_dual + q_mix
         return self.stage3_head(q)
 
     @staticmethod

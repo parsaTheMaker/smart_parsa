@@ -264,8 +264,16 @@ def build_stage_payload(model: CAT, stage: int):
     else:
         payload["geometry_encoder_state_dict"] = model.geometry_encoder.state_dict()
         payload["surface_encoder_state_dict"] = model.surface_encoder.state_dict()
-        payload["fusion_state_dict"] = model.fusion.state_dict()
-        payload["stage3_decoder_state_dict"] = model.stage3_decoder.state_dict()
+        if hasattr(model, "fusion"):
+            payload["fusion_state_dict"] = model.fusion.state_dict()
+        if hasattr(model, "stage3_decoder"):
+            payload["stage3_decoder_state_dict"] = model.stage3_decoder.state_dict()
+        if hasattr(model, "stage3_decoder_geom"):
+            payload["stage3_decoder_geom_state_dict"] = model.stage3_decoder_geom.state_dict()
+            # Backward-compatible alias for tooling expecting single key.
+            payload["stage3_decoder_state_dict"] = model.stage3_decoder_geom.state_dict()
+        if hasattr(model, "stage3_decoder_surf"):
+            payload["stage3_decoder_surf_state_dict"] = model.stage3_decoder_surf.state_dict()
         payload["stage3_head_state_dict"] = model.stage3_head.state_dict()
     return payload
 
@@ -392,9 +400,12 @@ def main(cfg: DictConfig):
             raise ValueError("Stage 3 requires stage3_geometry_ckpt and stage3_surface_ckpt in config.")
         load_encoder_from_checkpoint(model, geom_ckpt, which="geometry")
         load_encoder_from_checkpoint(model, surf_ckpt, which="surface")
-        model.enable_stage3_encoder_lora(rank=32, alpha=32.0)
+        for p in model.geometry_encoder.parameters():
+            p.requires_grad = True
+        for p in model.surface_encoder.parameters():
+            p.requires_grad = True
         print(f"Loaded encoders from: {geom_ckpt} and {surf_ckpt}")
-        print("Enabled stage3 encoder LoRA with rank=32, alpha=32.0")
+        print("Stage3 encoders are fully trainable (LoRA disabled).")
 
     model_checkpoint_name = get_model_checkpoint_name(config)
     model_checkpoint_name = f"{model_checkpoint_name}-cat-stage{stage}"

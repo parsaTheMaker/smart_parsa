@@ -182,9 +182,10 @@ def build_model_payload(model: CAT):
         "surface_decoder_state_dict": model.surface_decoder.state_dict(),
         "stage2_head_state_dict": model.stage2_head.state_dict(),
         "surface_physics_encoder_state_dict": model.surface_physics_encoder.state_dict(),
+        "volume_head_state_dict": model.volume_head.state_dict(),
+        "stage3_head_state_dict": model.volume_head.state_dict(),
         "volume_decoder_state_dict": model.volume_decoder.state_dict(),
-        "stage3_head_state_dict": model.stage3_head.state_dict(),
-        "stage3_decoder_state_dict": model.stage3_decoder.state_dict(),
+        "stage3_decoder_state_dict": model.volume_decoder.state_dict(),
     }
 
 
@@ -249,8 +250,11 @@ def main(cfg: DictConfig):
         if not stage1_ckpt:
             raise ValueError("Stage 2 requires experiment.stage2_stage1_ckpt")
         load_stage1_weights(model, stage1_ckpt, device)
+        with torch.no_grad():
+            model.surface_to_volume_skip_weights.fill_(0.2)
         model.freeze_stage1()
         print("Stage 1 modules frozen for stage 2 training.")
+        print("Reset surface_to_volume_skip_weights to 0.2 after stage-1 checkpoint load.")
 
     model_checkpoint_name = f"{get_model_checkpoint_name(config)}-cat-stage{stage}"
     print(f"Total parameters: {count_model_params(model)}")
@@ -387,7 +391,7 @@ def main(cfg: DictConfig):
                 "stage": stage,
             }
             if stage == 2:
-                w = torch.clamp(model.surface_to_volume_skip_weights.detach(), min=0.0, max=1.0)
+                w = model.surface_to_volume_skip_weights.detach()
                 epoch_log["model/surface_to_volume_skip_weight_mean"] = float(w.mean().item())
                 epoch_log["model/surface_to_volume_skip_weight_std"] = float(w.std(unbiased=False).item())
             add_canonical_field_metrics(epoch_log, "train", s_fields, vol_signals, metric_values=train_metrics)

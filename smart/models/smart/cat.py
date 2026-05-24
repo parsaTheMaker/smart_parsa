@@ -124,24 +124,26 @@ class CAT(nn.Module):
         self.stage2_head = nn.Sequential(
             nn.Linear(latent_dim, 128), nn.GELU(), nn.Linear(128, 64), nn.GELU(), nn.Linear(64, stage2_surface_channels)
         )
-        self.stage3_head = nn.Sequential(
+        self.volume_head = nn.Sequential(
             nn.Linear(latent_dim, 128), nn.GELU(), nn.Linear(128, 64), nn.GELU(), nn.Linear(64, volume_channels)
         )
 
         # Per-block coupling for stage-1->stage-2 latent injection.
-        self.surface_to_volume_skip_weights = nn.Parameter(torch.full((self.loops,), 1e-2))
-        self.surface_to_volume_skip_weight = self.surface_to_volume_skip_weights
+        # Direct trainable scalar weights (no sigmoid).
+        self.surface_to_volume_skip_weights = nn.Parameter(torch.full((self.loops,), 0.2))
+        # Light latent normalization before coupling for stability.
+        self.surface_to_volume_latent_norm = nn.LayerNorm(latent_dim)
 
         # Compatibility aliases expected by tooling.
         self.geometry_encoder = self.geometry_encoder_blocks
-        self.surface_encoder = self.surface_physics_encoder_blocks
         self.surface_physics_encoder = self.surface_physics_encoder_blocks
         self.surface_decoder = self.surface_decoder_blocks
-        self.stage1_decoder = self.surface_decoder_blocks
         self.stage2_decoder = self.surface_decoder_blocks
         self.volume_decoder = self.volume_decoder_blocks
         self.stage3_decoder = self.volume_decoder_blocks
+        self.stage3_head = self.volume_head
 
+    
     def _scale_pos(self, pos: torch.Tensor):
         return pos * self.pos_scale_factor
 
@@ -215,16 +217,21 @@ class CAT(nn.Module):
         prev_latents, _ = self._encode_stage2(surface_query_pos, surface_pred, anchor_pos, initial_latent=geom_final)
         new_latents, _ = self._encode_stage2(surface_query_pos, surface_pred, anchor_pos, initial_latent=None)
 
-        w = torch.clamp(self.surface_to_volume_skip_weights, min=0.0, max=1.0)
+        w = self.surface_to_volume_skip_weights
         fused_latents = []
         for m in range(self.loops):
             wm = w[m].view(1, 1, 1)
-            coupled = prev_latents[m] + wm * geom_latents[m]
-            fused = (1.0 - wm) * new_latents[m] + wm * coupled
+            geom_m = self.surface_to_volume_latent_norm(geom_latents[m])
+            prev_m = self.surface_to_volume_latent_norm(prev_latents[m])
+            new_m = self.surface_to_volume_latent_norm(new_latents[m])
+
+            # Residual gated updates keep behavior smooth and close to SMART-style iterative refinement.
+            coupled = prev_m + wm * (geom_m - prev_m)
+            fused = new_m + wm * (coupled - new_m)
             fused_latents.append(fused)
 
         qv = self._decode(volume_query_pos, fused_latents, anchor_pos, self.volume_decoder_blocks)
-        volume_pred = self.stage3_head(qv)
+        volume_pred = self.volume_head(qv)
 
         if return_aux:
             return volume_pred, {
@@ -250,16 +257,21 @@ class CAT(nn.Module):
         prev_latents, _ = self._encode_stage2(surface_query_pos, surface_pred, anchor_pos, initial_latent=geom_final)
         new_latents, _ = self._encode_stage2(surface_query_pos, surface_pred, anchor_pos, initial_latent=None)
 
-        w = torch.clamp(self.surface_to_volume_skip_weights, min=0.0, max=1.0)
+        w = self.surface_to_volume_skip_weights
         fused_latents = []
         for m in range(self.loops):
             wm = w[m].view(1, 1, 1)
-            coupled = prev_latents[m] + wm * geom_latents[m]
-            fused = (1.0 - wm) * new_latents[m] + wm * coupled
+            geom_m = self.surface_to_volume_latent_norm(geom_latents[m])
+            prev_m = self.surface_to_volume_latent_norm(prev_latents[m])
+            new_m = self.surface_to_volume_latent_norm(new_latents[m])
+
+            # Residual gated updates keep behavior smooth and close to SMART-style iterative refinement.
+            coupled = prev_m + wm * (geom_m - prev_m)
+            fused = new_m + wm * (coupled - new_m)
             fused_latents.append(fused)
 
         qv = self._decode(volume_query_pos, fused_latents, anchor_pos, self.volume_decoder_blocks)
-        volume_pred = self.stage3_head(qv)
+        volume_pred = self.volume_head(qv)
 
         if return_aux:
             return surface_pred, volume_pred, {
@@ -303,8 +315,8 @@ class CAT(nn.Module):
     def forward_stage2(self, surface_points: torch.Tensor, surface_query_points: torch.Tensor):
         return self.forward_stage1_only(surface_points, surface_query_points, return_aux=False)
 
-    def forward_stage3(self, surface_points: torch.Tensor, volume_query_points: torch.Tensor):
-        return self.forward_stage2_only(surface_points, surface_points, volume_query_points, return_aux=False)
+    def forward_stage3(self, surface_input_tokens: torch.Tensor, surface_query_tokens: torch.Tensor, volume_query_tokens: torch.Tensor):
+        return self.forward_stage2_only(surface_input_tokens, surface_query_tokens, volume_query_tokens, return_aux=False)
 
     @torch.no_grad()
     def inference_stage3(self, surface_points: torch.Tensor, volume_query_points: torch.Tensor):
@@ -312,5 +324,5 @@ class CAT(nn.Module):
         preds = []
         for i in range(0, n_vol, self.subregion_size):
             q = volume_query_points[:, i : i + self.subregion_size, :]
-            preds.append(self.forward_stage3(surface_points, q))
+            preds.append(self.forward_stage2_only(surface_points, surface_points, q, return_aux=False))
         return torch.cat(preds, dim=1)

@@ -251,10 +251,11 @@ def main(cfg: DictConfig):
             raise ValueError("Stage 2 requires experiment.stage2_stage1_ckpt")
         load_stage1_weights(model, stage1_ckpt, device)
         with torch.no_grad():
-            model.surface_to_volume_skip_weights.fill_(0.2)
+            model.surface_to_volume_skip_couple_weights.fill_(0.05)
+            model.surface_to_volume_skip_fuse_weights.fill_(0.05)
         model.freeze_stage1()
         print("Stage 1 modules frozen for stage 2 training.")
-        print("Reset surface_to_volume_skip_weights to 0.2 after stage-1 checkpoint load.")
+        print("Reset surface_to_volume_skip_couple_weights and surface_to_volume_skip_fuse_weights to 0.05 after stage-1 checkpoint load.")
 
     model_checkpoint_name = f"{get_model_checkpoint_name(config)}-cat-stage{stage}"
     print(f"Total parameters: {count_model_params(model)}")
@@ -275,6 +276,16 @@ def main(cfg: DictConfig):
             model.train()
             train_metrics = init_metric_dict(s_fields, vol_signals)
             test_metrics = init_metric_dict(s_fields, vol_signals)
+            train_skip_sum = 0.0
+            train_skip_sq_sum = 0.0
+            train_skip_count = 0
+            train_skip_min = float("inf")
+            train_skip_max = float("-inf")
+            test_skip_sum = 0.0
+            test_skip_sq_sum = 0.0
+            test_skip_count = 0
+            test_skip_min = float("inf")
+            test_skip_max = float("-inf")
 
             train_pbar = tqdm(train_loader, desc=f"Train S{stage} {ep + 1}/{config.epochs}", leave=False, dynamic_ncols=True)
             for batch_idx, batch in enumerate(train_pbar):
@@ -305,6 +316,14 @@ def main(cfg: DictConfig):
                 for prefix, pred_ch, gt_ch, names in channel_specs:
                     accumulate_channel_rel(train_metrics, prefix, pred_ch, gt_ch, names, rel_l2, bsz)
 
+                if stage == 2 and aux is not None:
+                    skip_vals = aux["skip_weights"].detach()
+                    train_skip_sum += float(skip_vals.sum().item())
+                    train_skip_sq_sum += float((skip_vals * skip_vals).sum().item())
+                    train_skip_count += int(skip_vals.numel())
+                    train_skip_min = min(train_skip_min, float(skip_vals.min().item()))
+                    train_skip_max = max(train_skip_max, float(skip_vals.max().item()))
+
                 global_step += 1
                 if batch_idx % log_every_n_steps == 0 or batch_idx == len(train_loader) - 1:
                     batch_log = {
@@ -321,6 +340,17 @@ def main(cfg: DictConfig):
                     if aux is not None:
                         batch_log["model/surface_to_volume_skip_weight_mean"] = float(aux["skip_weight_mean"].detach().item())
                         batch_log["model/surface_to_volume_skip_weight_std"] = float(aux["skip_weight_std"].detach().item())
+                        batch_log["model/surface_to_volume_skip_weight_min"] = float(aux["skip_weights"].detach().min().item())
+                        batch_log["model/surface_to_volume_skip_weight_max"] = float(aux["skip_weights"].detach().max().item())
+                        if "skip_weights_couple" in aux:
+                            batch_log["model/surface_to_volume_skip_weight_couple_mean"] = float(aux["skip_weight_couple_mean"].detach().item())
+                            batch_log["model/surface_to_volume_skip_weight_couple_std"] = float(aux["skip_weight_couple_std"].detach().item())
+                            batch_log["model/surface_to_volume_skip_weight_couple_min"] = float(aux["skip_weights_couple"].detach().min().item())
+                            batch_log["model/surface_to_volume_skip_weight_couple_max"] = float(aux["skip_weights_couple"].detach().max().item())
+                            batch_log["model/surface_to_volume_skip_weight_fuse_mean"] = float(aux["skip_weight_fuse_mean"].detach().item())
+                            batch_log["model/surface_to_volume_skip_weight_fuse_std"] = float(aux["skip_weight_fuse_std"].detach().item())
+                            batch_log["model/surface_to_volume_skip_weight_fuse_min"] = float(aux["skip_weights_fuse"].detach().min().item())
+                            batch_log["model/surface_to_volume_skip_weight_fuse_max"] = float(aux["skip_weights_fuse"].detach().max().item())
                     wandb.log(batch_log, step=global_step)
                     train_pbar.set_postfix(loss=f"{loss.item():.4f}", rel=f"{rel.item():.4f}")
 
@@ -342,6 +372,14 @@ def main(cfg: DictConfig):
                     test_metrics["rel_l2_vol"] += rel_v.item() * bsz
                     for prefix, pred_ch, gt_ch, names in channel_specs:
                         accumulate_channel_rel(test_metrics, prefix, pred_ch, gt_ch, names, rel_l2, bsz)
+
+                    if stage == 2 and _aux is not None:
+                        skip_vals = _aux["skip_weights"].detach()
+                        test_skip_sum += float(skip_vals.sum().item())
+                        test_skip_sq_sum += float((skip_vals * skip_vals).sum().item())
+                        test_skip_count += int(skip_vals.numel())
+                        test_skip_min = min(test_skip_min, float(skip_vals.min().item()))
+                        test_skip_max = max(test_skip_max, float(skip_vals.max().item()))
 
             for k in train_metrics:
                 train_metrics[k] /= len(train_loader.dataset)
@@ -390,10 +428,20 @@ def main(cfg: DictConfig):
                 "epoch": ep,
                 "stage": stage,
             }
-            if stage == 2:
-                w = model.surface_to_volume_skip_weights.detach()
-                epoch_log["model/surface_to_volume_skip_weight_mean"] = float(w.mean().item())
-                epoch_log["model/surface_to_volume_skip_weight_std"] = float(w.std(unbiased=False).item())
+            if stage == 2 and test_skip_count > 0:
+                train_skip_mean = train_skip_sum / max(train_skip_count, 1)
+                train_skip_var = max(train_skip_sq_sum / max(train_skip_count, 1) - train_skip_mean * train_skip_mean, 0.0)
+                test_skip_mean = test_skip_sum / test_skip_count
+                test_skip_var = max(test_skip_sq_sum / test_skip_count - test_skip_mean * test_skip_mean, 0.0)
+
+                epoch_log["model/surface_to_volume_skip_weight_mean"] = float(test_skip_mean)
+                epoch_log["model/surface_to_volume_skip_weight_std"] = float(test_skip_var ** 0.5)
+                epoch_log["model/surface_to_volume_skip_weight_min"] = float(test_skip_min)
+                epoch_log["model/surface_to_volume_skip_weight_max"] = float(test_skip_max)
+                epoch_log["model/surface_to_volume_skip_weight_mean_train"] = float(train_skip_mean)
+                epoch_log["model/surface_to_volume_skip_weight_std_train"] = float(train_skip_var ** 0.5)
+                epoch_log["model/surface_to_volume_skip_weight_min_train"] = float(train_skip_min)
+                epoch_log["model/surface_to_volume_skip_weight_max_train"] = float(train_skip_max)
             add_canonical_field_metrics(epoch_log, "train", s_fields, vol_signals, metric_values=train_metrics)
             add_canonical_field_metrics(epoch_log, "test", s_fields, vol_signals, metric_values=test_metrics)
             wandb.log(epoch_log, step=global_step)

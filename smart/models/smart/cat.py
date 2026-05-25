@@ -38,7 +38,7 @@ class LoRALinear(nn.Module):
         nn.init.kaiming_uniform_(self.lora_a, a=5 ** 0.5)
         nn.init.zeros_(self.lora_b)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         base_out = self.base(x)
         delta = (x @ self.lora_a.t()) @ self.lora_b.t()
         return base_out + self.scaling * delta
@@ -129,10 +129,33 @@ class CAT(nn.Module):
         )
 
         # Per-block coupling for stage-1->stage-2 latent injection.
-        # Direct trainable scalar weights (no sigmoid).
-        self.surface_to_volume_skip_weights = nn.Parameter(torch.full((self.loops,), 0.2))
+        # Global prior per block. Dynamic per-sample gates are predicted around this prior.
+        self.surface_to_volume_skip_couple_weights = nn.Parameter(torch.full((self.loops,), 0.05))
+        self.surface_to_volume_skip_fuse_weights = nn.Parameter(torch.full((self.loops,), 0.05))
         # Light latent normalization before coupling for stability.
         self.surface_to_volume_latent_norm = nn.LayerNorm(latent_dim)
+        # Data-dependent gate heads: one scalar gate per layer per sample and per anchor.
+        gate_hidden = max(32, latent_dim // 2)
+        gate_in_dim = 3 * latent_dim + self.stage2_surface_channels
+        self.surface_to_volume_couple_gate_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(gate_in_dim, gate_hidden),
+                nn.GELU(),
+                nn.Linear(gate_hidden, 1),
+            )
+            for _ in range(self.loops)
+        ])
+        self.surface_to_volume_fuse_gate_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(gate_in_dim, gate_hidden),
+                nn.GELU(),
+                nn.Linear(gate_hidden, 1),
+            )
+            for _ in range(self.loops)
+        ])
+        # Keep gates away from exact extremes to reduce collapse risk without extra losses.
+        self.surface_to_volume_gate_min = 0.0001
+        self.surface_to_volume_gate_max = 0.9999
 
         # Compatibility aliases expected by tooling.
         self.geometry_encoder = self.geometry_encoder_blocks
@@ -170,6 +193,43 @@ class CAT(nn.Module):
         for e_ca, block in zip(inter_latents, decoder_blocks):
             query_emb = block(query_emb, e_ca, None, queries_pos=query_pos, latent_geometry_pos=latent_pos)
         return query_emb
+
+    def _compute_dynamic_skip_weights(
+        self,
+        geom_latents: list[torch.Tensor],
+        prev_latents: list[torch.Tensor],
+        new_latents: list[torch.Tensor],
+        surface_pred: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        pooled_pressure = surface_pred.mean(dim=1, keepdim=True)
+        w_couple_list = []
+        w_fuse_list = []
+        for m in range(self.loops):
+            geom_norm = self.surface_to_volume_latent_norm(geom_latents[m])
+            prev_norm = self.surface_to_volume_latent_norm(prev_latents[m])
+            new_norm = self.surface_to_volume_latent_norm(new_latents[m])
+
+            n_anchor = geom_norm.shape[1]
+            pressure_ctx = pooled_pressure.expand(-1, n_anchor, -1)
+            gate_in = torch.cat([geom_norm, prev_norm, new_norm, pressure_ctx], dim=-1)
+
+            # Prior-centered per-anchor gates with bounded logit deltas for stability.
+            prior_c = torch.clamp(self.surface_to_volume_skip_couple_weights[m], min=1e-4, max=1.0 - 1e-4)
+            prior_f = torch.clamp(self.surface_to_volume_skip_fuse_weights[m], min=1e-4, max=1.0 - 1e-4)
+            prior_c_logit = torch.log(prior_c / (1.0 - prior_c))
+            prior_f_logit = torch.log(prior_f / (1.0 - prior_f))
+
+            delta_c = self.surface_to_volume_couple_gate_mlps[m](gate_in).squeeze(-1)
+            delta_f = self.surface_to_volume_fuse_gate_mlps[m](gate_in).squeeze(-1)
+
+            gate_c = torch.sigmoid(prior_c_logit + delta_c)
+            gate_f = torch.sigmoid(prior_f_logit + delta_f)
+            gate_c = self.surface_to_volume_gate_min + (self.surface_to_volume_gate_max - self.surface_to_volume_gate_min) * gate_c
+            gate_f = self.surface_to_volume_gate_min + (self.surface_to_volume_gate_max - self.surface_to_volume_gate_min) * gate_f
+
+            w_couple_list.append(gate_c)
+            w_fuse_list.append(gate_f)
+        return torch.stack(w_couple_list, dim=1), torch.stack(w_fuse_list, dim=1)
 
     def _encode_stage2(self, surface_query_pos: torch.Tensor, surface_pred: torch.Tensor, latent_pos: torch.Tensor, initial_latent: torch.Tensor | None):
         # Pressure is injected as an additive feature embedding on top of positional embeddings.
@@ -217,17 +277,18 @@ class CAT(nn.Module):
         prev_latents, _ = self._encode_stage2(surface_query_pos, surface_pred, anchor_pos, initial_latent=geom_final)
         new_latents, _ = self._encode_stage2(surface_query_pos, surface_pred, anchor_pos, initial_latent=None)
 
-        w = self.surface_to_volume_skip_weights
+        w_couple, w_fuse = self._compute_dynamic_skip_weights(geom_latents, prev_latents, new_latents, surface_pred)
         fused_latents = []
         for m in range(self.loops):
-            wm = w[m].view(1, 1, 1)
+            wc = w_couple[:, m, :].unsqueeze(-1)
+            wf = w_fuse[:, m, :].unsqueeze(-1)
             geom_m = self.surface_to_volume_latent_norm(geom_latents[m])
             prev_m = self.surface_to_volume_latent_norm(prev_latents[m])
             new_m = self.surface_to_volume_latent_norm(new_latents[m])
 
             # Residual gated updates keep behavior smooth and close to SMART-style iterative refinement.
-            coupled = prev_m + wm * (geom_m - prev_m)
-            fused = new_m + wm * (coupled - new_m)
+            coupled = prev_m + wc * (geom_m - prev_m)
+            fused = new_m + wf * (coupled - new_m)
             fused_latents.append(fused)
 
         qv = self._decode(volume_query_pos, fused_latents, anchor_pos, self.volume_decoder_blocks)
@@ -239,9 +300,15 @@ class CAT(nn.Module):
                 "geom_latents": geom_latents,
                 "vol_latents": fused_latents,
                 "anchor_pos": anchor_pos,
-                "skip_weights": w,
-                "skip_weight_mean": w.mean(),
-                "skip_weight_std": w.std(unbiased=False),
+                "skip_weights": 0.5 * (w_couple + w_fuse),
+                "skip_weight_mean": (0.5 * (w_couple + w_fuse)).mean(),
+                "skip_weight_std": (0.5 * (w_couple + w_fuse)).std(unbiased=False),
+                "skip_weights_couple": w_couple,
+                "skip_weight_couple_mean": w_couple.mean(),
+                "skip_weight_couple_std": w_couple.std(unbiased=False),
+                "skip_weights_fuse": w_fuse,
+                "skip_weight_fuse_mean": w_fuse.mean(),
+                "skip_weight_fuse_std": w_fuse.std(unbiased=False),
             }
         return volume_pred
 
@@ -257,17 +324,18 @@ class CAT(nn.Module):
         prev_latents, _ = self._encode_stage2(surface_query_pos, surface_pred, anchor_pos, initial_latent=geom_final)
         new_latents, _ = self._encode_stage2(surface_query_pos, surface_pred, anchor_pos, initial_latent=None)
 
-        w = self.surface_to_volume_skip_weights
+        w_couple, w_fuse = self._compute_dynamic_skip_weights(geom_latents, prev_latents, new_latents, surface_pred)
         fused_latents = []
         for m in range(self.loops):
-            wm = w[m].view(1, 1, 1)
+            wc = w_couple[:, m, :].unsqueeze(-1)
+            wf = w_fuse[:, m, :].unsqueeze(-1)
             geom_m = self.surface_to_volume_latent_norm(geom_latents[m])
             prev_m = self.surface_to_volume_latent_norm(prev_latents[m])
             new_m = self.surface_to_volume_latent_norm(new_latents[m])
 
             # Residual gated updates keep behavior smooth and close to SMART-style iterative refinement.
-            coupled = prev_m + wm * (geom_m - prev_m)
-            fused = new_m + wm * (coupled - new_m)
+            coupled = prev_m + wc * (geom_m - prev_m)
+            fused = new_m + wf * (coupled - new_m)
             fused_latents.append(fused)
 
         qv = self._decode(volume_query_pos, fused_latents, anchor_pos, self.volume_decoder_blocks)
@@ -275,9 +343,15 @@ class CAT(nn.Module):
 
         if return_aux:
             return surface_pred, volume_pred, {
-                "skip_weights": w,
-                "skip_weight_mean": w.mean(),
-                "skip_weight_std": w.std(unbiased=False),
+                "skip_weights": 0.5 * (w_couple + w_fuse),
+                "skip_weight_mean": (0.5 * (w_couple + w_fuse)).mean(),
+                "skip_weight_std": (0.5 * (w_couple + w_fuse)).std(unbiased=False),
+                "skip_weights_couple": w_couple,
+                "skip_weight_couple_mean": w_couple.mean(),
+                "skip_weight_couple_std": w_couple.std(unbiased=False),
+                "skip_weights_fuse": w_fuse,
+                "skip_weight_fuse_mean": w_fuse.mean(),
+                "skip_weight_fuse_std": w_fuse.std(unbiased=False),
                 "geom_latents": geom_latents,
                 "vol_latents": fused_latents,
                 "anchor_pos": anchor_pos,

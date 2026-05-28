@@ -79,8 +79,8 @@ def main(cfg: DictConfig):
         nonlocal fields, surf_channels, vol_channels
         # Vanilla SMART on NACA4: surface pressure + volume velocity only.
         if config.model_name == "SMART" and config.dataset == "NACA4":
-            fields = {"surface": [], "volume": ["pressure", "velocity_x", "velocity_y"]}
-            # Keep one surface output channel for model compatibility, but do not supervise it.
+            fields = {"surface": ["pressure"], "volume": ["pressure", "velocity_x", "velocity_y"]}
+            # Supervise surface pressure and volume pressure/velocity for apples-to-apples CAT comparison.
             surf_channels = 1
             vol_channels = 3
 

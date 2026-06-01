@@ -298,10 +298,47 @@ def main(cfg: DictConfig):
 
     loss_test_min = np.inf
     global_step = 0
+    start_epoch = 0
     log_every_n_steps = int(getattr(config, "log_every_n_steps", 10))
 
+    resume_ckpt = str(getattr(config, "resume_ckpt", "")).strip()
+    resume_reset_scheduler = bool(getattr(config, "resume_reset_scheduler", False))
+    resume_reset_optimizer = bool(getattr(config, "resume_reset_optimizer", False))
+    if resume_ckpt:
+        if not os.path.isfile(resume_ckpt):
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_ckpt}")
+        resume_payload = torch.load(resume_ckpt, map_location=device)
+        state = resume_payload.get("model_state_dict", resume_payload)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing:
+            print(f"[resume] Missing keys: {len(missing)}")
+        if unexpected:
+            print(f"[resume] Unexpected keys: {len(unexpected)}")
+        if (not resume_reset_optimizer) and "optimizer_state_dict" in resume_payload:
+            optimizer.load_state_dict(resume_payload["optimizer_state_dict"])
+        if (not resume_reset_scheduler) and "scheduler_state_dict" in resume_payload:
+            scheduler.load_state_dict(resume_payload["scheduler_state_dict"])
+        if "scaler_state_dict" in resume_payload:
+            scaler.load_state_dict(resume_payload["scaler_state_dict"])
+        start_epoch = int(resume_payload.get("epoch", -1)) + 1
+        loss_test_min = float(resume_payload.get("rel_l2_loss", np.inf))
+        global_step = start_epoch * len(train_loader)
+        print(f"Resumed stage {stage} from {resume_ckpt}")
+        print(f"Resume state -> start_epoch={start_epoch}, global_step={global_step}, best_rel_l2={loss_test_min}")
+        if resume_reset_scheduler:
+            # Start a fresh LR schedule window for this continuation run.
+            start_epoch = 0
+            global_step = 0
+            base_lr = float(config.learning_rate)
+            for pg in optimizer.param_groups:
+                pg["lr"] = base_lr
+            print("[resume] Scheduler reset requested: starting LR schedule from initial value.")
+            print(f"[resume] Optimizer param-group lr reset to {base_lr:.6g}.")
+        if resume_reset_optimizer:
+            print("[resume] Optimizer reset requested: using freshly initialized optimizer state.")
+
     try:
-        for ep in tqdm(range(config.epochs), desc="Epochs", dynamic_ncols=True):
+        for ep in tqdm(range(start_epoch, config.epochs), desc="Epochs", dynamic_ncols=True):
             t1 = default_timer()
             model.train()
             train_metrics = init_metric_dict(s_fields, vol_signals)
@@ -423,6 +460,7 @@ def main(cfg: DictConfig):
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
                     "loss": test_metrics["loss"],
                     "rel_l2_loss": test_metrics["rel_l2"],
                     "stage": stage,
@@ -435,6 +473,7 @@ def main(cfg: DictConfig):
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
                 "loss": test_metrics["loss"],
                 "rel_l2_loss": test_metrics["rel_l2"],
                 "stage": stage,

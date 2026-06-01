@@ -1,0 +1,68 @@
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+
+wandb:
+  project: "smart"
+  entity: "parsa-vatani99-technical-university-of-munich"
+
+experiment:
+  name: "DrivAerML_CAT"
+  model_name: "CAT"
+  model_tag: "cat"
+  random_seed: 42
+  manifest_variant: "full"
+
+  # Two-stage CAT controls
+  single_surface_input_points: 32768
+  single_surface_query_points: 32768
+  single_volume_query_points: 65536
+  surface_loss_weight: 1.0
+  volume_loss_weight: 1.0
+  resume_ckpt: ""
+  stage2_stage1_ckpt: ""
+
+  # Legacy fields used by train_cat.py
+  cat_stage: 1
+  stage3_volume_query_points: 65536
+  stage3_geometry_ckpt: ""
+  stage3_surface_ckpt: ""
+
+  architecture:
+    latent_dim: 256
+    latent_geometry_points: 2048
+    subsampled_geometry_points: 65536
+    num_encoder_decoder_blocks: 6
+    pos_scale_factor: 100
+    stage1_surface_attr_channels: 2
+    stage1_volume_attr_channels: 1
+    stage2_surface_channels: 4
+    volume_query_feature_channels: 1
+
+  optimizer: "adamw"
+  loss_fn: "rel_l2"
+  scheduler: "cosine"
+  scheduler_warumup_fraction: 0.2
+  batch_size: 1
+  epochs: 300
+  learning_rate: 2.e-4
+  gradient_norm: null
+  amp: True
+  precision: "float16"
+  log_every_n_steps: 10
+
+  dataset: "DrivAerML"
+  data_path: "/mnt/ssdraid/parsa/drivaerml_preprocessed"
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: True
+  num_body_points: 65536
+  num_surface_points: 32768
+  num_volume_points: 65536
+  scale_positions: False

@@ -52,6 +52,16 @@ def add_canonical_field_metrics(wandb_dict, split, surface_fields, volume_fields
         wandb_dict[key] = metric_values.get(src_key, np.nan) if f in volume_fields else np.nan
 
 
+def add_all_field_metrics(wandb_dict, split, surface_fields, volume_fields, metric_values=None):
+    metric_values = metric_values or {}
+    for f in surface_fields:
+        src_key = f"rel_l2_surf_{f}"
+        wandb_dict[f"{split}/rel_l2_surf_{f}"] = metric_values.get(src_key, np.nan)
+    for f in volume_fields:
+        src_key = f"rel_l2_vol_{f}"
+        wandb_dict[f"{split}/rel_l2_vol_{f}"] = metric_values.get(src_key, np.nan)
+
+
 
 @hydra.main(version_base="1.2", config_path="config", config_name="car")
 def main(cfg: DictConfig):
@@ -97,16 +107,27 @@ def main(cfg: DictConfig):
 
     use_surface_supervision = len(fields["surface"]) > 0
 
-    train_loader = torch.utils.data.DataLoader(train_data,
-                                               batch_size=config.batch_size,
-                                               num_workers=config.num_workers,
-                                               shuffle=True,
-                                               prefetch_factor=56)
-    test_loader = torch.utils.data.DataLoader(test_data,
-                                              batch_size=config.batch_size,
-                                              num_workers=config.num_workers,
-                                              shuffle=False,
-                                              prefetch_factor=56)
+    prefetch_factor = int(getattr(config, "prefetch_factor", 2))
+    pin_memory = bool(getattr(config, "pin_memory", True))
+    dl_common = dict(
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        pin_memory=pin_memory,
+    )
+    if config.num_workers > 0:
+        dl_common["prefetch_factor"] = prefetch_factor
+        dl_common["persistent_workers"] = True
+
+    train_loader = torch.utils.data.DataLoader(
+        train_data,
+        shuffle=True,
+        **dl_common,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_data,
+        shuffle=False,
+        **dl_common,
+    )
     # Move stats to device
     mean_surf = stats[0][:surf_channels].to(device)
     std_surf = stats[1][:surf_channels].to(device)
@@ -120,20 +141,21 @@ def main(cfg: DictConfig):
         mean_vol = stats[2][:vol_channels].to(device)
         std_vol = stats[3][:vol_channels].to(device)
     
-    # Extract one training sample for inspection
-    sample = train_data[0]
-    if params_dim > 0:
-        sample_geo_mesh, sample_surf_mesh, sample_surf_data, sample_vol_mesh, sample_vol_data, params = sample
-    else:
-        sample_geo_mesh, sample_surf_mesh, sample_surf_data, sample_vol_mesh, sample_vol_data = sample
-        params = None
-    print("Sample geo_mesh shape:", sample_geo_mesh.shape)
-    print("Sample surf_mesh shape:", sample_surf_mesh.shape)
-    print("Sample surface fields shape:", sample_surf_data.shape, "fields:", fields["surface"])
-    print("Sample vol_mesh shape:", sample_vol_mesh.shape)
-    print("Sample volume fields shape:", sample_vol_data.shape, "fields:", fields["volume"])
-    if params is not None:
-        print("Sample params shape:", params.shape)
+    if bool(getattr(config, "inspect_first_sample", False)):
+        # Optional sample inspection: useful for debugging, but can add startup I/O.
+        sample = train_data[0]
+        if params_dim > 0:
+            sample_geo_mesh, sample_surf_mesh, sample_surf_data, sample_vol_mesh, sample_vol_data, params = sample
+        else:
+            sample_geo_mesh, sample_surf_mesh, sample_surf_data, sample_vol_mesh, sample_vol_data = sample
+            params = None
+        print("Sample geo_mesh shape:", sample_geo_mesh.shape)
+        print("Sample surf_mesh shape:", sample_surf_mesh.shape)
+        print("Sample surface fields shape:", sample_surf_data.shape, "fields:", fields["surface"])
+        print("Sample vol_mesh shape:", sample_vol_mesh.shape)
+        print("Sample volume fields shape:", sample_vol_data.shape, "fields:", fields["volume"])
+        if params is not None:
+            print("Sample params shape:", params.shape)
     
     # Create model
     models = {"SMART": (SMART, {"spatial_dim": spatial_dim, "surface_channels": surf_channels, "volume_channels": vol_channels, "parameter_channels": params_dim})}
@@ -357,8 +379,10 @@ def main(cfg: DictConfig):
             print(f"epoch: {ep}, t2-t1 (epoch time): {t2-t1:.5f}, train loss: {train_losses['loss']:.5f}, test loss: {test_losses['loss']:.5f}")
             wandb_dict = {"lr": scheduler.get_last_lr()[0]}
 
-            wandb_dict.update({f"train/{key}": value for key, value in train_losses.items() if value != 0.0})
-            wandb_dict.update({f"test/{key}": value for key, value in test_losses.items() if value != 0.0})
+            wandb_dict.update({f"train/{key}": value for key, value in train_losses.items()})
+            wandb_dict.update({f"test/{key}": value for key, value in test_losses.items()})
+            add_all_field_metrics(wandb_dict, "train", fields["surface"], fields["volume"], metric_values=train_losses)
+            add_all_field_metrics(wandb_dict, "test", fields["surface"], fields["volume"], metric_values=test_losses)
             add_canonical_field_metrics(wandb_dict, "train", fields["surface"], fields["volume"], metric_values=train_losses)
             add_canonical_field_metrics(wandb_dict, "test", fields["surface"], fields["volume"], metric_values=test_losses)
             wandb_dict["meta/training_surface_signals"] = ",".join(fields["surface"])

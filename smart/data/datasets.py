@@ -1,5 +1,6 @@
 from data.shapenetcar_dataset import ShapeNetCarDataset
 from data.ahmedml_dataset import AhmedMLDataset
+from data.ahmedml_dataset_v2 import AhmedMLDatasetV2, DrivAerMLDataset
 from data.shiftsuv_dataset import ShiftSUVDataset
 from data.shiftwing_dataset import ShiftWingDataset
 from data.naca4_dataset import NACA4Dataset
@@ -8,6 +9,8 @@ from data.naca4_dataset import NACA4Dataset
 # Mapping of dataset names to their corresponding classes and properties
 datasets = {"ShapeNetCar": {"dataset": ShapeNetCarDataset, "spatial_dim": 3, "surf_channels": 1, "vol_channels": 3, "params_dim": 0, "fields": {"surface": ["pressure"], "volume": ["velocity_x", "velocity_y", "velocity_z"]}},
             "AhmedML": {"dataset": AhmedMLDataset, "spatial_dim": 3, "surf_channels": 1, "vol_channels": 3, "params_dim": 0, "fields": {"surface": ["pressure"], "volume": ["velocity_x", "velocity_y", "velocity_z"]}},
+            "AhmedMLV2": {"dataset": AhmedMLDatasetV2, "spatial_dim": 3, "surf_channels": 7, "vol_channels": 4, "params_dim": 0, "fields": {"surface": ["pressure", "normal_x", "normal_y", "normal_z", "wall_shear_x", "wall_shear_y", "wall_shear_z"], "volume": ["pressure", "velocity_x", "velocity_y", "velocity_z"]}},
+            "DrivAerML": {"dataset": DrivAerMLDataset, "spatial_dim": 3, "surf_channels": 7, "vol_channels": 4, "params_dim": 0, "fields": {"surface": ["pressure", "normal_x", "normal_y", "normal_z", "wall_shear_x", "wall_shear_y", "wall_shear_z"], "volume": ["pressure", "velocity_x", "velocity_y", "velocity_z"]}},
             "ShiftSUV": {"dataset": ShiftSUVDataset, "spatial_dim": 3, "surf_channels": 1, "vol_channels": 3, "params_dim": 0, "fields": {"surface": ["pressure"], "volume": ["velocity_x", "velocity_y", "velocity_z"]}},
             "ShiftWing": {"dataset": ShiftWingDataset, "spatial_dim": 3, "surf_channels": 1, "vol_channels": 3, "params_dim": 2, "fields": {"surface": ["pressure"], "volume": ["velocity_x", "velocity_y", "velocity_z"]}},
             "NACA4": {"dataset": NACA4Dataset, "spatial_dim": 2, "surf_channels": 3, "vol_channels": 4, "params_dim": 0, "fields": {"surface": ["pressure", "normal_x", "normal_y"], "volume": ["pressure", "sdf", "velocity_x", "velocity_y"]}}
@@ -45,6 +48,8 @@ def get_dataset(config):
                               surface_points=config.num_surface_points,
                               volume_points=config.num_volume_points,
                               scale_positions=config.scale_positions)
+        if dataset == "DrivAerML":
+            dataset_kwargs["require_preprocessed"] = True
         if dataset == "NACA4":
             dataset_kwargs["manifest_variant"] = getattr(config, "manifest_variant", "full")
         train_data = datasets[dataset]["dataset"](data_path,

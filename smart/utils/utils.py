@@ -9,6 +9,7 @@ from omegaconf import OmegaConf, open_dict
 import os
 import json
 import re
+import hashlib
 
 
 def _slugify(text):
@@ -26,6 +27,8 @@ def infer_fields_from_config(config):
     dataset = getattr(config, "dataset", None)
     if dataset == "NACA4":
         return {"surface": ["pressure", "normal_x", "normal_y"], "volume": ["pressure", "sdf", "velocity_x", "velocity_y"]}
+    if dataset in {"AhmedMLV2", "DrivAerML"}:
+        return {"surface": ["pressure", "normal_x", "normal_y", "normal_z", "wall_shear_x", "wall_shear_y", "wall_shear_z"], "volume": ["pressure", "velocity_x", "velocity_y", "velocity_z"]}
     if dataset in {"ShapeNetCar", "AhmedML", "ShiftSUV"}:
         return {"surface": ["pressure"], "volume": ["velocity_x", "velocity_y", "velocity_z"]}
     if dataset == "ShiftWing":
@@ -47,6 +50,17 @@ def get_field_tag(fields):
         for field in volume
     ])
     return f"s-{surface_tag}-v-{volume_tag}"
+
+
+def _safe_wandb_tag(tag, max_len=64):
+    """W&B tags must be <=64 chars; compact long tags deterministically."""
+    tag = str(tag)
+    if len(tag) <= max_len:
+        return tag
+    digest = hashlib.sha1(tag.encode("utf-8")).hexdigest()[:8]
+    # Keep a readable prefix and append stable hash.
+    keep = max_len - len("-") - len(digest)
+    return f"{tag[:keep]}-{digest}"
 
 
 def get_run_name(config, fields=None):
@@ -184,7 +198,8 @@ def initialize_wandb(config, wandb_config, model_files=[]):
     if getattr(config, "manifest_variant", None) and getattr(config, "manifest_variant", "full") != "full":
         tags.append(f"variant_{config.manifest_variant}")
     if fields:
-        tags.append(f"fields_{get_field_tag(fields)}")
+        tags.append(_safe_wandb_tag(f"fields_{get_field_tag(fields)}"))
+    tags = [_safe_wandb_tag(t) for t in tags]
 
     run = wandb.init(
         name=run_name,

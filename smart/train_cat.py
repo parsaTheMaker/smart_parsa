@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import wandb
 from omegaconf import DictConfig
+from omegaconf import open_dict
 from tqdm.auto import tqdm
 
 from data.datasets import get_dataset
@@ -67,27 +68,34 @@ def add_canonical_field_metrics(wandb_dict, split, surface_fields, volume_fields
         wandb_dict[f"{split}/rel_l2_vol_{f}"] = metric_values.get(src_key, np.nan) if f in volume_fields else np.nan
 
 
+def add_all_field_metrics(wandb_dict, split, surface_fields, volume_fields, metric_values=None):
+    metric_values = metric_values or {}
+    for f in surface_fields:
+        src_key = f"rel_l2_surf_{f}"
+        wandb_dict[f"{split}/rel_l2_surf_{f}"] = metric_values.get(src_key, np.nan)
+    for f in volume_fields:
+        src_key = f"rel_l2_vol_{f}"
+        wandb_dict[f"{split}/rel_l2_vol_{f}"] = metric_values.get(src_key, np.nan)
+
+
 def resolve_targets(fields: dict, mean_vol: torch.Tensor, std_vol: torch.Tensor):
     surface_fields = list(fields.get("surface", []))
     if len(surface_fields) == 0:
         raise ValueError("CAT requires at least one surface field.")
-    pressure_idx_s = surface_fields.index("pressure") if "pressure" in surface_fields else 0
-    surface_target_indices = [pressure_idx_s]
-    surface_target_fields = [surface_fields[pressure_idx_s]]
+    # Stage-1 should learn surface pressure + wall-shear channels when available.
+    preferred_surface = ["pressure", "normal_x", "normal_y", "normal_z", "wall_shear_x", "wall_shear_y", "wall_shear_z"]
+    surface_target_indices = [surface_fields.index(name) for name in preferred_surface if name in surface_fields]
+    if len(surface_target_indices) == 0:
+        surface_target_indices = list(range(len(surface_fields)))
+    surface_target_fields = [surface_fields[i] for i in surface_target_indices]
 
     volume_fields = list(fields.get("volume", []))
     if len(volume_fields) == 0:
         raise ValueError("CAT requires at least one volume field.")
     velocity_idx = [i for i, name in enumerate(volume_fields) if str(name).startswith("velocity_")]
     pressure_idx_v = volume_fields.index("pressure") if "pressure" in volume_fields else None
-
-    use_pressure = False
-    if pressure_idx_v is not None:
-        pressure_std = float(std_vol[pressure_idx_v].item()) if pressure_idx_v < len(std_vol) else 0.0
-        pressure_mean = float(mean_vol[pressure_idx_v].item()) if pressure_idx_v < len(mean_vol) else 0.0
-        use_pressure = not (abs(pressure_mean) < 1e-8 and pressure_std < 1e-8)
-
-    volume_target_indices = ([pressure_idx_v] if (pressure_idx_v is not None and use_pressure) else []) + velocity_idx
+    # Stage-2 should learn volume pressure + velocity when available.
+    volume_target_indices = ([pressure_idx_v] if pressure_idx_v is not None else []) + velocity_idx
     if len(volume_target_indices) == 0:
         volume_target_indices = list(range(len(volume_fields)))
 
@@ -224,6 +232,9 @@ def main(cfg: DictConfig):
         train_data, test_data, stats, spatial_dim, surf_channels, vol_channels, params_dim, fields = get_dataset(config)
 
     s_idx, s_fields, v_idx, v_fields = resolve_targets(fields, train_data.mean_vol_data, train_data.std_vol_data)
+    # Keep CAT head dimensions aligned with selected targets.
+    with open_dict(config.architecture):
+        config.architecture.stage2_surface_channels = len(s_idx)
     if stage == 1:
         vol_channels = len(v_idx)
         vol_signals = []
@@ -234,8 +245,27 @@ def main(cfg: DictConfig):
     if params_dim > 0:
         raise NotImplementedError("CAT train script currently supports params_dim=0 datasets.")
 
-    train_loader = torch.utils.data.DataLoader(train_data, batch_size=config.batch_size, num_workers=config.num_workers, shuffle=True, prefetch_factor=56)
-    test_loader = torch.utils.data.DataLoader(test_data, batch_size=config.batch_size, num_workers=config.num_workers, shuffle=False, prefetch_factor=56)
+    prefetch_factor = int(getattr(config, "prefetch_factor", 2))
+    pin_memory = bool(getattr(config, "pin_memory", True))
+    dl_common = dict(
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        pin_memory=pin_memory,
+    )
+    if config.num_workers > 0:
+        dl_common["prefetch_factor"] = prefetch_factor
+        dl_common["persistent_workers"] = True
+
+    train_loader = torch.utils.data.DataLoader(
+        train_data,
+        shuffle=True,
+        **dl_common,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_data,
+        shuffle=False,
+        **dl_common,
+    )
 
     model = CAT(
         spatial_dim=spatial_dim,
@@ -442,6 +472,8 @@ def main(cfg: DictConfig):
                 epoch_log["model/surface_to_volume_skip_weight_std_train"] = float(train_skip_var ** 0.5)
                 epoch_log["model/surface_to_volume_skip_weight_min_train"] = float(train_skip_min)
                 epoch_log["model/surface_to_volume_skip_weight_max_train"] = float(train_skip_max)
+            add_all_field_metrics(epoch_log, "train", s_fields, vol_signals, metric_values=train_metrics)
+            add_all_field_metrics(epoch_log, "test", s_fields, vol_signals, metric_values=test_metrics)
             add_canonical_field_metrics(epoch_log, "train", s_fields, vol_signals, metric_values=train_metrics)
             add_canonical_field_metrics(epoch_log, "test", s_fields, vol_signals, metric_values=test_metrics)
             wandb.log(epoch_log, step=global_step)

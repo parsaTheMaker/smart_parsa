@@ -55,7 +55,7 @@ VOLUME_FIELDS = ["pressure", "velocity_x", "velocity_y", "velocity_z"]
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Compare CAT(stage1+stage2) vs SMART on full run coordinates.")
     p.add_argument("--run-id", type=int, default=None, help="Representative run id for detailed plots/vtk. Default: first test run.")
-    p.add_argument("--all-test-metrics", action="store_true", help="Compute summary metrics over full test subset.")
+    p.add_argument("--stats-runs", type=int, default=20, help="Number of random test runs used for aggregate statistics.")
     p.add_argument("--smart-config", default="drivaerml", help="Config file name under smart/config (without .yaml)")
     p.add_argument("--cat-config", default="drivaerml_cat", help="Config file name under smart/config (without .yaml)")
     p.add_argument("--smart-checkpoint", default=None, help="Path to SMART checkpoint (_best.pt/_last.pt).")
@@ -67,7 +67,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--plot-max-points", type=int, default=90000, help="Max points per domain for plotting only.")
     p.add_argument("--cat-vol-chunk", type=int, default=131072, help="Stage2 volume query chunk size.")
     p.add_argument("--uq-params", default=None, help="Optional UQ params .pt from calibrate_uq.py to save uncertainty fields.")
+    p.add_argument("--uq-params-both", default=None, help="Optional UQ params .pt from calibrate_uq_both.py for separate surface+volume UQ.")
     p.add_argument("--gamma", type=float, default=0.1, help="UQ variance inflation factor for Mahalanobis scalar.")
+    p.add_argument("--gamma-surface", type=float, default=0.1, help="Surface UQ inflation factor for uq-params-both.")
+    p.add_argument("--gamma-volume", type=float, default=0.1, help="Volume UQ inflation factor for uq-params-both.")
     return p.parse_args()
 
 
@@ -197,6 +200,11 @@ def compute_global_metrics(gt: np.ndarray, pred: np.ndarray) -> Dict[str, float]
     }
 
 
+def append_magnitude_channel(arr: np.ndarray, start: int, end: int) -> np.ndarray:
+    mag = np.linalg.norm(arr[:, start:end], axis=1, keepdims=True)
+    return np.concatenate([arr[:, :start], mag], axis=1)
+
+
 class RunningFieldStats:
     def __init__(self, field_names: List[str]):
         self.names = field_names
@@ -279,7 +287,7 @@ def cat_stage2_predict_full_cached(
     vol_query_norm: torch.Tensor,
     chunk_size: int,
     device: torch.device,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Equivalent to forward_stage2_only, but caches surface-side work once."""
     b_input = surf_input_norm.unsqueeze(0).to(device)
     b_surf_q = surf_query_norm.unsqueeze(0).to(device)
@@ -306,13 +314,110 @@ def cat_stage2_predict_full_cached(
             fused_latents.append(fused)
 
         preds = []
+        q_sum = None
+        q_count = 0
+        z4_chunks = []
         n = vol_query_norm.shape[0]
         for i in range(0, n, chunk_size):
             q = vol_query_norm[i : i + chunk_size].unsqueeze(0).to(device)
             qv = model._decode(q[..., : model.spatial_dim], fused_latents, anchor_pos, model.volume_decoder_blocks)
-            y = model.volume_head(qv)
+            z1 = model.volume_head[0](qv)
+            z2 = model.volume_head[1](z1)
+            z3 = model.volume_head[2](z2)
+            z4 = model.volume_head[3](z3)
+            y = model.volume_head[4](z4)
             preds.append(y[0].detach().cpu())
-    return torch.cat(preds, dim=0)
+            qv0 = qv[0]
+            qsum_c = qv0.sum(dim=0).detach().cpu()
+            q_sum = qsum_c if q_sum is None else (q_sum + qsum_c)
+            q_count += int(qv0.shape[0])
+            z4_chunks.append(z4[0].detach().cpu())
+    q_global = None
+    z_all = None
+    if q_sum is not None and q_count > 0:
+        q_global = (q_sum / float(q_count)).unsqueeze(0)
+    if z4_chunks:
+        z_all = torch.cat(z4_chunks, dim=0)
+    return torch.cat(preds, dim=0), q_global, z_all
+
+
+def compute_hybrid_uq(
+    q_tensor: torch.Tensor,
+    z_tensor: torch.Tensor,
+    mu_train: torch.Tensor,
+    inv_sigma_train: torch.Tensor,
+    Sigma_LLL: torch.Tensor,
+    V_skew: torch.Tensor,
+    K: float,
+    gamma: float,
+):
+    target_device = mu_train.device
+    q_tensor = q_tensor.to(target_device)
+    z_tensor = z_tensor.to(target_device)
+    inv_sigma_train = inv_sigma_train.to(target_device)
+    Sigma_LLL = Sigma_LLL.to(target_device)
+    V_skew = V_skew.to(target_device)
+    qg = q_tensor.mean(dim=1)
+    dq = qg - mu_train.unsqueeze(0)
+    md2 = torch.einsum("bi,ij,bj->b", dq, inv_sigma_train, dq)
+    md = torch.sqrt(torch.clamp(md2, min=1e-12))[0]
+    z = z_tensor[0]
+    var_lll = torch.sum((z @ Sigma_LLL) * z, dim=-1)
+    var_final = var_lll * (1.0 + float(gamma) * md)
+    cross = z @ V_skew
+    denom = torch.sqrt(torch.clamp(var_final * K - cross * cross, min=1e-6))
+    alpha = cross / denom
+    return float(md.item()), var_final.detach().cpu().numpy(), alpha.detach().cpu().numpy()
+
+
+def compute_surface_uq_chunked(
+    model: CAT,
+    surf_input_norm: torch.Tensor,
+    surf_query_norm: torch.Tensor,
+    chunk_size: int,
+    device: torch.device,
+    mu_train: torch.Tensor,
+    inv_sigma_train: torch.Tensor,
+    Sigma_LLL: torch.Tensor,
+    V_skew: torch.Tensor,
+    K: float,
+    gamma: float,
+):
+    """Compute surface UQ without full-query OOM by chunking stage-1 decode."""
+    with torch.no_grad():
+        b_input = surf_input_norm.unsqueeze(0).to(device)
+        surface_input_pos = b_input[..., : model.spatial_dim]
+        geom_latents, anchor_pos, _geom_final = model._encode_stage1(surface_input_pos)
+
+        n = surf_query_norm.shape[0]
+        q_sum = None
+        n_total = 0
+        z_chunks = []
+        for i in range(0, n, chunk_size):
+            q_chunk = surf_query_norm[i : i + chunk_size].unsqueeze(0).to(device)
+            q_emb = model._decode(q_chunk[..., : model.spatial_dim], geom_latents, anchor_pos, model.surface_decoder_blocks)
+            q_c = q_emb[0]
+            z1 = model.stage2_head[0](q_c)
+            z2 = model.stage2_head[1](z1)
+            z3 = model.stage2_head[2](z2)
+            z4 = model.stage2_head[3](z3)
+            z_chunks.append(z4.detach().cpu())
+            qsum_c = q_c.sum(dim=0)
+            q_sum = qsum_c if q_sum is None else (q_sum + qsum_c)
+            n_total += int(q_c.shape[0])
+
+        q_global = (q_sum / max(n_total, 1)).unsqueeze(0)
+        dq = q_global - mu_train.unsqueeze(0)
+        md2 = torch.einsum("bi,ij,bj->b", dq, inv_sigma_train, dq)
+        md = torch.sqrt(torch.clamp(md2, min=1e-12))[0]
+
+        z_all = torch.cat(z_chunks, dim=0).to(device)
+        var_lll = torch.sum((z_all @ Sigma_LLL) * z_all, dim=-1)
+        var_final = var_lll * (1.0 + float(gamma) * md)
+        cross = z_all @ V_skew
+        denom = torch.sqrt(torch.clamp(var_final * K - cross * cross, min=1e-6))
+        alpha = cross / denom
+    return float(md.item()), var_final.detach().cpu().numpy(), alpha.detach().cpu().numpy()
 
 
 def setup_plot_style():
@@ -339,6 +444,15 @@ def downsample_for_plot(coords: np.ndarray, arrays: List[np.ndarray], max_points
     rng = np.random.default_rng(seed)
     idx = rng.choice(n, size=max_points, replace=False)
     return coords[idx], [a[idx] for a in arrays]
+
+
+def downsample_pair(a: np.ndarray, b: np.ndarray, max_points: int, seed: int):
+    n = min(a.shape[0], b.shape[0])
+    if n <= max_points:
+        return a[:n], b[:n]
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(n, size=max_points, replace=False)
+    return a[idx], b[idx]
 
 
 def plot_field_maps(
@@ -389,6 +503,106 @@ def plot_field_maps(
     plt.close(fig)
 
 
+def make_smoothed_y0_slice(
+    coords: np.ndarray,
+    values: np.ndarray,
+    nx: int = 800,
+    nz: int = 200,
+    radius: float | None = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    x = coords[:, 0].astype(np.float32, copy=False)
+    y = coords[:, 1].astype(np.float32, copy=False)
+    z = coords[:, 2].astype(np.float32, copy=False)
+    vals = values.astype(np.float32, copy=False)
+
+    x_min = float(x.min())
+    x_max = float(x.max())
+    z_min = float(z.min())
+    z_max = float(z.max())
+    x_range = max(x_max - x_min, 1e-12)
+    z_range = max(z_max - z_min, 1e-12)
+    gather_radius = float(radius if radius is not None else ( x_range / 100.0))
+
+    slice_mask = np.abs(y) <= gather_radius
+    if np.any(slice_mask):
+        x = x[slice_mask]
+        z = z[slice_mask]
+        vals = vals[slice_mask]
+
+    x_centers = np.linspace(x_min, x_max, nx, dtype=np.float32)
+    z_centers = np.linspace(z_min, z_max, nz, dtype=np.float32)
+    dx = x_range / max(nx - 1, 1)
+    dz = z_range / max(nz - 1, 1)
+
+    grid_sum = np.zeros((nz, nx), dtype=np.float64)
+    grid_count = np.zeros((nz, nx), dtype=np.float64)
+
+    for xp, zp, vp in zip(x, z, vals):
+        ix0 = max(0, int(math.floor((xp - gather_radius - x_min) / max(dx, 1e-12))))
+        ix1 = min(nx - 1, int(math.ceil((xp + gather_radius - x_min) / max(dx, 1e-12))))
+        iz0 = max(0, int(math.floor((zp - gather_radius - z_min) / max(dz, 1e-12))))
+        iz1 = min(nz - 1, int(math.ceil((zp + gather_radius - z_min) / max(dz, 1e-12))))
+        if ix0 > ix1 or iz0 > iz1:
+            continue
+        local_x = x_centers[ix0 : ix1 + 1]
+        local_z = z_centers[iz0 : iz1 + 1]
+        dist2 = (local_z[:, None] - zp) ** 2 + (local_x[None, :] - xp) ** 2
+        mask = dist2 <= gather_radius * gather_radius
+        if not np.any(mask):
+            continue
+        grid_sum[iz0 : iz1 + 1, ix0 : ix1 + 1][mask] += float(vp)
+        grid_count[iz0 : iz1 + 1, ix0 : ix1 + 1][mask] += 1.0
+
+    grid = np.zeros((nz, nx), dtype=np.float32)
+    valid = grid_count > 0
+    grid[valid] = (grid_sum[valid] / grid_count[valid]).astype(np.float32, copy=False)
+    extent = np.array([x_min, x_max, z_min, z_max], dtype=np.float32)
+    return grid, x_centers, z_centers, gather_radius
+
+
+def plot_volume_slice_maps(
+    out_path: Path,
+    title: str,
+    coords: np.ndarray,
+    gt: np.ndarray,
+    pred_a: np.ndarray,
+    pred_b: np.ndarray,
+    field_name: str,
+):
+    slice_gt, _, _, gather_radius = make_smoothed_y0_slice(coords, gt)
+    slice_a, _, _, _ = make_smoothed_y0_slice(coords, pred_a, radius=gather_radius)
+    slice_b, _, _, _ = make_smoothed_y0_slice(coords, pred_b, radius=gather_radius)
+    err_a = np.abs(slice_a - slice_gt)
+    err_b = np.abs(slice_b - slice_gt)
+
+    valid_stack = np.concatenate([slice_gt.reshape(-1), slice_a.reshape(-1), slice_b.reshape(-1)])
+    vmin = float(np.percentile(valid_stack, 1))
+    vmax = float(np.percentile(valid_stack, 99))
+    evmax = float(max(np.percentile(err_a, 99), np.percentile(err_b, 99)))
+    evmax = evmax if evmax > 0 else 1e-12
+    extent = [float(coords[:, 0].min()), float(coords[:, 0].max()), float(coords[:, 2].min()), float(coords[:, 2].max())]
+
+    fig, axes = plt.subplots(1, 5, figsize=(24, 4.8), constrained_layout=True)
+    fig.suptitle(f"{title}\nSmoothed y=0 slice, 200x50 pixels, gather radius={gather_radius:.4f}")
+    panels = [
+        (slice_gt, "GT", "coolwarm", vmin, vmax),
+        (slice_a, "CAT-S2", "coolwarm", vmin, vmax),
+        (slice_b, "SMART", "coolwarm", vmin, vmax),
+        (err_a, "|CAT-S2 - GT|", "magma", 0.0, evmax),
+        (err_b, "|SMART - GT|", "magma", 0.0, evmax),
+    ]
+    for ax, (img, subtitle, cmap, pvmin, pvmax) in zip(axes, panels):
+        im = ax.imshow(img, origin="lower", extent=extent, aspect="auto", cmap=cmap, vmin=pvmin, vmax=pvmax)
+        ax.set_title(f"{field_name} - {subtitle}")
+        ax.set_xlabel("x")
+        ax.set_ylabel("z")
+        cbar = fig.colorbar(im, ax=ax, shrink=0.82)
+        cbar.ax.tick_params(labelsize=10)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
 def plot_parity(
     out_path: Path,
     gt: np.ndarray,
@@ -402,16 +616,19 @@ def plot_parity(
     fig, axes = plt.subplots(n, 2, figsize=(14, 4.0 * n), constrained_layout=True)
     if n == 1:
         axes = np.expand_dims(axes, axis=0)
-    fig.suptitle("Parity Plots")
+    fig.suptitle("Parity Plots (aggregated over sampled test runs)")
     for i, field in enumerate(field_names):
         g = gt[:, i]
         for j, (p, name) in enumerate([(pred_a[:, i], model_a_name), (pred_b[:, i], model_b_name)]):
             ax = axes[i, j]
             lo = float(np.percentile(np.concatenate([g, p]), 1))
             hi = float(np.percentile(np.concatenate([g, p]), 99))
+            ss_res = float(np.sum((p - g) ** 2))
+            ss_tot = float(np.sum((g - g.mean()) ** 2))
+            r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 1e-12 else float("nan")
             ax.scatter(g, p, s=3, alpha=0.35, rasterized=True)
             ax.plot([lo, hi], [lo, hi], "k--", linewidth=1.2)
-            ax.set_title(f"{field}: {name}")
+            ax.set_title(f"{field}: {name} (R2={r2:.3f})")
             ax.set_xlabel("GT")
             ax.set_ylabel("Prediction")
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -432,7 +649,7 @@ def plot_error_hist(
     fig, axes = plt.subplots(n, 1, figsize=(12, 3.2 * n), constrained_layout=True)
     if n == 1:
         axes = [axes]
-    fig.suptitle("Absolute Error Distributions")
+    fig.suptitle("Absolute Error Distributions (aggregated over sampled test runs)")
     for i, field in enumerate(field_names):
         ea = np.abs(pred_a[:, i] - gt[:, i])
         eb = np.abs(pred_b[:, i] - gt[:, i])
@@ -474,6 +691,81 @@ def plot_grouped_metrics(
     plt.close(fig)
 
 
+def plot_pointwise_error_vs_uncertainty(
+    out_path: Path,
+    uncertainty: np.ndarray,
+    pointwise_error: np.ndarray,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+):
+    fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+    ax.scatter(uncertainty, pointwise_error, s=4, alpha=0.25, rasterized=True)
+    if uncertainty.size > 2 and pointwise_error.size > 2:
+        corr = float(np.corrcoef(uncertainty, pointwise_error)[0, 1])
+    else:
+        corr = float("nan")
+    ax.set_title(f"{title} (corr={corr:.3f})")
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def plot_md_vs_error(
+    out_path: Path,
+    md_values: np.ndarray,
+    err_values: np.ndarray,
+    title: str,
+    ylabel: str,
+):
+    fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
+    ax.scatter(md_values, err_values, s=35, alpha=0.8)
+    if md_values.size > 1 and err_values.size > 1:
+        corr = float(np.corrcoef(md_values, err_values)[0, 1])
+    else:
+        corr = float("nan")
+    ax.set_title(f"{title} (corr={corr:.3f})")
+    ax.set_xlabel("Mahalanobis Distance")
+    ax.set_ylabel(ylabel)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def plot_global_summary(
+    out_path: Path,
+    surface_metrics: Dict[str, Dict[str, float]],
+    volume_metrics: Dict[str, Dict[str, float]],
+):
+    labels = ["Surface rel_l2", "Surface R2", "Volume rel_l2", "Volume R2"]
+    cat_vals = [
+        surface_metrics["cat_stage1_global"]["rel_l2"],
+        surface_metrics["cat_stage1_global"]["r2"],
+        volume_metrics["cat_stage2_global"]["rel_l2"],
+        volume_metrics["cat_stage2_global"]["r2"],
+    ]
+    smart_vals = [
+        surface_metrics["smart_global"]["rel_l2"],
+        surface_metrics["smart_global"]["r2"],
+        volume_metrics["smart_global"]["rel_l2"],
+        volume_metrics["smart_global"]["r2"],
+    ]
+    x = np.arange(len(labels))
+    width = 0.38
+    fig, ax = plt.subplots(figsize=(10, 6), constrained_layout=True)
+    ax.bar(x - width / 2, cat_vals, width, label="CAT")
+    ax.bar(x + width / 2, smart_vals, width, label="SMART")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.set_title("Global Comparison Summary (aggregated)")
+    ax.legend()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
 def main():
     args = parse_args()
     setup_plot_style()
@@ -494,9 +786,16 @@ def main():
         require_preprocessed=True,
     )
 
-    # Use split ids from dataset for statistically reliable summary metrics.
-    eval_run_ids = list(dataset.test_ids) if args.all_test_metrics else [int(args.run_id if args.run_id is not None else dataset.test_ids[0])]
-    rep_run_id = int(args.run_id if args.run_id is not None else eval_run_ids[0])
+    # Use random subset of test ids for statistics; keep one representative run for VTK/plots.
+    test_ids = list(dataset.test_ids)
+    if len(test_ids) == 0:
+        raise RuntimeError("No test ids found in dataset split.")
+    rep_run_id = int(args.run_id if args.run_id is not None else test_ids[0])
+    rng_stats = np.random.default_rng(args.seed + 777)
+    n_stats = min(int(args.stats_runs), len(test_ids))
+    eval_run_ids = [int(x) for x in rng_stats.choice(np.array(test_ids, dtype=np.int64), size=n_stats, replace=False)]
+    if rep_run_id not in eval_run_ids:
+        eval_run_ids[0] = rep_run_id
 
     mean_s = dataset.mean_surf_data
     std_s = torch.clamp(dataset.std_surf_data, min=1e-12)
@@ -545,6 +844,7 @@ def main():
 
     # Optional uncertainty params
     uq = None
+    uq_both = None
     mu_train = inv_sigma_train = Sigma_LLL = V_skew = None
     K = 1.0
     if args.uq_params:
@@ -554,6 +854,8 @@ def main():
         Sigma_LLL = uq["Sigma_LLL"].float().to(device)
         V_skew = uq["V_skew"].float().to(device)
         K = float(uq["K"].item() if isinstance(uq["K"], torch.Tensor) else uq["K"])
+    if args.uq_params_both:
+        uq_both = torch.load(args.uq_params_both, map_location="cpu")
 
     # Hooks for UQ tensors from stage1 pass.
     uq_cache: Dict[str, torch.Tensor] = {}
@@ -568,11 +870,29 @@ def main():
         h_q = cat_stage2.stage2_head[0].register_forward_hook(hook_q)
         h_z = cat_stage2.stage2_head[3].register_forward_hook(hook_z)
 
-    # Streaming stats over full test subset.
-    surf_cat_stats = RunningFieldStats(SURFACE_FIELDS)
-    surf_smart_stats = RunningFieldStats(SURFACE_FIELDS)
-    vol_cat_stats = RunningFieldStats(VOLUME_FIELDS)
-    vol_smart_stats = RunningFieldStats(VOLUME_FIELDS)
+    # Streaming stats over sampled test subset.
+    surface_eval_fields = ["pressure", "normal_x", "normal_y", "normal_z", "wall_shear_mag"]
+    volume_eval_fields = ["pressure", "velocity_mag"]
+    surf_cat_stats = RunningFieldStats(surface_eval_fields)
+    surf_smart_stats = RunningFieldStats(surface_eval_fields)
+    vol_cat_stats = RunningFieldStats(volume_eval_fields)
+    vol_smart_stats = RunningFieldStats(volume_eval_fields)
+    per_run_surface_md = []
+    per_run_volume_md = []
+    per_run_surface_err = []
+    per_run_volume_err = []
+    agg_surf_plot_gt = []
+    agg_surf_plot_cat = []
+    agg_surf_plot_smart = []
+    agg_surf_plot_coords = []
+    agg_vol_plot_gt = []
+    agg_vol_plot_cat = []
+    agg_vol_plot_smart = []
+    agg_vol_plot_coords = []
+    agg_surface_unc = []
+    agg_surface_err = []
+    agg_volume_unc = []
+    agg_volume_err = []
 
     # Representative run buffers (for detailed files/plots)
     rep = {}
@@ -628,7 +948,7 @@ def main():
                 )
                 cat_s_np = to_np(denorm_fields(cat_s1_norm, mean_s, std_s))
 
-                cat_v_norm = cat_stage2_predict_full_cached(
+                cat_v_norm, cat_v_q_global, cat_v_z_all = cat_stage2_predict_full_cached(
                     cat_stage2,
                     cat_input_norm,
                     surf_query_norm,
@@ -638,10 +958,63 @@ def main():
                 )
                 cat_v_np = to_np(denorm_fields(cat_v_norm, mean_v, std_v))
 
-            surf_cat_stats.update(surf_gt_np, cat_s_np)
-            surf_smart_stats.update(surf_gt_np, smart_s_np)
-            vol_cat_stats.update(vol_gt_np, cat_v_np)
-            vol_smart_stats.update(vol_gt_np, smart_v_np)
+            surf_gt_eval = append_magnitude_channel(surf_gt_np, 4, 7)
+            cat_s_eval = append_magnitude_channel(cat_s_np, 4, 7)
+            smart_s_eval = append_magnitude_channel(smart_s_np, 4, 7)
+            # Keep pressure + velocity magnitude only for volume comparison.
+            vol_gt_eval = np.concatenate([vol_gt_np[:, :1], np.linalg.norm(vol_gt_np[:, 1:4], axis=1, keepdims=True)], axis=1)
+            cat_v_eval = np.concatenate([cat_v_np[:, :1], np.linalg.norm(cat_v_np[:, 1:4], axis=1, keepdims=True)], axis=1)
+            smart_v_eval = np.concatenate([smart_v_np[:, :1], np.linalg.norm(smart_v_np[:, 1:4], axis=1, keepdims=True)], axis=1)
+
+            surf_cat_stats.update(surf_gt_eval, cat_s_eval)
+            surf_smart_stats.update(surf_gt_eval, smart_s_eval)
+            vol_cat_stats.update(vol_gt_eval, cat_v_eval)
+            vol_smart_stats.update(vol_gt_eval, smart_v_eval)
+            agg_surf_plot_gt.append(surf_gt_np)
+            agg_surf_plot_cat.append(cat_s_np)
+            agg_surf_plot_smart.append(smart_s_np)
+            agg_surf_plot_coords.append(surf_coords)
+            agg_vol_plot_gt.append(vol_gt_np)
+            agg_vol_plot_cat.append(cat_v_np)
+            agg_vol_plot_smart.append(smart_v_np)
+            agg_vol_plot_coords.append(vol_coords)
+
+            if uq_both is not None:
+                sp = uq_both["surface"]
+                md_s2, var_s2, alpha_s2 = compute_surface_uq_chunked(
+                    cat_stage2,
+                    cat_input_norm,
+                    surf_query_norm,
+                    chunk_size=cat_query_chunk,
+                    device=device,
+                    mu_train=sp["mu_train"].float().to(device),
+                    inv_sigma_train=sp["inv_sigma_train"].float().to(device),
+                    Sigma_LLL=sp["Sigma_LLL"].float().to(device),
+                    V_skew=sp["V_skew"].float().to(device),
+                    K=float(sp["K"].item() if isinstance(sp["K"], torch.Tensor) else sp["K"]),
+                    gamma=args.gamma_surface,
+                )
+                if cat_v_q_global is None or cat_v_z_all is None:
+                    raise RuntimeError("Missing cached CAT stage2 features for volume UQ.")
+                vp = uq_both["volume"]
+                md_v2, var_v2, alpha_v2 = compute_hybrid_uq(
+                    cat_v_q_global.unsqueeze(1),
+                    cat_v_z_all.unsqueeze(0),
+                    vp["mu_train"].float().to(device),
+                    vp["inv_sigma_train"].float().to(device),
+                    vp["Sigma_LLL"].float().to(device),
+                    vp["V_skew"].float().to(device),
+                    float(vp["K"].item() if isinstance(vp["K"], torch.Tensor) else vp["K"]),
+                    args.gamma_volume,
+                )
+                per_run_surface_md.append(md_s2)
+                per_run_volume_md.append(md_v2)
+                per_run_surface_err.append(float(np.mean(np.linalg.norm(cat_s_eval - surf_gt_eval, axis=1))))
+                per_run_volume_err.append(float(np.mean(np.linalg.norm(cat_v_eval - vol_gt_eval, axis=1))))
+                agg_surface_unc.append(np.asarray(var_s2, dtype=np.float32).reshape(-1))
+                agg_surface_err.append(np.linalg.norm(cat_s_eval - surf_gt_eval, axis=1).astype(np.float32))
+                agg_volume_unc.append(np.asarray(var_v2, dtype=np.float32).reshape(-1))
+                agg_volume_err.append(np.linalg.norm(cat_v_eval - vol_gt_eval, axis=1).astype(np.float32))
 
             if int(rid) == rep_run_id:
                 rep = {
@@ -656,19 +1029,46 @@ def main():
                     "cat_v": cat_v_np,
                 }
                 if uq is not None and "q" in uq_cache and "z" in uq_cache:
-                    qg = uq_cache["q"].mean(dim=1)
-                    dq = qg - mu_train.unsqueeze(0)
-                    md2 = torch.einsum("bi,ij,bj->b", dq, inv_sigma_train, dq)
-                    md = torch.sqrt(torch.clamp(md2, min=1e-12))[0]
-                    z = uq_cache["z"][0]
-                    var_lll = torch.sum((z @ Sigma_LLL) * z, dim=-1)
-                    var_final = var_lll * (1.0 + float(args.gamma) * md)
-                    cross = z @ V_skew
-                    denom = torch.sqrt(torch.clamp(var_final * K - cross * cross, min=1e-6))
-                    alpha = cross / denom
-                    rep["uq_md"] = float(md.item())
-                    rep["uq_var"] = var_final.detach().cpu().numpy()
-                    rep["uq_alpha"] = alpha.detach().cpu().numpy()
+                    md_s, var_s, alpha_s = compute_hybrid_uq(
+                        uq_cache["q"], uq_cache["z"], mu_train, inv_sigma_train, Sigma_LLL, V_skew, K, args.gamma
+                    )
+                    rep["uq_md"] = md_s
+                    rep["uq_var"] = var_s
+                    rep["uq_alpha"] = alpha_s
+                if uq_both is not None:
+                    sp = uq_both["surface"]
+                    md_s2, var_s2, alpha_s2 = compute_surface_uq_chunked(
+                        cat_stage2,
+                        cat_input_norm,
+                        surf_query_norm,
+                        chunk_size=cat_query_chunk,
+                        device=device,
+                        mu_train=sp["mu_train"].float().to(device),
+                        inv_sigma_train=sp["inv_sigma_train"].float().to(device),
+                        Sigma_LLL=sp["Sigma_LLL"].float().to(device),
+                        V_skew=sp["V_skew"].float().to(device),
+                        K=float(sp["K"].item() if isinstance(sp["K"], torch.Tensor) else sp["K"]),
+                        gamma=args.gamma_surface,
+                    )
+                    if cat_v_q_global is None or cat_v_z_all is None:
+                        raise RuntimeError("Missing cached CAT stage2 features for volume UQ.")
+                    vp = uq_both["volume"]
+                    md_v2, var_v2, alpha_v2 = compute_hybrid_uq(
+                        cat_v_q_global.unsqueeze(1),
+                        cat_v_z_all.unsqueeze(0),
+                        vp["mu_train"].float().to(device),
+                        vp["inv_sigma_train"].float().to(device),
+                        vp["Sigma_LLL"].float().to(device),
+                        vp["V_skew"].float().to(device),
+                        float(vp["K"].item() if isinstance(vp["K"], torch.Tensor) else vp["K"]),
+                        args.gamma_volume,
+                    )
+                    rep["uq_surface_md_scalar"] = md_s2
+                    rep["uq_surface_variance_final"] = var_s2
+                    rep["uq_surface_alpha_exact"] = alpha_s2
+                    rep["uq_volume_md_scalar"] = md_v2
+                    rep["uq_volume_variance_final"] = var_v2
+                    rep["uq_volume_alpha_exact"] = alpha_v2
     finally:
         if h_q is not None:
             h_q.remove()
@@ -677,6 +1077,19 @@ def main():
 
     if not rep:
         raise RuntimeError(f"Representative run {rep_run_id} not found in evaluated set.")
+
+    agg_surf_plot_coords_np = np.concatenate(agg_surf_plot_coords, axis=0) if agg_surf_plot_coords else rep["surf_coords"]
+    agg_surf_plot_gt_np = np.concatenate(agg_surf_plot_gt, axis=0) if agg_surf_plot_gt else rep["surf_gt"]
+    agg_surf_plot_cat_np = np.concatenate(agg_surf_plot_cat, axis=0) if agg_surf_plot_cat else rep["cat_s"]
+    agg_surf_plot_smart_np = np.concatenate(agg_surf_plot_smart, axis=0) if agg_surf_plot_smart else rep["smart_s"]
+    agg_vol_plot_coords_np = np.concatenate(agg_vol_plot_coords, axis=0) if agg_vol_plot_coords else rep["vol_coords"]
+    agg_vol_plot_gt_np = np.concatenate(agg_vol_plot_gt, axis=0) if agg_vol_plot_gt else rep["vol_gt"]
+    agg_vol_plot_cat_np = np.concatenate(agg_vol_plot_cat, axis=0) if agg_vol_plot_cat else rep["cat_v"]
+    agg_vol_plot_smart_np = np.concatenate(agg_vol_plot_smart, axis=0) if agg_vol_plot_smart else rep["smart_v"]
+    agg_surface_unc_np = np.concatenate(agg_surface_unc, axis=0) if agg_surface_unc else None
+    agg_surface_err_np = np.concatenate(agg_surface_err, axis=0) if agg_surface_err else None
+    agg_volume_unc_np = np.concatenate(agg_volume_unc, axis=0) if agg_volume_unc else None
+    agg_volume_err_np = np.concatenate(agg_volume_err, axis=0) if agg_volume_err else None
 
     surf_coords = rep["surf_coords"]
     vol_coords = rep["vol_coords"]
@@ -707,98 +1120,136 @@ def main():
 
     out_root = Path(args.output_dir or (SMART_ROOT.parent / "results" / "drivaerml_full_compare" / f"run_{rep_run_id}"))
     out_root.mkdir(parents=True, exist_ok=True)
+    surface_export_fields = ["pressure", "normal_x", "normal_y", "normal_z", "wall_shear_mag"]
+    volume_export_fields = ["pressure", "velocity_mag"]
+    surf_gt_export = append_magnitude_channel(surf_gt, 4, 7)
+    cat_s_export = append_magnitude_channel(cat_s_np, 4, 7)
+    smart_s_export = append_magnitude_channel(smart_s_np, 4, 7)
+    vol_gt_export = np.concatenate([vol_gt[:, :1], np.linalg.norm(vol_gt[:, 1:4], axis=1, keepdims=True)], axis=1)
+    cat_v_export = np.concatenate([cat_v_np[:, :1], np.linalg.norm(cat_v_np[:, 1:4], axis=1, keepdims=True)], axis=1)
+    smart_v_export = np.concatenate([smart_v_np[:, :1], np.linalg.norm(smart_v_np[:, 1:4], axis=1, keepdims=True)], axis=1)
 
     # Save ParaView-friendly files (same points; switch arrays in ParaView).
     surf_point_data = {}
     vol_point_data = {}
-    for i, f in enumerate(SURFACE_FIELDS):
-        surf_point_data[f"gt_{f}"] = surf_gt[:, i]
-        surf_point_data[f"cat_stage1_{f}"] = cat_s_np[:, i]
-        surf_point_data[f"smart_{f}"] = smart_s_np[:, i]
-        surf_point_data[f"err_cat_stage1_{f}"] = cat_s_np[:, i] - surf_gt[:, i]
-        surf_point_data[f"err_smart_{f}"] = smart_s_np[:, i] - surf_gt[:, i]
-        surf_point_data[f"abs_err_cat_stage1_{f}"] = np.abs(cat_s_np[:, i] - surf_gt[:, i])
-        surf_point_data[f"abs_err_smart_{f}"] = np.abs(smart_s_np[:, i] - surf_gt[:, i])
+    for i, f in enumerate(surface_export_fields):
+        surf_point_data[f"gt_{f}"] = surf_gt_export[:, i]
+        surf_point_data[f"cat_stage1_{f}"] = cat_s_export[:, i]
+        surf_point_data[f"smart_{f}"] = smart_s_export[:, i]
+        surf_point_data[f"err_cat_stage1_{f}"] = cat_s_export[:, i] - surf_gt_export[:, i]
+        surf_point_data[f"err_smart_{f}"] = smart_s_export[:, i] - surf_gt_export[:, i]
+        surf_point_data[f"abs_err_cat_stage1_{f}"] = np.abs(cat_s_export[:, i] - surf_gt_export[:, i])
+        surf_point_data[f"abs_err_smart_{f}"] = np.abs(smart_s_export[:, i] - surf_gt_export[:, i])
 
-    for i, f in enumerate(VOLUME_FIELDS):
-        vol_point_data[f"gt_{f}"] = vol_gt[:, i]
-        vol_point_data[f"cat_stage2_{f}"] = cat_v_np[:, i]
-        vol_point_data[f"smart_{f}"] = smart_v_np[:, i]
-        vol_point_data[f"err_cat_stage2_{f}"] = cat_v_np[:, i] - vol_gt[:, i]
-        vol_point_data[f"err_smart_{f}"] = smart_v_np[:, i] - vol_gt[:, i]
-        vol_point_data[f"abs_err_cat_stage2_{f}"] = np.abs(cat_v_np[:, i] - vol_gt[:, i])
-        vol_point_data[f"abs_err_smart_{f}"] = np.abs(smart_v_np[:, i] - vol_gt[:, i])
+    for i, f in enumerate(volume_export_fields):
+        vol_point_data[f"gt_{f}"] = vol_gt_export[:, i]
+        vol_point_data[f"cat_stage2_{f}"] = cat_v_export[:, i]
+        vol_point_data[f"smart_{f}"] = smart_v_export[:, i]
+        vol_point_data[f"err_cat_stage2_{f}"] = cat_v_export[:, i] - vol_gt_export[:, i]
+        vol_point_data[f"err_smart_{f}"] = smart_v_export[:, i] - vol_gt_export[:, i]
+        vol_point_data[f"abs_err_cat_stage2_{f}"] = np.abs(cat_v_export[:, i] - vol_gt_export[:, i])
+        vol_point_data[f"abs_err_smart_{f}"] = np.abs(smart_v_export[:, i] - vol_gt_export[:, i])
 
-    # Convenience vector arrays for quick glyph visualization.
-    surf_point_data["gt_normals"] = surf_gt[:, 1:4]
-    surf_point_data["cat_stage1_normals"] = cat_s_np[:, 1:4]
-    surf_point_data["smart_normals"] = smart_s_np[:, 1:4]
-    surf_point_data["gt_wall_shear"] = surf_gt[:, 4:7]
-    surf_point_data["cat_stage1_wall_shear"] = cat_s_np[:, 4:7]
-    surf_point_data["smart_wall_shear"] = smart_s_np[:, 4:7]
+    surf_point_data["pointwise_total_abs_err_cat_stage1"] = np.linalg.norm(cat_s_export - surf_gt_export, axis=1)
+    surf_point_data["pointwise_total_abs_err_smart"] = np.linalg.norm(smart_s_export - surf_gt_export, axis=1)
+    vol_point_data["pointwise_total_abs_err_cat_stage2"] = np.linalg.norm(cat_v_export - vol_gt_export, axis=1)
+    vol_point_data["pointwise_total_abs_err_smart"] = np.linalg.norm(smart_v_export - vol_gt_export, axis=1)
     if "uq_var" in rep:
         surf_point_data["uq_variance_final"] = rep["uq_var"]
         surf_point_data["uq_alpha_exact"] = rep["uq_alpha"]
         surf_point_data["uq_md_scalar"] = np.full((surf_coords.shape[0],), rep["uq_md"], dtype=np.float32)
+    if "uq_surface_variance_final" in rep:
+        surf_point_data["uq_surface_variance_final"] = rep["uq_surface_variance_final"]
+        surf_point_data["uq_surface_alpha_exact"] = rep["uq_surface_alpha_exact"]
+        surf_point_data["uq_surface_md_scalar"] = np.full((surf_coords.shape[0],), rep["uq_surface_md_scalar"], dtype=np.float32)
 
     vol_point_data["gt_velocity"] = vol_gt[:, 1:4]
     vol_point_data["cat_stage2_velocity"] = cat_v_np[:, 1:4]
     vol_point_data["smart_velocity"] = smart_v_np[:, 1:4]
+    if "uq_volume_variance_final" in rep:
+        vol_point_data["uq_volume_variance_final"] = rep["uq_volume_variance_final"]
+        vol_point_data["uq_volume_alpha_exact"] = rep["uq_volume_alpha_exact"]
+        vol_point_data["uq_volume_md_scalar"] = np.full((vol_coords.shape[0],), rep["uq_volume_md_scalar"], dtype=np.float32)
 
     write_polydata_vtk(out_root / "surface_predictions.vtk", surf_coords, surf_point_data)
     write_polydata_vtk(out_root / "volume_predictions.vtk", vol_coords, vol_point_data)
 
-    # Plotting (downsampled for speed/readability only).
+    # Plotting uses the aggregated 20-run subset; VTKs remain representative-run only.
     surf_plot_coords, surf_plot_arrs = downsample_for_plot(
-        surf_coords,
-        [surf_gt, cat_s_np, smart_s_np],
+        agg_surf_plot_coords_np,
+        [agg_surf_plot_gt_np, agg_surf_plot_cat_np, agg_surf_plot_smart_np],
         max_points=int(args.plot_max_points),
-        seed=args.seed + 1000 + args.run_id,
+        seed=args.seed + 1000 + rep_run_id,
     )
     surf_plot_gt, surf_plot_cat, surf_plot_smart = surf_plot_arrs
     vol_plot_coords, vol_plot_arrs = downsample_for_plot(
-        vol_coords,
-        [vol_gt, cat_v_np, smart_v_np],
+        agg_vol_plot_coords_np,
+        [agg_vol_plot_gt_np, agg_vol_plot_cat_np, agg_vol_plot_smart_np],
         max_points=int(args.plot_max_points),
-        seed=args.seed + 2000 + args.run_id,
+        seed=args.seed + 2000 + rep_run_id,
     )
     vol_plot_gt, vol_plot_cat, vol_plot_smart = vol_plot_arrs
 
     plots_dir = out_root / "plots"
     plots_dir.mkdir(parents=True, exist_ok=True)
 
+    surf_plot_gt_eval = append_magnitude_channel(surf_plot_gt, 4, 7)
+    surf_plot_cat_eval = append_magnitude_channel(surf_plot_cat, 4, 7)
+    surf_plot_smart_eval = append_magnitude_channel(surf_plot_smart, 4, 7)
+    vol_plot_gt_eval = np.concatenate([vol_plot_gt[:, :1], np.linalg.norm(vol_plot_gt[:, 1:4], axis=1, keepdims=True)], axis=1)
+    vol_plot_cat_eval = np.concatenate([vol_plot_cat[:, :1], np.linalg.norm(vol_plot_cat[:, 1:4], axis=1, keepdims=True)], axis=1)
+    vol_plot_smart_eval = np.concatenate([vol_plot_smart[:, :1], np.linalg.norm(vol_plot_smart[:, 1:4], axis=1, keepdims=True)], axis=1)
+
     plot_field_maps(
         plots_dir / "surface_field_maps.png",
-        "Surface Fields: GT vs CAT Stage1 vs SMART",
+        f"Surface Fields: GT vs CAT Stage1 vs SMART (aggregated over {len(eval_run_ids)} test runs)",
         surf_plot_coords,
-        surf_plot_gt,
-        surf_plot_cat,
-        surf_plot_smart,
-        SURFACE_FIELDS,
+        surf_plot_gt_eval,
+        surf_plot_cat_eval,
+        surf_plot_smart_eval,
+        surface_eval_fields,
         "CAT-S1",
         "SMART",
     )
     plot_field_maps(
         plots_dir / "volume_field_maps.png",
-        "Volume Fields: GT vs CAT Stage2 vs SMART",
+        f"Volume Fields: GT vs CAT Stage2 vs SMART (aggregated over {len(eval_run_ids)} test runs)",
         vol_plot_coords,
-        vol_plot_gt,
-        vol_plot_cat,
-        vol_plot_smart,
-        VOLUME_FIELDS,
+        vol_plot_gt_eval,
+        vol_plot_cat_eval,
+        vol_plot_smart_eval,
+        volume_eval_fields,
         "CAT-S2",
         "SMART",
     )
-    plot_parity(plots_dir / "surface_parity.png", surf_plot_gt, surf_plot_cat, surf_plot_smart, SURFACE_FIELDS, "CAT-S1", "SMART")
-    plot_parity(plots_dir / "volume_parity.png", vol_plot_gt, vol_plot_cat, vol_plot_smart, VOLUME_FIELDS, "CAT-S2", "SMART")
-    plot_error_hist(plots_dir / "surface_error_hist.png", surf_plot_gt, surf_plot_cat, surf_plot_smart, SURFACE_FIELDS, "CAT-S1", "SMART")
-    plot_error_hist(plots_dir / "volume_error_hist.png", vol_plot_gt, vol_plot_cat, vol_plot_smart, VOLUME_FIELDS, "CAT-S2", "SMART")
+    plot_volume_slice_maps(
+        plots_dir / "volume_slice_pressure.png",
+        "Representative Volume Slice at y=0",
+        vol_coords,
+        vol_gt_export[:, 0],
+        cat_v_export[:, 0],
+        smart_v_export[:, 0],
+        "pressure",
+    )
+    plot_volume_slice_maps(
+        plots_dir / "volume_slice_velocity_mag.png",
+        "Representative Volume Slice at y=0",
+        vol_coords,
+        vol_gt_export[:, 1],
+        cat_v_export[:, 1],
+        smart_v_export[:, 1],
+        "velocity_mag",
+    )
+    plot_parity(plots_dir / "surface_parity.png", surf_plot_gt_eval, surf_plot_cat_eval, surf_plot_smart_eval, surface_eval_fields, "CAT-S1", "SMART")
+    plot_parity(plots_dir / "volume_parity.png", vol_plot_gt_eval, vol_plot_cat_eval, vol_plot_smart_eval, volume_eval_fields, "CAT-S2", "SMART")
+    plot_error_hist(plots_dir / "surface_error_hist.png", surf_plot_gt_eval, surf_plot_cat_eval, surf_plot_smart_eval, surface_eval_fields, "CAT-S1", "SMART")
+    plot_error_hist(plots_dir / "volume_error_hist.png", vol_plot_gt_eval, vol_plot_cat_eval, vol_plot_smart_eval, volume_eval_fields, "CAT-S2", "SMART")
     plot_grouped_metrics(
         plots_dir / "surface_rel_l2_by_field.png",
         "rel_l2",
         surface_metrics["cat_stage1"],
         surface_metrics["smart"],
-        SURFACE_FIELDS,
+        surface_eval_fields,
         "CAT-S1",
         "SMART",
     )
@@ -807,20 +1258,74 @@ def main():
         "rel_l2",
         volume_metrics["cat_stage2"],
         volume_metrics["smart"],
-        VOLUME_FIELDS,
+        volume_eval_fields,
         "CAT-S2",
         "SMART",
     )
+    plot_global_summary(plots_dir / "global_summary.png", surface_metrics, volume_metrics)
+
+    if agg_surface_unc_np is not None and agg_surface_err_np is not None:
+        surf_unc_ds, surf_err_ds = downsample_pair(
+            agg_surface_unc_np.reshape(-1),
+            agg_surface_err_np.reshape(-1),
+            max_points=int(args.plot_max_points),
+            seed=args.seed + 3000,
+        )
+        plot_pointwise_error_vs_uncertainty(
+            plots_dir / "surface_error_vs_uncertainty.png",
+            surf_unc_ds,
+            surf_err_ds,
+            f"Surface Pointwise Error vs Uncertainty (aggregated over {len(eval_run_ids)} test runs)",
+            "Surface Variance",
+            "Pointwise Total Error",
+        )
+    if agg_volume_unc_np is not None and agg_volume_err_np is not None:
+        vol_unc_ds, vol_err_ds = downsample_pair(
+            agg_volume_unc_np.reshape(-1),
+            agg_volume_err_np.reshape(-1),
+            max_points=int(args.plot_max_points),
+            seed=args.seed + 4000,
+        )
+        plot_pointwise_error_vs_uncertainty(
+            plots_dir / "volume_error_vs_uncertainty.png",
+            vol_unc_ds,
+            vol_err_ds,
+            f"Volume Pointwise Error vs Uncertainty (aggregated over {len(eval_run_ids)} test runs)",
+            "Volume Variance",
+            "Pointwise Total Error",
+        )
+    if per_run_surface_md and per_run_surface_err:
+        plot_md_vs_error(
+            plots_dir / "surface_md_vs_error.png",
+            np.asarray(per_run_surface_md, dtype=np.float32),
+            np.asarray(per_run_surface_err, dtype=np.float32),
+            "Surface MD vs Mean Error Across Sampled Runs",
+            "Mean Pointwise Total Error",
+        )
+    if per_run_volume_md and per_run_volume_err:
+        plot_md_vs_error(
+            plots_dir / "volume_md_vs_error.png",
+            np.asarray(per_run_volume_md, dtype=np.float32),
+            np.asarray(per_run_volume_err, dtype=np.float32),
+            "Volume MD vs Mean Error Across Sampled Runs",
+            "Mean Pointwise Total Error",
+        )
 
     metrics_payload = {
         "representative_run_id": int(rep_run_id),
         "evaluated_run_ids": [int(x) for x in eval_run_ids],
+        "stats_runs_requested": int(args.stats_runs),
         "surface_points_total": int(surf_coords.shape[0]),
         "volume_points_total": int(vol_coords.shape[0]),
         "smart_checkpoint": smart_ckpt_path,
         "cat_stage1_checkpoint": args.cat_stage1_checkpoint,
         "cat_stage2_checkpoint": args.cat_stage2_checkpoint,
         "uq_params": args.uq_params,
+        "uq_params_both": args.uq_params_both,
+        "surface_md_values": per_run_surface_md,
+        "surface_mean_error_values": per_run_surface_err,
+        "volume_md_values": per_run_volume_md,
+        "volume_mean_error_values": per_run_volume_err,
         "surface_metrics": surface_metrics,
         "volume_metrics": volume_metrics,
     }
@@ -831,12 +1336,22 @@ def main():
         "======================================",
         f"Representative run id: {rep_run_id}",
         f"Evaluated runs for summary: {len(eval_run_ids)}",
+        f"Stats runs requested: {int(args.stats_runs)}",
         f"Surface points in representative run: {surf_coords.shape[0]}",
         f"Volume points in representative run: {vol_coords.shape[0]}",
         f"SMART checkpoint: {smart_ckpt_path}",
         f"CAT stage1 checkpoint: {args.cat_stage1_checkpoint}",
         f"CAT stage2 checkpoint: {args.cat_stage2_checkpoint}",
         f"UQ params: {args.uq_params}",
+        f"UQ params both: {args.uq_params_both}",
+        f"All reported statistics and plots aggregate over {len(eval_run_ids)} sampled test runs.",
+        "",
+        "Uncertainty Fields Guide",
+        "------------------------",
+        "uq_surface_variance_final / uq_volume_variance_final: pointwise uncertainty scale. Larger means the model considers that point less certain.",
+        "uq_surface_alpha_exact / uq_volume_alpha_exact: pointwise asymmetry indicator. Positive means the predictive distribution has a heavier upper tail, negative means a heavier lower tail.",
+        "uq_surface_md_scalar / uq_volume_md_scalar: run-level Mahalanobis distance copied to every point for visualization. Larger means the whole case looks more out-of-distribution relative to calibration data.",
+        "pointwise_total_abs_err_*: Euclidean error over the exported scalar set. For surface this uses pressure, normals, and wall-shear magnitude. For volume this uses pressure and velocity magnitude.",
         "",
         "Global Metrics (lower is better)",
         "--------------------------------",
@@ -845,16 +1360,21 @@ def main():
         f"Volume CAT-S2: {volume_metrics['cat_stage2_global']}",
         f"Volume SMART:  {volume_metrics['smart_global']}",
         "",
+        "Magnitude Convention",
+        "--------------------",
+        "Wall-shear and velocity are compared using magnitude only in metrics, parity plots, point-cloud images, and exported scalar error fields.",
+        "Representative volume slice images use a smoothed y=0 x-z raster with 200x50 pixels; each pixel averages all points within radius x_range/80, and empty pixels are set to zero.",
+        "",
         "Per-field Surface rel_l2",
         "-------------------------",
     ]
-    for f in SURFACE_FIELDS:
+    for f in surface_eval_fields:
         summary_lines.append(
             f"{f:18s} CAT-S1 rel_l2={surface_metrics['cat_stage1'][f]['rel_l2']:.6f}, R2={surface_metrics['cat_stage1'][f]['r2']:.6f}"
             f" | SMART rel_l2={surface_metrics['smart'][f]['rel_l2']:.6f}, R2={surface_metrics['smart'][f]['r2']:.6f}"
         )
     summary_lines += ["", "Per-field Volume rel_l2", "------------------------"]
-    for f in VOLUME_FIELDS:
+    for f in volume_eval_fields:
         summary_lines.append(
             f"{f:18s} CAT-S2 rel_l2={volume_metrics['cat_stage2'][f]['rel_l2']:.6f}, R2={volume_metrics['cat_stage2'][f]['r2']:.6f}"
             f" | SMART rel_l2={volume_metrics['smart'][f]['rel_l2']:.6f}, R2={volume_metrics['smart'][f]['r2']:.6f}"

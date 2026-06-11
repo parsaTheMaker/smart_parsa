@@ -196,3 +196,5 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+morph_test/

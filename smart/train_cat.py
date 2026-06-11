@@ -34,11 +34,15 @@ def sample_indices(n: int, k: int, device: torch.device, disjoint_from: torch.Te
         candidate = torch.where(mask)[0]
         if candidate.numel() == 0:
             return torch.randint(0, n, (k,), device=device)
+        if k == candidate.numel():
+            return candidate
         if k <= candidate.numel():
             perm = torch.randperm(candidate.numel(), device=device)[:k]
             return candidate[perm]
         extra = candidate[torch.randint(0, candidate.numel(), (k - candidate.numel(),), device=device)]
         return torch.cat([candidate, extra], dim=0)
+    if k == n:
+        return torch.arange(n, device=device)
     if k <= n:
         return torch.randperm(n, device=device)[:k]
     extra = torch.randint(0, n, (k - n,), device=device)
@@ -105,37 +109,45 @@ def resolve_targets(fields: dict, mean_vol: torch.Tensor, std_vol: torch.Tensor)
 
 def prepare_stage_batch(stage: int, batch, config, device, surface_target_indices, volume_target_indices):
     geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data = batch
-    del geo_mesh
+    geo_mesh = geo_mesh.to(device)
     surf_mesh = surf_mesh.to(device)
     surf_data = surf_data.to(device)
     vol_mesh = vol_mesh.to(device)
     vol_data = vol_data.to(device)
 
-    bsz, ns, _ = surf_mesh.shape
+    bsz, ng, _ = geo_mesh.shape
+    ns = surf_mesh.shape[1]
     nv = vol_mesh.shape[1]
 
-    s_in = int(getattr(config, "single_surface_input_points", getattr(config, "num_body_points", ns)))
-    s_q = int(getattr(config, "single_surface_query_points", getattr(config, "num_surface_points", ns)))
-    v_q = int(getattr(config, "single_volume_query_points", getattr(config, "num_volume_points", nv)))
+    num_body_points = int(getattr(config, "num_body_points", ng))
+    s_in = int(getattr(config, "single_surface_input_points", num_body_points))
+    # Keep CAT query handling as close to SMART as possible: use the dataset-provided
+    # surface/volume query tensors directly instead of introducing a second query cap.
+    # The dataset already applied num_surface_points / num_volume_points.
+    s_q = ns
+    v_q = nv
 
+    # Match SMART semantics: when the dataset is asked for full geometry, CAT should
+    # also consume the full geometry pool for its encoder input, regardless of any
+    # stale single-surface-input cap left in the config.
+    if num_body_points <= 0:
+        s_in = ng
     if s_in <= 0:
-        s_in = ns
-    if s_q <= 0:
-        s_q = ns
-    if v_q <= 0:
-        v_q = nv
-
+        s_in = ng
     enc_idx, surf_q_idx = [], []
     vol_q_idx = []
     for _b in range(bsz):
-        e = sample_indices(ns, s_in, device)
-        sq = sample_indices(ns, s_q, device, disjoint_from=e)
+        e = sample_indices(ng, s_in, device)
+        # Geometry inputs and surface queries may come from different pools/sizes,
+        # so disjoint sampling only makes sense when they share the same index space.
+        disjoint = e if ng == ns else None
+        sq = sample_indices(ns, s_q, device, disjoint_from=disjoint)
         enc_idx.append(e)
         surf_q_idx.append(sq)
         if stage == 2:
             vol_q_idx.append(sample_indices(nv, v_q, device))
 
-    surface_input_tokens = gather_per_batch(surf_mesh, enc_idx)
+    surface_input_tokens = gather_per_batch(geo_mesh, enc_idx)
     surface_query_tokens = gather_per_batch(surf_mesh, surf_q_idx)
 
     s_idx = torch.tensor(surface_target_indices, dtype=torch.long, device=surf_data.device)

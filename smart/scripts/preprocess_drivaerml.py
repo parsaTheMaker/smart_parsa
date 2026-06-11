@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
+import concurrent.futures as cf
 import json
+import multiprocessing as mp
 import os
 import signal
 import tempfile
@@ -260,17 +262,30 @@ def main():
         for rid in run_ids
     ]
 
-    # HDF5 + multiprocessing can stall on some systems. Default to robust streaming mode.
     ok = 0
     status_counts = {"ok": 0, "skipped": 0, "missing": 0}
     try:
-        for j in tqdm(jobs, total=len(jobs), desc="Preprocessing runs"):
-            rid, status = process_run(j)
-            status_counts[status] = status_counts.get(status, 0) + 1
-            if status == "ok":
-                ok += 1
+        if int(args.workers) <= 1:
+            for j in tqdm(jobs, total=len(jobs), desc="Preprocessing runs"):
+                rid, status = process_run(j)
+                status_counts[status] = status_counts.get(status, 0) + 1
+                if status == "ok":
+                    ok += 1
+        else:
+            ctx = mp.get_context("spawn")
+            with cf.ProcessPoolExecutor(max_workers=int(args.workers), mp_context=ctx) as ex:
+                futs = [ex.submit(process_run, j) for j in jobs]
+                for fut in tqdm(cf.as_completed(futs), total=len(futs), desc="Preprocessing runs"):
+                    rid, status = fut.result()
+                    status_counts[status] = status_counts.get(status, 0) + 1
+                    if status == "ok":
+                        ok += 1
     except KeyboardInterrupt:
         print("\nInterrupted. Terminating immediately.")
+        try:
+            ex.shutdown(wait=False, cancel_futures=True)  # type: ignore[name-defined]
+        except Exception:
+            pass
         # Hard-exit so there is no lingering work.
         os._exit(130)
 

@@ -34,7 +34,10 @@ class AhmedMLDatasetV2(Dataset):
         cache_root=None,
         require_preprocessed=False,
     ):
-        print(f"Using {geometry_points} geometry points, {surface_points} surface points, and {volume_points} volume points.")
+        geo_label = "all" if int(geometry_points) == 0 else str(int(geometry_points))
+        surf_label = "all" if int(surface_points) == 0 else str(int(surface_points))
+        vol_label = "all" if int(volume_points) == 0 else str(int(volume_points))
+        print(f"Using {geo_label} geometry points, {surf_label} surface points, and {vol_label} volume points.")
 
         self.geometry_points = int(geometry_points)
         self.surface_points = int(surface_points)

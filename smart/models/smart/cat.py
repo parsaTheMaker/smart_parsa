@@ -234,7 +234,6 @@ class CAT(nn.Module):
     def _encode_stage2(self, surface_query_pos: torch.Tensor, surface_pred: torch.Tensor, latent_pos: torch.Tensor, initial_latent: torch.Tensor | None):
         # Pressure is injected as an additive feature embedding on top of positional embeddings.
         surf_pos = self._scale_pos(surface_query_pos)
-        pressure_emb_full = self.stage2_pressure_proj(surface_pred)
 
         if initial_latent is None:
             latent_emb = self.pos_encoder(latent_pos)
@@ -245,7 +244,8 @@ class CAT(nn.Module):
         for block in self.surface_physics_encoder_blocks:
             idx = torch.randperm(surf_pos.shape[1], device=surf_pos.device)[: min(self.subsampled_geometry_points, surf_pos.shape[1])]
             sub_pos = surf_pos[:, idx, :]
-            sub_emb = self.pos_encoder(sub_pos) + pressure_emb_full[:, idx, :]
+            sub_surface_pred = surface_pred[:, idx, :]
+            sub_emb = self.pos_encoder(sub_pos) + self.stage2_pressure_proj(sub_surface_pred)
             latent_emb, e_ca = block(latent_emb, sub_emb, None, latent_geometry_pos=latent_pos, subsampled_geometry_pos=sub_pos)
             inter.append(e_ca)
         return inter, latent_emb
@@ -259,7 +259,12 @@ class CAT(nn.Module):
         surface_pred = self.stage2_head(q)
 
         if return_aux:
-            return surface_pred, {"anchor_pos": anchor_pos, "geom_latents": geom_latents, "geom_final": geom_final}
+            return surface_pred, {
+                "anchor_pos": anchor_pos,
+                "anchor_pos_norm": anchor_pos / float(self.pos_scale_factor),
+                "geom_latents": geom_latents,
+                "geom_final": geom_final,
+            }
         return surface_pred
 
     def forward_stage2_only(self, surface_input_tokens: torch.Tensor, surface_query_tokens: torch.Tensor, volume_query_tokens: torch.Tensor, return_aux: bool = False):

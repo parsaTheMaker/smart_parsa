@@ -499,7 +499,7 @@ class SMART(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
     
-    def encode(self, geo, params):
+    def encode(self, geo, params, return_final=False):
         # Prepare positions by scaling
         geo = geo * self.pos_scale_factor
         
@@ -520,9 +520,11 @@ class SMART(nn.Module):
             # Store for decoder
             intermediate_latent_geometries.append(e_ca)
         
+        if return_final:
+            return intermediate_latent_geometries, latent_geo_pos, latent_geo_emb
         return intermediate_latent_geometries, latent_geo_pos
     
-    def decode(self, intermediate_latent_geometries, latent_geo_pos, params, query_pos):
+    def decode_features(self, intermediate_latent_geometries, latent_geo_pos, params, query_pos):
         # Prepare positions by scaling
         query_pos = query_pos * self.pos_scale_factor
         query_emb = self.pos_encoder(query_pos)
@@ -531,9 +533,11 @@ class SMART(nn.Module):
         for e_ca, block in zip(intermediate_latent_geometries, self.decoder_blocks):
             query_emb = block(query_emb, e_ca, params, queries_pos=query_pos, latent_geometry_pos=latent_geo_pos)
         
-        # Final MLP
+        return query_emb
+
+    def decode(self, intermediate_latent_geometries, latent_geo_pos, params, query_pos):
+        query_emb = self.decode_features(intermediate_latent_geometries, latent_geo_pos, params, query_pos)
         pred = self.mlp(query_emb)
-        
         return pred
     
     def forward(self, geo, surf_query_pos, vol_query_pos, params):

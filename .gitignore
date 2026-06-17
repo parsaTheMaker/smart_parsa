@@ -198,3 +198,4 @@ cython_debug/
 .pypirc
 
 morph_test/
+smart_parsa.code-workspace

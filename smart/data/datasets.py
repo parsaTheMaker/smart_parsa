@@ -50,6 +50,20 @@ def get_dataset(config):
                               scale_positions=config.scale_positions)
         if dataset == "DrivAerML":
             dataset_kwargs["require_preprocessed"] = True
+            model_name = getattr(config, "model_name", "")
+            if model_name in {"SMART_SAT", "SMART_SATLOSS"}:
+                arch = getattr(config, "architecture", {})
+                density_knn_k = int(getattr(config, "density_knn_k", getattr(arch, "density_knn_k", 8)))
+                density_neighbor_hops = int(getattr(config, "density_neighbor_hops", getattr(arch, "density_neighbor_hops", 1)))
+                density_estimator = getattr(config, "density_estimator", getattr(arch, "density_estimator", "rk2"))
+                dataset_kwargs["geometry_density_knn_k"] = density_knn_k
+                dataset_kwargs["geometry_density_neighbor_hops"] = density_neighbor_hops
+                dataset_kwargs["geometry_density_estimator"] = density_estimator
+                dataset_kwargs["geometry_density_cache_dtype"] = getattr(config, "geometry_density_cache_dtype", "float16")
+                if model_name == "SMART_SAT":
+                    dataset_kwargs["return_geometry_density"] = True
+                if model_name == "SMART_SATLOSS":
+                    dataset_kwargs["return_surface_density"] = True
         if dataset == "NACA4":
             dataset_kwargs["manifest_variant"] = getattr(config, "manifest_variant", "full")
         train_data = datasets[dataset]["dataset"](data_path,

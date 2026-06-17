@@ -2,12 +2,17 @@ import os
 import json
 import shutil
 import tempfile
+from collections import OrderedDict
 from pathlib import Path
 
 import h5py
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+try:
+    from utils.geometry_density import estimate_log_sampling_density
+except ImportError:  # pragma: no cover - package-style imports
+    from smart.utils.geometry_density import estimate_log_sampling_density
 
 
 class AhmedMLDatasetV2(Dataset):
@@ -33,6 +38,12 @@ class AhmedMLDatasetV2(Dataset):
         io_oversample_factor=4,
         cache_root=None,
         require_preprocessed=False,
+        return_geometry_density=False,
+        return_surface_density=False,
+        geometry_density_knn_k=8,
+        geometry_density_neighbor_hops=1,
+        geometry_density_estimator="rk2",
+        geometry_density_cache_dtype="float16",
     ):
         geo_label = "all" if int(geometry_points) == 0 else str(int(geometry_points))
         surf_label = "all" if int(surface_points) == 0 else str(int(surface_points))
@@ -54,6 +65,14 @@ class AhmedMLDatasetV2(Dataset):
         print(f"AhmedMLDatasetV2 cache root: {self.cache_root}")
         self.preprocessed_mode = (Path(self.file_path) / "preprocessed_manifest.json").is_file()
         self.require_preprocessed = bool(require_preprocessed)
+        self.return_geometry_density = bool(return_geometry_density)
+        self.return_surface_density = bool(return_surface_density)
+        self.geometry_density_knn_k = max(1, int(geometry_density_knn_k))
+        self.geometry_density_neighbor_hops = max(0, int(geometry_density_neighbor_hops))
+        self.geometry_density_estimator = str(geometry_density_estimator)
+        self.geometry_density_cache_dtype = str(geometry_density_cache_dtype)
+        self._geometry_density_ram_cache = OrderedDict()
+        self._geometry_density_ram_cache_max_entries = 16
         if self.require_preprocessed and not self.preprocessed_mode:
             raise FileNotFoundError(
                 "DrivAerML is configured to use preprocessed-only mode, but "
@@ -241,6 +260,76 @@ class AhmedMLDatasetV2(Dataset):
             "volume": run_dir / f"volume_{self.CACHE_VERSION}.npy",
             "volume_targets": run_dir / f"volume_targets_{self.CACHE_VERSION}.npy",
         }
+
+    def _geometry_density_cache_path(self, run_id):
+        run_dir = self.cache_root / f"run_{run_id}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        scale_tag = "scaled" if self.scale_positions else "noscale"
+        dtype_tag = self.geometry_density_cache_dtype
+        return run_dir / (
+            f"geometry_log_density_{self.CACHE_VERSION}_{scale_tag}"
+            f"_{self.geometry_density_estimator}"
+            f"_k{self.geometry_density_knn_k}"
+            f"_h{self.geometry_density_neighbor_hops}"
+            f"_{dtype_tag}.npy"
+        )
+
+    def _load_or_compute_geometry_density(self, run_id, geo_mesh, can_cache):
+        cache_path = self._geometry_density_cache_path(run_id)
+        ram_key = str(cache_path)
+        cached = self._geometry_density_ram_cache.get(ram_key)
+        if cached is not None and int(cached.shape[0]) == int(geo_mesh.shape[0]):
+            self._geometry_density_ram_cache.move_to_end(ram_key)
+            return cached
+        if can_cache and cache_path.is_file():
+            try:
+                arr = np.load(cache_path)
+                if int(arr.shape[0]) == int(geo_mesh.shape[0]):
+                    tensor = torch.from_numpy(np.asarray(arr, dtype=np.float32))
+                    self._remember_geometry_density(ram_key, tensor)
+                    return tensor
+            except Exception:
+                pass
+
+        log_density = estimate_log_sampling_density(
+            geo_mesh.unsqueeze(0),
+            knn_k=self.geometry_density_knn_k,
+            neighbor_hops=self.geometry_density_neighbor_hops,
+            estimator=self.geometry_density_estimator,
+        ).squeeze(0).cpu()
+
+        if can_cache:
+            if self.geometry_density_cache_dtype == "float16":
+                cache_arr = log_density.numpy().astype(np.float16, copy=False)
+            else:
+                cache_arr = log_density.numpy().astype(np.float32, copy=False)
+            try:
+                self._atomic_save_npy(cache_path, cache_arr)
+            except Exception:
+                pass
+        self._remember_geometry_density(ram_key, log_density)
+
+        return log_density
+
+    def _remember_geometry_density(self, ram_key, tensor):
+        self._geometry_density_ram_cache[ram_key] = tensor
+        self._geometry_density_ram_cache.move_to_end(ram_key)
+        while len(self._geometry_density_ram_cache) > self._geometry_density_ram_cache_max_entries:
+            self._geometry_density_ram_cache.popitem(last=False)
+
+    def _try_load_surface_density_subset_from_cache(self, run_id, surf_idx, expected_n):
+        cache_path = self._geometry_density_cache_path(run_id)
+        if not cache_path.is_file():
+            return None
+        try:
+            arr = np.load(cache_path, mmap_mode="r")
+            if int(arr.shape[0]) != int(expected_n):
+                return None
+            surf_idx_np = surf_idx.detach().cpu().numpy().astype(np.int64, copy=False)
+            subset = np.asarray(arr[surf_idx_np], dtype=np.float32)
+            return torch.from_numpy(subset)
+        except Exception:
+            return None
 
     @staticmethod
     def _finite_mask(*arrays):
@@ -677,7 +766,7 @@ class AhmedMLDatasetV2(Dataset):
         idx = np.random.choice(n, size=k, replace=False)
         return arr[idx]
 
-    def _load_case_sampled_from_h5(self, run_id):
+    def _load_case_sampled_from_h5(self, run_id, return_sample_info=False):
         ns, nv = self._get_point_counts(run_id)
 
         with h5py.File(self._boundary_h5_path(run_id), "r") as hb:
@@ -725,9 +814,18 @@ class AhmedMLDatasetV2(Dataset):
         vol_mesh = torch.from_numpy(vcoords)
         vol_data = torch.from_numpy(u)
 
+        sample_info = {
+            "geo_idx": None,
+            "surf_idx": None,
+            "vol_idx": None,
+            "source_ns": ns,
+            "source_nv": nv,
+        }
+        if return_sample_info:
+            return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, sample_info
         return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data
 
-    def _load_case_from_preprocessed(self, run_id):
+    def _load_case_from_preprocessed(self, run_id, return_sample_info=False):
         run_dir = self._run_dir(run_id)
         surf_coords = np.load(run_dir / "surface_coords.npy", mmap_mode="r")
         surf_p = np.load(run_dir / "surface_pMeanTrim.npy", mmap_mode="r")
@@ -770,23 +868,68 @@ class AhmedMLDatasetV2(Dataset):
             )
         )
 
+        sample_info = {"surf_idx": torch.from_numpy(surf_idx)}
+        if return_sample_info:
+            return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, sample_info
         return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data
 
     def __getitem__(self, idx):
         run_id = self.data[idx]
+        ns, _ = self._get_point_counts(run_id)
+        need_sample_info = self.return_surface_density
         if self.preprocessed_mode:
-            geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data = self._load_case_from_preprocessed(run_id)
+            loaded = self._load_case_from_preprocessed(run_id, return_sample_info=need_sample_info)
         else:
             # Fast path: sample directly from H5 so we avoid full-array materialization.
-            geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data = self._load_case_sampled_from_h5(run_id)
+            loaded = self._load_case_sampled_from_h5(run_id, return_sample_info=need_sample_info)
+
+        if need_sample_info:
+            geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, sample_info = loaded
+        else:
+            geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data = loaded
+            sample_info = None
 
         geo_mesh = self._normalize_pos(geo_mesh, self.min_pos, self.max_pos)
         surf_mesh = self._normalize_pos(surf_mesh, self.min_pos, self.max_pos)
         vol_mesh = self._normalize_pos(vol_mesh, self.min_pos, self.max_pos)
 
+        geo_log_density = None
+        surf_log_density = None
+        if self.return_geometry_density or self.return_surface_density:
+            can_cache = self.geometry_points <= 0 or self.geometry_points >= ns
+            full_geo_log_density = None
+            if self.return_geometry_density:
+                full_geo_log_density = self._load_or_compute_geometry_density(run_id, geo_mesh, can_cache=can_cache)
+                geo_log_density = full_geo_log_density
+            if self.return_surface_density:
+                surf_idx = None if sample_info is None else sample_info.get("surf_idx")
+                if surf_idx is not None and not self.return_geometry_density and can_cache:
+                    surf_log_density = self._try_load_surface_density_subset_from_cache(run_id, surf_idx, ns)
+                if full_geo_log_density is None and surf_log_density is None:
+                    full_geo_log_density = self._load_or_compute_geometry_density(run_id, geo_mesh, can_cache=can_cache)
+                if surf_log_density is None and (
+                    surf_idx is not None
+                    and full_geo_log_density is not None
+                    and int(full_geo_log_density.shape[0]) == int(ns)
+                ):
+                    surf_log_density = full_geo_log_density.index_select(0, surf_idx.to(dtype=torch.long))
+                elif surf_log_density is None:
+                    surf_log_density = estimate_log_sampling_density(
+                        surf_mesh.unsqueeze(0),
+                        knn_k=self.geometry_density_knn_k,
+                        neighbor_hops=self.geometry_density_neighbor_hops,
+                        estimator=self.geometry_density_estimator,
+                    ).squeeze(0).cpu()
+
         surf_data = (surf_data - self.mean_surf_data) / torch.clamp(self.std_surf_data, min=1e-12)
         vol_data = (vol_data - self.mean_vol_data) / torch.clamp(self.std_vol_data, min=1e-12)
 
+        if geo_log_density is not None and surf_log_density is not None:
+            return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, geo_log_density, surf_log_density
+        if surf_log_density is not None:
+            return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, surf_log_density
+        if geo_log_density is not None:
+            return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, geo_log_density
         return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data
 
 

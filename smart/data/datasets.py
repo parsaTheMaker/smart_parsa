@@ -51,7 +51,7 @@ def get_dataset(config):
         if dataset == "DrivAerML":
             dataset_kwargs["require_preprocessed"] = True
             model_name = getattr(config, "model_name", "")
-            if model_name in {"SMART_SAT", "SMART_SATLOSS"}:
+            if model_name in {"SMART_SAT", "SMART_SATLOSS"} or str(model_name).endswith("_SAT"):
                 arch = getattr(config, "architecture", {})
                 density_knn_k = int(getattr(config, "density_knn_k", getattr(arch, "density_knn_k", 8)))
                 density_neighbor_hops = int(getattr(config, "density_neighbor_hops", getattr(arch, "density_neighbor_hops", 1)))
@@ -60,7 +60,7 @@ def get_dataset(config):
                 dataset_kwargs["geometry_density_neighbor_hops"] = density_neighbor_hops
                 dataset_kwargs["geometry_density_estimator"] = density_estimator
                 dataset_kwargs["geometry_density_cache_dtype"] = getattr(config, "geometry_density_cache_dtype", "float16")
-                if model_name == "SMART_SAT":
+                if model_name == "SMART_SAT" or str(model_name).endswith("_SAT"):
                     dataset_kwargs["return_geometry_density"] = True
                 if model_name == "SMART_SATLOSS":
                     dataset_kwargs["return_surface_density"] = True

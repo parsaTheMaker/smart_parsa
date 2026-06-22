@@ -61,6 +61,11 @@ def add_all_field_metrics(wandb_dict, split, surface_fields, volume_fields, metr
         wandb_dict[f"{split}/rel_l2_vol_{f}"] = metric_values.get(src_key, np.nan)
 
 
+def set_dataset_epoch(dataset, epoch):
+    if hasattr(dataset, "set_epoch"):
+        dataset.set_epoch(epoch)
+
+
 def load_partial_state_dict(model, checkpoint_path, device):
     if not checkpoint_path:
         return 0, 0
@@ -119,6 +124,8 @@ def main(cfg: DictConfig):
         print(f"[{config.model_name}] training signals -> surface: {fields['surface']} | volume: {fields['volume']}")
 
     use_surface_supervision = len(fields["surface"]) > 0
+    set_dataset_epoch(train_data, 0)
+    set_dataset_epoch(test_data, 0)
 
     prefetch_factor = int(getattr(config, "prefetch_factor", 2))
     pin_memory = bool(getattr(config, "pin_memory", True))
@@ -162,7 +169,8 @@ def main(cfg: DictConfig):
     print(f"Total parameters: {count_model_params(model)}")
     model_checkpoint_name = get_model_checkpoint_name(config)
     print(f"Checkpoint name: {model_checkpoint_name}")
-    run.watch(model, log="all")
+    if bool(getattr(config, "wandb_watch_model", False)):
+        run.watch(model, log="all")
 
     scaler = torch.amp.GradScaler("cuda")
     optimizer, scheduler, loss_fn, rel_l2_loss_fn = get_optimizer_scheduler_loss(model, config, train_loader, loss_dim=1)
@@ -175,6 +183,8 @@ def main(cfg: DictConfig):
     try:
         for ep in tqdm(range(config.epochs), desc="Epochs", dynamic_ncols=True):
             t1 = default_timer()
+            set_dataset_epoch(train_data, ep)
+            set_dataset_epoch(test_data, 0)
             train_losses = init_metric_dict(fields["surface"], fields["volume"])
             test_losses = init_metric_dict(fields["surface"], fields["volume"])
 
@@ -185,29 +195,29 @@ def main(cfg: DictConfig):
                 if params_dim > 0:
                     if len(batch) == 7:
                         geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, geo_log_density = batch
-                        geo_log_density = geo_log_density.to(device)
+                        geo_log_density = geo_log_density.to(device, non_blocking=True)
                     else:
                         geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params = batch
-                    params = params.to(device)
+                    params = params.to(device, non_blocking=True)
                 else:
                     if len(batch) == 6:
                         geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, geo_log_density = batch
-                        geo_log_density = geo_log_density.to(device)
+                        geo_log_density = geo_log_density.to(device, non_blocking=True)
                     else:
                         geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data = batch
                     params = None
 
-                geo_mesh = geo_mesh.to(device)
-                surf_mesh = surf_mesh.to(device)
-                surf_data = surf_data.to(device)
-                vol_mesh = vol_mesh.to(device)
-                vol_data = vol_data.to(device)
+                geo_mesh = geo_mesh.to(device, non_blocking=True)
+                surf_mesh = surf_mesh.to(device, non_blocking=True)
+                surf_data = surf_data.to(device, non_blocking=True)
+                vol_mesh = vol_mesh.to(device, non_blocking=True)
+                vol_data = vol_data.to(device, non_blocking=True)
 
                 if config.model_name in {"SMART", "SMART_SAT"} and config.dataset == "NACA4":
                     surf_data = surf_data[..., :1]
                     vol_data = torch.cat([vol_data[..., :1], vol_data[..., 2:4]], dim=-1)
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
                 if amp:
                     with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=True):
@@ -269,23 +279,23 @@ def main(cfg: DictConfig):
                     if params_dim > 0:
                         if len(batch) == 7:
                             geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, geo_log_density = batch
-                            geo_log_density = geo_log_density.to(device)
+                            geo_log_density = geo_log_density.to(device, non_blocking=True)
                         else:
                             geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params = batch
-                        params = params.to(device)
+                        params = params.to(device, non_blocking=True)
                     else:
                         if len(batch) == 6:
                             geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, geo_log_density = batch
-                            geo_log_density = geo_log_density.to(device)
+                            geo_log_density = geo_log_density.to(device, non_blocking=True)
                         else:
                             geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data = batch
                         params = None
 
-                    geo_mesh = geo_mesh.to(device)
-                    surf_mesh = surf_mesh.to(device)
-                    surf_data = surf_data.to(device)
-                    vol_mesh = vol_mesh.to(device)
-                    vol_data = vol_data.to(device)
+                    geo_mesh = geo_mesh.to(device, non_blocking=True)
+                    surf_mesh = surf_mesh.to(device, non_blocking=True)
+                    surf_data = surf_data.to(device, non_blocking=True)
+                    vol_mesh = vol_mesh.to(device, non_blocking=True)
+                    vol_data = vol_data.to(device, non_blocking=True)
 
                     if config.model_name in {"SMART", "SMART_SAT"} and config.dataset == "NACA4":
                         surf_data = surf_data[..., :1]

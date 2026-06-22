@@ -68,6 +68,11 @@ def add_all_field_metrics(wandb_dict, split, surface_fields, volume_fields, metr
         wandb_dict[f"{split}/rel_l2_vol_{f}"] = metric_values.get(src_key, np.nan)
 
 
+def set_dataset_epoch(dataset, epoch):
+    if hasattr(dataset, "set_epoch"):
+        dataset.set_epoch(epoch)
+
+
 def load_partial_state_dict(model, checkpoint_path, device):
     if not checkpoint_path:
         return 0, 0
@@ -153,6 +158,8 @@ def main(cfg: DictConfig):
         print(f"[{config.model_name}] training signals -> surface: {fields['surface']} | volume: {fields['volume']}")
 
     use_surface_supervision = len(fields["surface"]) > 0
+    set_dataset_epoch(train_data, 0)
+    set_dataset_epoch(test_data, 0)
 
     prefetch_factor = int(getattr(config, "prefetch_factor", 2))
     pin_memory = bool(getattr(config, "pin_memory", True))
@@ -207,6 +214,8 @@ def main(cfg: DictConfig):
     try:
         for ep in tqdm(range(config.epochs), desc="Epochs", dynamic_ncols=True):
             t1 = default_timer()
+            set_dataset_epoch(train_data, ep)
+            set_dataset_epoch(test_data, 0)
             train_losses = init_metric_dict(fields["surface"], fields["volume"])
             test_losses = init_metric_dict(fields["surface"], fields["volume"])
 

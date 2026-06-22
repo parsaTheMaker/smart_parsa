@@ -23,9 +23,9 @@ experiment:
     latent_dim: 256
     latent_geometry_points: 4096
     local_geometry_points: 4096
-    local_group_k: 32
-    subsampled_geometry_points: 65536
-    num_encoder_decoder_blocks: 8
+    local_group_k: 16
+    subsampled_geometry_points: 32768
+    num_encoder_decoder_blocks: 6
     num_heads: 8
     pos_scale_factor: 100
 

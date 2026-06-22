@@ -12,8 +12,7 @@ from .family_common import (
     init_linear_layer_weights,
     knn_group,
     resolve_geo_log_density,
-    sample_tokens_fps,
-    sample_tokens_density_compensated_fps,
+    sample_tokens,
 )
 from .smart.smart import CrossAttention, PlainMLP, RotaryPositionalEmbedding, SimulationParamModulatedMLP
 
@@ -215,7 +214,14 @@ class ABUPTGeometryEncoder(nn.Module):
             ]
         )
 
-    def forward(self, geometry_position, geometry_supernode_position=None, params=None, geo_log_density=None):
+    def forward(
+        self,
+        geometry_position,
+        geometry_supernode_position=None,
+        geometry_supernode_idx=None,
+        params=None,
+        geo_log_density=None,
+    ):
         full_geo_log_density = None
         if self.density_compensated:
             full_geo_log_density = resolve_geo_log_density(
@@ -224,15 +230,15 @@ class ABUPTGeometryEncoder(nn.Module):
                 knn_k=self.density_knn_k,
                 neighbor_hops=self.density_neighbor_hops,
                 estimator=self.density_estimator,
-            )
+        )
 
         geo_pos = geometry_position
-        if geometry_supernode_position is not None:
+        if geometry_supernode_idx is not None:
+            super_pos = torch.gather(geo_pos, 1, geometry_supernode_idx.unsqueeze(-1).expand(-1, -1, geo_pos.shape[-1]))
+        elif geometry_supernode_position is not None:
             super_pos = geometry_supernode_position
-        elif self.density_compensated and full_geo_log_density is not None:
-            super_pos, _ = sample_tokens_density_compensated_fps(geo_pos, self.num_supernodes, full_geo_log_density)
         else:
-            super_pos, _ = sample_tokens_fps(geo_pos, self.num_supernodes, random_start=False)
+            super_pos, _ = sample_tokens(geo_pos, self.num_supernodes)
 
         super_tokens = self.pos_encoder(super_pos)
         super_tokens = super_tokens + self.pool(
@@ -351,21 +357,9 @@ class ABUPTBase(nn.Module):
 
     def prepare_contract_inputs(self, geo, surf_query_pos, vol_query_pos, geo_log_density=None):
         geo_pos = geo * self.pos_scale_factor
-        if self.expects_geo_log_density and geo_log_density is not None:
-            geometry_supernode_pos, geometry_supernode_idx = sample_tokens_density_compensated_fps(
-                geo_pos,
-                self.geometry_encoder.num_supernodes,
-                geo_log_density,
-            )
-        else:
-            geometry_supernode_pos, geometry_supernode_idx = sample_tokens_fps(
-                geo_pos,
-                self.geometry_encoder.num_supernodes,
-                random_start=False,
-            )
-
-        surface_anchor_position, _ = sample_tokens_fps(surf_query_pos * self.pos_scale_factor, self.anchor_points, random_start=False)
-        volume_anchor_position, _ = sample_tokens_fps(vol_query_pos * self.pos_scale_factor, self.anchor_points, random_start=False)
+        geometry_supernode_pos, geometry_supernode_idx = sample_tokens(geo_pos, self.geometry_encoder.num_supernodes)
+        surface_anchor_position, _ = sample_tokens(surf_query_pos * self.pos_scale_factor, self.anchor_points)
+        volume_anchor_position, _ = sample_tokens(vol_query_pos * self.pos_scale_factor, self.anchor_points)
         return {
             "geometry_position": geo_pos,
             "geometry_supernode_idx": geometry_supernode_idx,
@@ -376,10 +370,18 @@ class ABUPTBase(nn.Module):
             "volume_query_position": vol_query_pos * self.pos_scale_factor,
         }
 
-    def encode_geometry(self, geometry_position, geometry_supernode_position=None, params=None, geo_log_density=None):
+    def encode_geometry(
+        self,
+        geometry_position,
+        geometry_supernode_position=None,
+        geometry_supernode_idx=None,
+        params=None,
+        geo_log_density=None,
+    ):
         return self.geometry_encoder(
             geometry_position,
             geometry_supernode_position=geometry_supernode_position,
+            geometry_supernode_idx=geometry_supernode_idx,
             params=params,
             geo_log_density=geo_log_density,
         )
@@ -414,6 +416,7 @@ class ABUPTBase(nn.Module):
         geometry_encoding, geometry_pos = self.encode_geometry(
             prepared["geometry_position"],
             geometry_supernode_position=prepared["geometry_supernode_position"],
+            geometry_supernode_idx=prepared["geometry_supernode_idx"],
             params=params,
             geo_log_density=geo_log_density,
         )

@@ -12,8 +12,7 @@ from .family_common import (
     init_linear_layer_weights,
     knn_group,
     resolve_geo_log_density,
-    sample_tokens_fps,
-    sample_tokens_density_compensated_fps,
+    sample_tokens,
     split_surface_volume_predictions,
 )
 from .smart.smart import CrossAttention, PlainMLP, SimulationParamModulatedMLP
@@ -142,14 +141,9 @@ class GINOTGeometryEncoder(nn.Module):
             )
 
         geo_pos = geo * self.pos_scale_factor
-        if self.density_compensated and full_geo_log_density is not None:
-            local_pos, _ = sample_tokens_density_compensated_fps(
-                geo_pos,
-                self.local_geometry_points,
-                full_geo_log_density,
-            )
-        else:
-            local_pos, _ = sample_tokens_fps(geo_pos, self.local_geometry_points, random_start=False)
+        # Match the official GINOT data path: support tokens are sampled
+        # randomly by the preprocessing pipeline.
+        local_pos, _ = sample_tokens(geo_pos, self.local_geometry_points)
 
         local_tokens = self.pos_encoder(local_pos)
         local_tokens = local_tokens + self.local_group_encoder(
@@ -162,9 +156,9 @@ class GINOTGeometryEncoder(nn.Module):
         for block in self.local_blocks:
             local_tokens = block(local_tokens, params=params, pos=local_pos)
 
-        # Avoid the previous SAT bug: once local centers are density-corrected,
-        # the global support is chosen geometrically from that corrected set.
-        global_pos, _ = sample_tokens_fps(local_pos, self.latent_geometry_points, random_start=False)
+        # Keep the global supernodes as a random subsample of the local support,
+        # matching the repo's sampling-and-grouping style.
+        global_pos, _ = sample_tokens(local_pos, self.latent_geometry_points)
         global_tokens = self.pos_encoder(global_pos)
         global_tokens = self.global_cross(global_tokens, local_tokens, params=params, q_pos=global_pos, kv_pos=local_pos)
         for block in self.global_self:

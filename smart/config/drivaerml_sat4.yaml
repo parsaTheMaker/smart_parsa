@@ -13,8 +13,8 @@ wandb:
   entity: "parsa-vatani99-technical-university-of-munich"
 
 experiment:
-  name: "DrivAerML_SMART_SAT"
-  model_name: "SMART_SAT"
+  name: "DrivAerML_SMART_SAT4"
+  model_name: "SMART_SAT4"
   model_tag: ""
   random_seed: 42
   manifest_variant: "full"
@@ -29,7 +29,6 @@ experiment:
     density_knn_k: 24
     density_neighbor_hops: 1
     density_estimator: "tangent_cov"
-    latent_density_alpha: 0.25
 
   optimizer: "adamw"
   loss_fn: "rel_l2"
@@ -44,6 +43,8 @@ experiment:
   log_every_n_steps: 10
   inspect_first_sample: False
   resume_ckpt: ""
+  resume_full_state: False
+  wandb_watch_model: False
 
   dataset: "DrivAerML"
   data_path: "/mnt/ssdraid/parsa/drivaerml_preprocessed"
@@ -51,8 +52,20 @@ experiment:
   prefetch_factor: 4
   pin_memory: True
   geometry_density_cache_dtype: "float16"
-  geometry_epoch_seeded_sampling: True
-  num_body_points: 131072
+  geometry_epoch_seeded_sampling: False
+  num_body_points: 0
   num_surface_points: 65536
   num_volume_points: 65536
   scale_positions: False
+
+  view_geometry_points: 131072
+  eval_view_geometry_points: 131072
+  train_primary_sampling_mode: "uniform_wor"
+  train_secondary_sampling_mode: "mixed"
+  eval_aligned_sampling_mode: "uniform_wor"
+  eval_shifted_sampling_mode: "inverse_density_wor"
+  inverse_density_beta: 1.0
+  mixed_inverse_density_prob: 0.5
+  prediction_consistency_weight: 1.0
+  latent_consistency_weight: 0.1
+  consistency_warmup_epochs: 30

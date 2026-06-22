@@ -418,7 +418,7 @@ class DecoderBlock(nn.Module):
         return queries
 
 
-def sample_geometry(geometry, num_samples):
+def sample_geometry(geometry, num_samples, with_replacement=False):
     """Samples points from the input geometry.
 
     Args:
@@ -428,8 +428,20 @@ def sample_geometry(geometry, num_samples):
     Returns:
         Sampled input geometry with shape (batch size, num_samples, spatial_dim).
     """
-    idx = torch.randperm(geometry.shape[1], device=geometry.device)[:num_samples]
-    sampled_geometry = geometry[:, idx, :]
+    n_points = int(geometry.shape[1])
+    batch_size = int(geometry.shape[0])
+    if num_samples <= 0:
+        return geometry
+    if with_replacement:
+        idx = torch.randint(0, n_points, (batch_size, num_samples), device=geometry.device, dtype=torch.long)
+    else:
+        if num_samples >= n_points:
+            return geometry
+        idx = torch.stack(
+            [torch.randperm(n_points, device=geometry.device)[:num_samples] for _ in range(batch_size)],
+            dim=0,
+        )
+    sampled_geometry = torch.gather(geometry, 1, idx.unsqueeze(-1).expand(-1, -1, geometry.shape[-1]))
     return sampled_geometry
 
    
@@ -462,7 +474,8 @@ class SMART(nn.Module):
                  num_heads=8,
                  pos_scale_factor=1000,
                  dropout=0.0,
-                 subregion_size=262144):
+                 subregion_size=262144,
+                 subsampled_geometry_with_replacement=False):
         super(SMART, self).__init__()
         assert surface_channels > 0 and volume_channels > 0, "surface_channels and volume_channels must be positive integers."
         
@@ -470,6 +483,7 @@ class SMART(nn.Module):
         self.volume_channels = volume_channels
         self.num_geo = latent_geometry_points
         self.subsampled_geometry_points = subsampled_geometry_points
+        self.subsampled_geometry_with_replacement = bool(subsampled_geometry_with_replacement)
         self.pos_scale_factor = pos_scale_factor
         self.pos_encoder = ModulatedPositionalEmbedding(latent_dim, spatial_dim)
         
@@ -511,7 +525,11 @@ class SMART(nn.Module):
         intermediate_latent_geometries = []
         for block in self.encoder_blocks:
             # Subsample the geometry for geometry cross-attention
-            sub_geo_pos = sample_geometry(geo, self.subsampled_geometry_points)
+            sub_geo_pos = sample_geometry(
+                geo,
+                self.subsampled_geometry_points,
+                with_replacement=self.subsampled_geometry_with_replacement,
+            )
             sub_geo_emb = self.pos_encoder(sub_geo_pos)
             
             # Apply encoder block
@@ -539,7 +557,7 @@ class SMART(nn.Module):
         query_emb = self.decode_features(intermediate_latent_geometries, latent_geo_pos, params, query_pos)
         pred = self.mlp(query_emb)
         return pred
-    
+
     def forward(self, geo, surf_query_pos, vol_query_pos, params):
         """Forward method for SMART model.
         

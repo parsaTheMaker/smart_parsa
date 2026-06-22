@@ -22,8 +22,9 @@ experiment:
   architecture:
     latent_dim: 256
     latent_geometry_points: 4096
-    subsampled_geometry_points: 65536
-    num_encoder_decoder_blocks: 8
+    subsampled_geometry_points: 16384
+    subsampled_geometry_with_replacement: True
+    num_encoder_decoder_blocks: 6
     pos_scale_factor: 100
 
   optimizer: "adamw"
@@ -44,7 +45,8 @@ experiment:
   num_workers: 8
   prefetch_factor: 4
   pin_memory: True
-  num_body_points: 0
+  geometry_epoch_seeded_sampling: True
+  num_body_points: 131072
   num_surface_points: 65536
   num_volume_points: 65536
   scale_positions: False

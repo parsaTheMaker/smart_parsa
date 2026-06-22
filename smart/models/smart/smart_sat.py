@@ -1,11 +1,13 @@
-"""SMART-SAT: density-compensated SMART with surface-local sampling correction.
+"""SMART-SAT: density-compensated SMART with tempered anchor correction.
 
 This is the canonical SAT implementation. It keeps SMART's progressive block
-refinement and shared decoder attention, while correcting the two main places
-where non-uniform surface sampling leaks into the representation:
+refinement and shared decoder attention, while correcting the main places where
+non-uniform surface sampling leaks into the representation:
 
-1. geometry-to-latent aggregation uses a density-compensated attention rule
-2. latent anchors are sampled with probability proportional to inverse density
+1. geometry-to-latent aggregation uses a density-compensated attention rule;
+2. latent anchors are sampled with a tempered inverse-density law;
+3. latent-token reuse paths in the encoder and decoder use a proposal-matched
+   density correction for the resulting latent anchor distribution.
 """
 
 from __future__ import annotations
@@ -15,14 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from .smart import (
-    CrossAttention,
-    DecoderBlock,
-    ModulatedPositionalEmbedding,
-    PlainMLP,
-    RotaryPositionalEmbedding,
-    SimulationParamModulatedMLP,
-)
+from .smart import ModulatedPositionalEmbedding, PlainMLP, RotaryPositionalEmbedding, SimulationParamModulatedMLP
 
 try:
     from utils.geometry_density import estimate_log_sampling_density
@@ -77,6 +72,7 @@ class DensityCompensatedCrossAttention(nn.Module):
             attn_mask=attn_bias,
             dropout_p=0.0,
         )
+
         out = rearrange(out, "b h q d -> b q (h d)").to(dtype=q_proj.dtype)
         return self.out_proj(out)
 
@@ -87,7 +83,7 @@ class DensityCompensatedEncoderBlock(nn.Module):
     def __init__(self, dim, num_heads=8, dropout=0.1, spatial_dim=3, cond_dim=2):
         super().__init__()
         self.geo_attn = DensityCompensatedCrossAttention(dim=dim, num_heads=num_heads, spatial_dim=spatial_dim)
-        self.cross_attn = CrossAttention(dim=dim, num_heads=num_heads, dropout=dropout, spatial_dim=spatial_dim)
+        self.cross_attn = DensityCompensatedCrossAttention(dim=dim, num_heads=num_heads, spatial_dim=spatial_dim)
         self.attn_dropout = nn.Dropout(dropout)
 
         if cond_dim > 0:
@@ -103,6 +99,7 @@ class DensityCompensatedEncoderBlock(nn.Module):
         latent_geometry_pos=None,
         geometry_pos=None,
         geometry_log_density=None,
+        latent_geometry_log_density=None,
     ):
         latent_geometry_cross = latent_geometry + self.attn_dropout(
             self.geo_attn(
@@ -115,7 +112,13 @@ class DensityCompensatedEncoderBlock(nn.Module):
         )
 
         latent_geometry_self = latent_geometry + self.attn_dropout(
-            self.cross_attn(q=latent_geometry, kv=latent_geometry_cross, q_pos=latent_geometry_pos, kv_pos=latent_geometry_pos)
+            self.cross_attn(
+                q=latent_geometry,
+                kv=latent_geometry_cross,
+                q_pos=latent_geometry_pos,
+                kv_pos=latent_geometry_pos,
+                kv_log_density=latent_geometry_log_density,
+            )
         )
 
         latent_geometry_mlp = latent_geometry_self + self.mlp(latent_geometry_self, params)
@@ -127,37 +130,72 @@ def gather_geometry(geometry, idx):
     return torch.gather(geometry, 1, idx.unsqueeze(-1).expand(-1, -1, geometry.shape[-1]))
 
 
-def sample_geometry(geometry, num_samples):
+def sample_geometry(geometry, num_samples, with_replacement=False):
     """Sample geometry points and return the chosen indices."""
     n_points = int(geometry.shape[1])
     batch_size = int(geometry.shape[0])
-    if num_samples <= 0 or num_samples >= n_points:
+    if num_samples <= 0:
         idx = torch.arange(n_points, device=geometry.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
         return geometry, idx
-    idx = torch.stack(
-        [torch.randperm(n_points, device=geometry.device)[:num_samples] for _ in range(batch_size)],
-        dim=0,
-    )
+    if with_replacement:
+        idx = torch.randint(0, n_points, (batch_size, num_samples), device=geometry.device, dtype=torch.long)
+    else:
+        if num_samples >= n_points:
+            idx = torch.arange(n_points, device=geometry.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
+            return geometry, idx
+        idx = torch.stack(
+            [torch.randperm(n_points, device=geometry.device)[:num_samples] for _ in range(batch_size)],
+            dim=0,
+        )
     sampled_geometry = gather_geometry(geometry, idx)
     return sampled_geometry, idx
 
 
-def sample_geometry_density_compensated(geometry, num_samples, log_density):
-    """Sample geometry with probability proportional to inverse density."""
+def sample_geometry_density_tempered(geometry, num_samples, log_density, alpha=0.25):
+    """Sample geometry with probabilities proportional to rho(x)^(-alpha)."""
     n_points = int(geometry.shape[1])
     batch_size = int(geometry.shape[0])
     if num_samples <= 0 or num_samples >= n_points:
         idx = torch.arange(n_points, device=geometry.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
         return geometry, idx
 
-    weights = torch.exp(-log_density.float())
-    weights = torch.clamp(weights, min=0.0)
-    weights_sum = weights.sum(dim=1, keepdim=True)
-    uniform = torch.full_like(weights, 1.0 / float(n_points))
-    probs = torch.where(weights_sum > 0.0, weights / torch.clamp(weights_sum, min=1e-12), uniform)
+    alpha = float(alpha)
+    if alpha <= 0.0:
+        return sample_geometry(geometry, num_samples)
+
+    weights = torch.exp(-alpha * log_density.float())
+    weights = torch.clamp(weights, min=1e-12)
+    probs = weights / torch.clamp(weights.sum(dim=1, keepdim=True), min=1e-12)
     idx = torch.multinomial(probs, num_samples=num_samples, replacement=False)
     sampled_geometry = gather_geometry(geometry, idx)
     return sampled_geometry, idx
+
+
+class DensityCompensatedDecoderBlock(nn.Module):
+    """Decoder block that reuses latent tokens with density-aware key weighting."""
+
+    def __init__(self, dim, num_heads=8, dropout=0.1, spatial_dim=3, cond_dim=2, shared_attn=None, shared_mlp=None):
+        super().__init__()
+        self.attn = DensityCompensatedCrossAttention(dim=dim, num_heads=num_heads, spatial_dim=spatial_dim) if shared_attn is None else shared_attn
+        self.attn_dropout = nn.Dropout(dropout)
+
+        if cond_dim > 0:
+            self.mlp = SimulationParamModulatedMLP(dim=dim, hidden_dim=dim * 4, cond_dim=cond_dim, dropout=dropout) if shared_mlp is None else shared_mlp
+        else:
+            self.mlp = PlainMLP(dim=dim, hidden_dim=dim * 4, dropout=dropout) if shared_mlp is None else shared_mlp
+
+    def forward(self, queries, latent_geometry, params, queries_pos=None, latent_geometry_pos=None, latent_geometry_log_density=None):
+        queries = queries + self.attn_dropout(
+            self.attn(
+                q=queries,
+                kv=latent_geometry,
+                q_pos=queries_pos,
+                kv_pos=latent_geometry_pos,
+                kv_log_density=latent_geometry_log_density,
+            )
+        )
+        queries = queries + self.mlp(queries, params)
+        return queries
 
 
 class SMARTSAT(nn.Module):
@@ -180,6 +218,8 @@ class SMARTSAT(nn.Module):
         density_knn_k=8,
         density_neighbor_hops=1,
         density_estimator="rk2",
+        latent_density_alpha=0.25,
+        subsampled_geometry_with_replacement=False,
     ):
         super().__init__()
         assert surface_channels > 0 and volume_channels > 0, "surface_channels and volume_channels must be positive integers."
@@ -188,10 +228,12 @@ class SMARTSAT(nn.Module):
         self.volume_channels = volume_channels
         self.num_geo = latent_geometry_points
         self.subsampled_geometry_points = subsampled_geometry_points
+        self.subsampled_geometry_with_replacement = bool(subsampled_geometry_with_replacement)
         self.pos_scale_factor = pos_scale_factor
         self.density_knn_k = int(density_knn_k)
         self.density_neighbor_hops = int(density_neighbor_hops)
         self.density_estimator = str(density_estimator)
+        self.latent_density_alpha = float(latent_density_alpha)
 
         self.pos_encoder = ModulatedPositionalEmbedding(latent_dim, spatial_dim)
 
@@ -209,7 +251,7 @@ class SMARTSAT(nn.Module):
         )
         self.decoder_blocks = nn.ModuleList(
             [
-                DecoderBlock(
+                DensityCompensatedDecoderBlock(
                     dim=latent_dim,
                     num_heads=num_heads,
                     dropout=dropout,
@@ -244,7 +286,7 @@ class SMARTSAT(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def encode(self, geo, params, return_final=False, geo_log_density=None):
+    def encode(self, geo, params, return_final=False, geo_log_density=None, return_latent_density=False):
         if geo_log_density is None:
             full_geo_log_density = estimate_log_sampling_density(
                 geo,
@@ -256,16 +298,27 @@ class SMARTSAT(nn.Module):
             full_geo_log_density = geo_log_density.to(device=geo.device, dtype=geo.dtype)
         geo_scaled = geo * self.pos_scale_factor
 
-        latent_geo_pos, _ = sample_geometry_density_compensated(
+        latent_geo_pos, latent_geo_idx = sample_geometry_density_tempered(
             geo_scaled,
             self.num_geo,
             log_density=full_geo_log_density,
+            alpha=self.latent_density_alpha,
         )
+        latent_geo_log_density = torch.gather(full_geo_log_density, 1, latent_geo_idx)
+        # If anchors are sampled with p(x) propto rho(x)^(-alpha) from an
+        # original cloud with density rho(x), the retained latent-anchor
+        # density scales like rho(x)^(1 - alpha). Reuse paths should therefore
+        # correct by (1 - alpha) * log rho rather than the full log rho.
+        latent_reuse_log_density = latent_geo_log_density * max(0.0, 1.0 - self.latent_density_alpha)
         latent_geo_emb = self.pos_encoder(latent_geo_pos)
 
         intermediate_latent_geometries = []
         for block in self.encoder_blocks:
-            sub_geo_raw, sub_idx = sample_geometry(geo, self.subsampled_geometry_points)
+            sub_geo_raw, sub_idx = sample_geometry(
+                geo,
+                self.subsampled_geometry_points,
+                with_replacement=self.subsampled_geometry_with_replacement,
+            )
             sub_geo_pos = sub_geo_raw * self.pos_scale_factor
             sub_geo_emb = self.pos_encoder(sub_geo_pos)
             sub_geo_log_density = torch.gather(full_geo_log_density, 1, sub_idx)
@@ -277,42 +330,82 @@ class SMARTSAT(nn.Module):
                 latent_geometry_pos=latent_geo_pos,
                 geometry_pos=sub_geo_pos,
                 geometry_log_density=sub_geo_log_density,
+                latent_geometry_log_density=latent_reuse_log_density,
             )
             intermediate_latent_geometries.append(e_ca)
 
         if return_final:
+            if return_latent_density:
+                return intermediate_latent_geometries, latent_geo_pos, latent_geo_emb, latent_reuse_log_density
             return intermediate_latent_geometries, latent_geo_pos, latent_geo_emb
+        if return_latent_density:
+            return intermediate_latent_geometries, latent_geo_pos, latent_reuse_log_density
         return intermediate_latent_geometries, latent_geo_pos
 
-    def decode_features(self, intermediate_latent_geometries, latent_geo_pos, params, query_pos):
+    def decode_features(self, intermediate_latent_geometries, latent_geo_pos, params, query_pos, latent_geo_log_density=None):
         query_pos = query_pos * self.pos_scale_factor
         query_emb = self.pos_encoder(query_pos)
 
         for e_ca, block in zip(intermediate_latent_geometries, self.decoder_blocks):
-            query_emb = block(query_emb, e_ca, params, queries_pos=query_pos, latent_geometry_pos=latent_geo_pos)
+            query_emb = block(
+                query_emb,
+                e_ca,
+                params,
+                queries_pos=query_pos,
+                latent_geometry_pos=latent_geo_pos,
+                latent_geometry_log_density=latent_geo_log_density,
+            )
         return query_emb
 
-    def decode(self, intermediate_latent_geometries, latent_geo_pos, params, query_pos):
-        query_emb = self.decode_features(intermediate_latent_geometries, latent_geo_pos, params, query_pos)
+    def decode(self, intermediate_latent_geometries, latent_geo_pos, params, query_pos, latent_geo_log_density=None):
+        query_emb = self.decode_features(
+            intermediate_latent_geometries,
+            latent_geo_pos,
+            params,
+            query_pos,
+            latent_geo_log_density=latent_geo_log_density,
+        )
         return self.mlp(query_emb)
 
     def forward(self, geo, surf_query_pos, vol_query_pos, params, geo_log_density=None):
-        intermediate_latent_geometries, latent_geo_pos = self.encode(geo, params, geo_log_density=geo_log_density)
+        intermediate_latent_geometries, latent_geo_pos, latent_geo_log_density = self.encode(
+            geo,
+            params,
+            geo_log_density=geo_log_density,
+            return_latent_density=True,
+        )
         query_pos = torch.cat([surf_query_pos, vol_query_pos], dim=1)
-        pred = self.decode(intermediate_latent_geometries, latent_geo_pos, params, query_pos)
+        pred = self.decode(
+            intermediate_latent_geometries,
+            latent_geo_pos,
+            params,
+            query_pos,
+            latent_geo_log_density=latent_geo_log_density,
+        )
         pred_surf = pred[:, :surf_query_pos.shape[1], 0:self.surface_channels]
         pred_vol = pred[:, surf_query_pos.shape[1]:, self.surface_channels:]
         return pred_surf, pred_vol
 
     @torch.inference_mode()
     def inference(self, geo, surf_query_pos, vol_query_pos, params, geo_log_density=None):
-        intermediate_latent_geometries, latent_geo_pos = self.encode(geo, params, geo_log_density=geo_log_density)
+        intermediate_latent_geometries, latent_geo_pos, latent_geo_log_density = self.encode(
+            geo,
+            params,
+            geo_log_density=geo_log_density,
+            return_latent_density=True,
+        )
 
         n_surf = surf_query_pos.shape[1]
         y_hat_surf_subregions = []
         for i in range(0, n_surf, self.subregion_size):
             surf_subregion = surf_query_pos[:, i:i + self.subregion_size, :]
-            y_surf_subregion = self.decode(intermediate_latent_geometries, latent_geo_pos, params, surf_subregion)
+            y_surf_subregion = self.decode(
+                intermediate_latent_geometries,
+                latent_geo_pos,
+                params,
+                surf_subregion,
+                latent_geo_log_density=latent_geo_log_density,
+            )
             y_hat_surf_subregions.append(y_surf_subregion)
         y_hat_surf = torch.cat(y_hat_surf_subregions, dim=1)
 
@@ -320,7 +413,13 @@ class SMARTSAT(nn.Module):
         y_hat_vol_subregions = []
         for i in range(0, n_vol, self.subregion_size):
             vol_subregion = vol_query_pos[:, i:i + self.subregion_size, :]
-            y_vol_subregion = self.decode(intermediate_latent_geometries, latent_geo_pos, params, vol_subregion)
+            y_vol_subregion = self.decode(
+                intermediate_latent_geometries,
+                latent_geo_pos,
+                params,
+                vol_subregion,
+                latent_geo_log_density=latent_geo_log_density,
+            )
             y_hat_vol_subregions.append(y_vol_subregion)
         y_hat_vol = torch.cat(y_hat_vol_subregions, dim=1)
 

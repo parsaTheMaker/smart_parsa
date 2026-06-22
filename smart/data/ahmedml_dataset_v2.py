@@ -2,6 +2,7 @@ import os
 import json
 import shutil
 import tempfile
+import multiprocessing as mp
 from collections import OrderedDict
 from pathlib import Path
 
@@ -44,6 +45,7 @@ class AhmedMLDatasetV2(Dataset):
         geometry_density_neighbor_hops=1,
         geometry_density_estimator="rk2",
         geometry_density_cache_dtype="float16",
+        geometry_epoch_seeded_sampling=False,
     ):
         geo_label = "all" if int(geometry_points) == 0 else str(int(geometry_points))
         surf_label = "all" if int(surface_points) == 0 else str(int(surface_points))
@@ -71,8 +73,12 @@ class AhmedMLDatasetV2(Dataset):
         self.geometry_density_neighbor_hops = max(0, int(geometry_density_neighbor_hops))
         self.geometry_density_estimator = str(geometry_density_estimator)
         self.geometry_density_cache_dtype = str(geometry_density_cache_dtype)
+        self.geometry_epoch_seeded_sampling = bool(geometry_epoch_seeded_sampling)
+        self._shared_epoch = mp.Value("i", 0, lock=False)
         self._geometry_density_ram_cache = OrderedDict()
-        self._geometry_density_ram_cache_max_entries = 16
+        # Keep a materially larger in-memory cache so repeated epochs do not
+        # keep reloading density tensors from disk for the same runs.
+        self._geometry_density_ram_cache_max_entries = 512
         if self.require_preprocessed and not self.preprocessed_mode:
             raise FileNotFoundError(
                 "DrivAerML is configured to use preprocessed-only mode, but "
@@ -274,22 +280,77 @@ class AhmedMLDatasetV2(Dataset):
             f"_{dtype_tag}.npy"
         )
 
-    def _load_or_compute_geometry_density(self, run_id, geo_mesh, can_cache):
+    def set_epoch(self, epoch):
+        self._shared_epoch.value = int(epoch)
+
+    def get_epoch(self):
+        return int(self._shared_epoch.value)
+
+    def _make_epoch_rng(self, run_id, stream_id):
+        # Mix run/stream into the epoch seed so worker ordering does not affect samples.
+        seed = np.random.SeedSequence([self.get_epoch(), int(run_id), int(stream_id)])
+        return np.random.default_rng(seed)
+
+    def _load_full_geometry_mesh(self, run_id):
+        if self.preprocessed_mode:
+            surf_coords = np.load(self._run_dir(run_id) / "surface_coords.npy", mmap_mode="r")
+            geo_mesh = torch.from_numpy(np.asarray(surf_coords, dtype=np.float32))
+            return self._normalize_pos(geo_mesh, self.min_pos, self.max_pos)
+
+        with h5py.File(self._boundary_h5_path(run_id), "r") as hb:
+            bcoords = np.asarray(hb["coords"], dtype=np.float32)
+        geo_mesh = torch.tensor(bcoords, dtype=torch.float32)
+        geo_mask = self._finite_mask(geo_mesh)
+        geo_mesh = geo_mesh[geo_mask]
+        if geo_mesh.shape[0] == 0:
+            raise ValueError(f"Run {run_id} has empty geometry after finite filtering.")
+        return self._normalize_pos(geo_mesh, self.min_pos, self.max_pos)
+
+    def _load_or_compute_full_geometry_density(self, run_id, expected_n=None):
         cache_path = self._geometry_density_cache_path(run_id)
         ram_key = str(cache_path)
         cached = self._geometry_density_ram_cache.get(ram_key)
-        if cached is not None and int(cached.shape[0]) == int(geo_mesh.shape[0]):
+        if cached is not None and (expected_n is None or int(cached.shape[0]) == int(expected_n)):
             self._geometry_density_ram_cache.move_to_end(ram_key)
             return cached
-        if can_cache and cache_path.is_file():
+
+        if cache_path.is_file():
             try:
                 arr = np.load(cache_path)
-                if int(arr.shape[0]) == int(geo_mesh.shape[0]):
-                    tensor = torch.from_numpy(np.asarray(arr, dtype=np.float32))
+                if expected_n is None or int(arr.shape[0]) == int(expected_n):
+                    tensor = torch.from_numpy(np.asarray(arr))
                     self._remember_geometry_density(ram_key, tensor)
                     return tensor
             except Exception:
                 pass
+
+        full_geo_mesh = self._load_full_geometry_mesh(run_id)
+        log_density = estimate_log_sampling_density(
+            full_geo_mesh.unsqueeze(0),
+            knn_k=self.geometry_density_knn_k,
+            neighbor_hops=self.geometry_density_neighbor_hops,
+            estimator=self.geometry_density_estimator,
+        ).squeeze(0).cpu()
+
+        remembered = log_density
+        if self.geometry_density_cache_dtype == "float16":
+            cache_arr = log_density.numpy().astype(np.float16, copy=False)
+            remembered = torch.from_numpy(cache_arr)
+        else:
+            cache_arr = log_density.numpy().astype(np.float32, copy=False)
+            remembered = torch.from_numpy(cache_arr)
+        try:
+            self._atomic_save_npy(cache_path, cache_arr)
+        except Exception:
+            pass
+        self._remember_geometry_density(ram_key, remembered)
+        return remembered
+
+    def _load_or_compute_geometry_density(self, run_id, geo_mesh, can_cache):
+        if can_cache:
+            cached = self._load_or_compute_full_geometry_density(run_id, expected_n=int(geo_mesh.shape[0]))
+            if int(cached.shape[0]) == int(geo_mesh.shape[0]):
+                return cached
 
         log_density = estimate_log_sampling_density(
             geo_mesh.unsqueeze(0),
@@ -298,18 +359,21 @@ class AhmedMLDatasetV2(Dataset):
             estimator=self.geometry_density_estimator,
         ).squeeze(0).cpu()
 
+        remembered = log_density
         if can_cache:
             if self.geometry_density_cache_dtype == "float16":
                 cache_arr = log_density.numpy().astype(np.float16, copy=False)
+                remembered = torch.from_numpy(cache_arr)
             else:
                 cache_arr = log_density.numpy().astype(np.float32, copy=False)
+                remembered = torch.from_numpy(cache_arr)
             try:
                 self._atomic_save_npy(cache_path, cache_arr)
             except Exception:
                 pass
-        self._remember_geometry_density(ram_key, log_density)
+        self._remember_geometry_density(ram_key, remembered)
 
-        return log_density
+        return remembered
 
     def _remember_geometry_density(self, ram_key, tensor):
         self._geometry_density_ram_cache[ram_key] = tensor
@@ -707,10 +771,15 @@ class AhmedMLDatasetV2(Dataset):
         np.save(vol_file, np.stack([self.mean_vol_data.numpy(), self.std_vol_data.numpy()]))
         np.save(pos_file, np.stack([self.min_pos.numpy(), self.max_pos.numpy()]))
 
-    def _sample_idx(self, n, k):
+    def _sample_idx(self, n, k, rng=None, replace=None):
         if k <= 0 or k >= n:
             return torch.arange(n, dtype=torch.long)
-        if self.fast_approx_sampling:
+        if replace is None:
+            replace = bool(self.fast_approx_sampling)
+        if rng is not None:
+            idx = rng.choice(n, size=k, replace=bool(replace))
+            return torch.from_numpy(idx.astype(np.int64, copy=False))
+        if replace:
             return torch.randint(0, n, (k,), dtype=torch.long)
         # Avoid torch.randperm(n) for huge n.
         idx = np.random.choice(n, size=k, replace=False)
@@ -839,9 +908,15 @@ class AhmedMLDatasetV2(Dataset):
 
         ns = int(surf_coords.shape[0])
         nv = int(vol_coords.shape[0])
-        geo_idx = self._sample_idx(ns, self.geometry_points).numpy().astype(np.int64, copy=False)
-        surf_idx = self._sample_idx(ns, self.surface_points).numpy().astype(np.int64, copy=False)
-        vol_idx = self._sample_idx(nv, self.volume_points).numpy().astype(np.int64, copy=False)
+        geo_rng = None
+        if self.geometry_epoch_seeded_sampling and 0 < self.geometry_points < ns:
+            geo_rng = self._make_epoch_rng(run_id, stream_id=0)
+        geo_idx_t = self._sample_idx(ns, self.geometry_points, rng=geo_rng, replace=False if geo_rng is not None else None)
+        surf_idx_t = self._sample_idx(ns, self.surface_points)
+        vol_idx_t = self._sample_idx(nv, self.volume_points)
+        geo_idx = geo_idx_t.numpy().astype(np.int64, copy=False)
+        surf_idx = surf_idx_t.numpy().astype(np.int64, copy=False)
+        vol_idx = vol_idx_t.numpy().astype(np.int64, copy=False)
 
         geo_mesh = torch.from_numpy(np.asarray(surf_coords[geo_idx], dtype=np.float32))
         surf_mesh = torch.from_numpy(np.asarray(surf_coords[surf_idx], dtype=np.float32))
@@ -868,7 +943,10 @@ class AhmedMLDatasetV2(Dataset):
             )
         )
 
-        sample_info = {"surf_idx": torch.from_numpy(surf_idx)}
+        sample_info = {
+            "geo_idx": geo_idx_t.to(dtype=torch.long),
+            "surf_idx": surf_idx_t.to(dtype=torch.long),
+        }
         if return_sample_info:
             return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, sample_info
         return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data
@@ -876,7 +954,7 @@ class AhmedMLDatasetV2(Dataset):
     def __getitem__(self, idx):
         run_id = self.data[idx]
         ns, _ = self._get_point_counts(run_id)
-        need_sample_info = self.return_surface_density
+        need_sample_info = self.return_surface_density or (self.return_geometry_density and self.geometry_points > 0)
         if self.preprocessed_mode:
             loaded = self._load_case_from_preprocessed(run_id, return_sample_info=need_sample_info)
         else:
@@ -896,24 +974,26 @@ class AhmedMLDatasetV2(Dataset):
         geo_log_density = None
         surf_log_density = None
         if self.return_geometry_density or self.return_surface_density:
-            can_cache = self.geometry_points <= 0 or self.geometry_points >= ns
             full_geo_log_density = None
+            geo_idx = None if sample_info is None else sample_info.get("geo_idx")
+            surf_idx = None if sample_info is None else sample_info.get("surf_idx")
             if self.return_geometry_density:
-                full_geo_log_density = self._load_or_compute_geometry_density(run_id, geo_mesh, can_cache=can_cache)
-                geo_log_density = full_geo_log_density
-            if self.return_surface_density:
-                surf_idx = None if sample_info is None else sample_info.get("surf_idx")
-                if surf_idx is not None and not self.return_geometry_density and can_cache:
-                    surf_log_density = self._try_load_surface_density_subset_from_cache(run_id, surf_idx, ns)
-                if full_geo_log_density is None and surf_log_density is None:
+                if geo_idx is not None and 0 < self.geometry_points < ns:
+                    full_geo_log_density = self._load_or_compute_full_geometry_density(run_id, expected_n=ns)
+                    geo_log_density = full_geo_log_density.index_select(0, geo_idx.to(dtype=torch.long))
+                else:
+                    can_cache = self.geometry_points <= 0 or self.geometry_points >= ns
                     full_geo_log_density = self._load_or_compute_geometry_density(run_id, geo_mesh, can_cache=can_cache)
-                if surf_log_density is None and (
-                    surf_idx is not None
-                    and full_geo_log_density is not None
-                    and int(full_geo_log_density.shape[0]) == int(ns)
-                ):
+                    geo_log_density = full_geo_log_density
+            if self.return_surface_density:
+                if surf_idx is not None:
+                    if full_geo_log_density is None or int(full_geo_log_density.shape[0]) != int(ns):
+                        full_geo_log_density = self._load_or_compute_full_geometry_density(run_id, expected_n=ns)
                     surf_log_density = full_geo_log_density.index_select(0, surf_idx.to(dtype=torch.long))
-                elif surf_log_density is None:
+                if full_geo_log_density is None and surf_log_density is None:
+                    can_cache = self.geometry_points <= 0 or self.geometry_points >= ns
+                    full_geo_log_density = self._load_or_compute_geometry_density(run_id, geo_mesh, can_cache=can_cache)
+                if surf_log_density is None:
                     surf_log_density = estimate_log_sampling_density(
                         surf_mesh.unsqueeze(0),
                         knn_k=self.geometry_density_knn_k,

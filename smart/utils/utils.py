@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import random
+import inspect
 from loss.losses import RelL2Loss
 from lion_pytorch import Lion
 from omegaconf import OmegaConf, open_dict
@@ -171,10 +172,17 @@ def initialize_gpu(random_seed, high_precision=True):
     
     # Device settings
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
     if high_precision:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         torch.set_float32_matmul_precision("highest")
+    else:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
 
     # Set random seed
     random.seed(random_seed)
@@ -306,15 +314,38 @@ def get_optimizer_scheduler_loss(model, config, train_loader, loss_dim=-2):
         ValueError: If an unsupported optimizer, scheduler, or loss function is specified in the config.
     """
     
+    def _cuda_optimizer_impl_kwargs(optimizer_cls):
+        if not torch.cuda.is_available():
+            return {}
+        try:
+            parameters = inspect.signature(optimizer_cls).parameters
+        except (TypeError, ValueError):
+            return {}
+        if "fused" in parameters:
+            return {"fused": True}
+        if "foreach" in parameters:
+            return {"foreach": True}
+        return {}
+
     # Get optimizer
     if config.optimizer == "adam":
         # we have to exclude the bias and weights from norms
         grouped_parameters = exclude_params_from_weight_decay(model)
-        optimizer = torch.optim.Adam(grouped_parameters, lr=config.learning_rate, weight_decay=1e-5)
+        optimizer = torch.optim.Adam(
+            grouped_parameters,
+            lr=config.learning_rate,
+            weight_decay=1e-5,
+            **_cuda_optimizer_impl_kwargs(torch.optim.Adam),
+        )
     elif config.optimizer == "adamw":
         # we have to exclude the bias and weights from norms
         grouped_parameters = exclude_params_from_weight_decay(model, exclude=["bias", "norm", "query_pos", "B"])
-        optimizer = torch.optim.AdamW(grouped_parameters, lr=config.learning_rate, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW(
+            grouped_parameters,
+            lr=config.learning_rate,
+            weight_decay=1e-4,
+            **_cuda_optimizer_impl_kwargs(torch.optim.AdamW),
+        )
     elif config.optimizer == "lion":
         grouped_parameters = exclude_params_from_weight_decay(model, exclude=["bias", "norm", "query_pos", "B"])
         optimizer = Lion(grouped_parameters, lr=config.learning_rate, weight_decay=1e-4)

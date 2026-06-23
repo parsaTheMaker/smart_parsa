@@ -48,10 +48,18 @@ if str(SMART_ROOT) not in sys.path:
     sys.path.insert(0, str(SMART_ROOT))
 
 from data.ahmedml_dataset_v2 import AhmedMLDatasetV2
+from models.abupt import ABUPT
+from models.abupt_sat import ABUPTSAT
+from models.ginot import GINOT
+from models.ginot_sat import GINOTSAT
+from models.pointnet import PointNet
 from models.smart.smart import SMART
+from models.smart.smart_sat import SMARTSAT
 from models.smart.smart_sat2 import SMARTSAT2
 from models.smart.smart_sat3 import SMARTSAT3
 from models.smart.smart_sat4 import SMARTSAT4
+from models.transolverpp import TransolverPP
+from models.transolverpp_sat import TransolverPPSAT
 from utils.geometry_density import estimate_log_sampling_density
 from utils.utils import get_model_checkpoint_name
 
@@ -81,40 +89,105 @@ HEADLINE_METRIC_KEYS = [
     "combined_physics_rel_l2",
 ]
 
-MODEL_ORDER = ["SMART", "SMART_SATLOSS2", "SMART_SAT2", "SMART_SAT3", "SMART_SAT4"]
+MODEL_ORDER = [
+    "SMART",
+    "SMART_SAT",
+    "SMART_SATLOSS3",
+    "TRANSOLVERPP",
+    "TRANSOLVERPP_SAT",
+    "TRANSOLVERPP_SATLOSS3",
+    "GINOT",
+    "GINOT_SATLOSS3",
+    "ABUPT",
+    "ABUPT_SATLOSS3",
+    "POINTNET",
+    "POINTNET_SATLOSS3",
+]
 MODEL_LABELS = {
     "SMART": "SMART",
-    "SMART_SATLOSS2": "SATLOSS2",
-    "SMART_SAT2": "SAT2",
-    "SMART_SAT3": "SAT3",
-    "SMART_SAT4": "SAT4",
+    "SMART_SAT": "SMART-SAT",
+    "SMART_SATLOSS3": "SMART-SATLOSS3",
+    "TRANSOLVERPP": "TransolverPP",
+    "TRANSOLVERPP_SAT": "TransolverPP-SAT",
+    "TRANSOLVERPP_SATLOSS3": "TransolverPP-SATLOSS3",
+    "GINOT": "GINOT",
+    "GINOT_SATLOSS3": "GINOT-SATLOSS3",
+    "ABUPT": "ABUPT",
+    "ABUPT_SATLOSS3": "ABUPT-SATLOSS3",
+    "POINTNET": "PointNet",
+    "POINTNET_SATLOSS3": "PointNet-SATLOSS3",
 }
 MODEL_COLORS = {
     "SMART": "#6C6F7D",
-    "SMART_SATLOSS2": "#F58518",
-    "SMART_SAT2": "#54A24B",
-    "SMART_SAT3": "#E45756",
-    "SMART_SAT4": "#4C78A8",
+    "SMART_SAT": "#4C78A8",
+    "SMART_SATLOSS3": "#F58518",
+    "TRANSOLVERPP": "#6C6F7D",
+    "TRANSOLVERPP_SAT": "#54A24B",
+    "TRANSOLVERPP_SATLOSS3": "#E45756",
+    "GINOT": "#6C6F7D",
+    "GINOT_SATLOSS3": "#4C78A8",
+    "ABUPT": "#6C6F7D",
+    "ABUPT_SATLOSS3": "#E45756",
+    "POINTNET": "#6C6F7D",
+    "POINTNET_SATLOSS3": "#4C78A8",
 }
-MODE_COLORS = {
-    "aligned_uniform_wor": "#4C78A8",
-    "shifted_inverse_density_beta_0.50": "#F58518",
-    "shifted_inverse_density_beta_1.00": "#E45756",
+FAMILY_GROUPS = OrderedDict(
+    [
+        ("smart_family", ["SMART", "SMART_SAT", "SMART_SATLOSS3"]),
+        ("transolverpp_family", ["TRANSOLVERPP", "TRANSOLVERPP_SAT", "TRANSOLVERPP_SATLOSS3"]),
+        ("ginot_family", ["GINOT", "GINOT_SATLOSS3"]),
+        ("abupt_family", ["ABUPT", "ABUPT_SATLOSS3"]),
+        ("pointnet_family", ["POINTNET", "POINTNET_SATLOSS3"]),
+    ]
+)
+FAMILY_TITLES = {
+    "smart_family": "SMART vs SMART-SAT vs SMART-SATLOSS3",
+    "transolverpp_family": "TransolverPP vs TransolverPP-SAT vs TransolverPP-SATLOSS3",
+    "ginot_family": "GINOT vs GINOT-SATLOSS3",
+    "abupt_family": "ABUPT vs ABUPT-SATLOSS3",
+    "pointnet_family": "PointNet vs PointNet-SATLOSS3",
 }
+VTK_PRESSURE_MODELS = [
+    "SMART",
+    "SMART_SAT",
+    "SMART_SATLOSS3",
+    "TRANSOLVERPP",
+    "TRANSOLVERPP_SATLOSS3",
+    "GINOT",
+    "GINOT_SATLOSS3",
+    "ABUPT",
+    "ABUPT_SATLOSS3",
+    "POINTNET",
+    "POINTNET_SATLOSS3",
+]
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Fair DrivAerML sampling-invariance comparison for SMART / SATLOSS2 / SAT2 / SAT3 / SAT4.")
+    p = argparse.ArgumentParser(description="Fair DrivAerML sampling-invariance comparison across SMART, TransolverPP, GINOT, ABUPT, and PointNet families.")
     p.add_argument("--smart-config", default="drivaerml")
-    p.add_argument("--satloss2-config", default="drivaerml_satloss2")
-    p.add_argument("--sat2-config", default="drivaerml_sat2")
-    p.add_argument("--sat3-config", default="drivaerml_sat3")
-    p.add_argument("--sat4-config", default="drivaerml_sat4")
+    p.add_argument("--smart-sat-config", default="drivaerml_sat")
+    p.add_argument("--smart-satloss3-config", default="drivaerml_satloss3")
+    p.add_argument("--transolverpp-config", default="drivaerml_transolverpp")
+    p.add_argument("--transolverpp-sat-config", default="drivaerml_transolverpp_sat")
+    p.add_argument("--transolverpp-satloss3-config", default="drivaerml_transolverpp_satloss3")
+    p.add_argument("--ginot-config", default="drivaerml_ginot")
+    p.add_argument("--ginot-satloss3-config", default="drivaerml_ginot_satloss3")
+    p.add_argument("--abupt-config", default="drivaerml_abupt")
+    p.add_argument("--abupt-satloss3-config", default="drivaerml_abupt_satloss3")
+    p.add_argument("--pointnet-config", default="drivaerml_pointnet")
+    p.add_argument("--pointnet-satloss3-config", default="drivaerml_pointnet_satloss3")
     p.add_argument("--smart-checkpoint", default=None)
-    p.add_argument("--satloss2-checkpoint", default=None)
-    p.add_argument("--sat2-checkpoint", default=None)
-    p.add_argument("--sat3-checkpoint", default=None)
-    p.add_argument("--sat4-checkpoint", default=None)
+    p.add_argument("--smart-sat-checkpoint", default=None)
+    p.add_argument("--smart-satloss3-checkpoint", default=None)
+    p.add_argument("--transolverpp-checkpoint", default=None)
+    p.add_argument("--transolverpp-sat-checkpoint", default=None)
+    p.add_argument("--transolverpp-satloss3-checkpoint", default=None)
+    p.add_argument("--ginot-checkpoint", default=None)
+    p.add_argument("--ginot-satloss3-checkpoint", default=None)
+    p.add_argument("--abupt-checkpoint", default=None)
+    p.add_argument("--abupt-satloss3-checkpoint", default=None)
+    p.add_argument("--pointnet-checkpoint", default=None)
+    p.add_argument("--pointnet-satloss3-checkpoint", default=None)
     p.add_argument("--num-runs", type=int, default=8, help="Number of test runs to evaluate.")
     p.add_argument("--run-ids", default=None, help="Optional comma-separated explicit run ids.")
     p.add_argument("--seed", type=int, default=42)
@@ -122,8 +195,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--input-points", type=int, default=None, help="Encoder input size. Default: 131072.")
     p.add_argument(
         "--shift-betas",
-        default="0.5,1.0",
-        help="Comma-separated inverse-density shift severities. Example: 0.5,1.0",
+        default="0,0.25,0.5,0.75,1.0",
+        help="Comma-separated inverse-density shift severities. Example: 0,0.25,0.5,0.75,1.0",
     )
     p.add_argument("--views-per-mode", type=int, default=2, help="Number of independently sampled encoder-input views per run/mode.")
     p.add_argument("--view-batch-size", type=int, default=2, help="How many views to evaluate together in one model call.")
@@ -137,6 +210,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vtk-run-id", type=int, default=None, help="Representative run id for the full-surface VTK export. Default: first evaluated run.")
     p.add_argument("--vtk-surface-query-dir", default="/home/parsa/smart_parsa/CFD_audi/run_100/audi", help="Directory containing external surface_coords/normals/pressure/WSS NPY files for representative VTK export.")
     p.add_argument("--plot-workers", type=int, default=max(1, min(6, (os.cpu_count() or 1) // 2)), help="Worker count for CPU-side plot generation.")
+    p.add_argument("--surface-query-points", type=int, default=0, help="Fixed surface query budget for all models. Use 0 to auto-pick the minimum training budget across compared models.")
+    p.add_argument("--volume-query-points", type=int, default=0, help="Fixed volume query budget for all models. Use 0 to auto-pick the minimum training budget across compared models.")
     p.add_argument("--output-dir", default=None)
     return p.parse_args()
 
@@ -173,10 +248,17 @@ def choose_ckpt(config, explicit: str | None) -> str:
     model_slug = str(config.model_name).lower().replace("_", "-")
     prefix_map = {
         "SMART": "smart-smart-",
-        "SMART_SATLOSS2": "smart-satloss2-",
-        "SMART_SAT2": "smart-sat2-",
-        "SMART_SAT3": "smart-sat3-",
-        "SMART_SAT4": "smart-sat4-",
+        "SMART_SAT": "smart-sat-",
+        "SMART_SATLOSS3": "smart-satloss3-",
+        "TRANSOLVERPP": "transolverpp-",
+        "TRANSOLVERPP_SAT": "transolverpp-sat-",
+        "TRANSOLVERPP_SATLOSS3": "transolverpp-satloss3-",
+        "GINOT": "ginot-",
+        "GINOT_SATLOSS3": "ginot-satloss3-",
+        "ABUPT": "abupt-",
+        "ABUPT_SATLOSS3": "abupt-satloss3-",
+        "POINTNET": "pointnet-",
+        "POINTNET_SATLOSS3": "pointnet-satloss3-",
     }
     required_prefix = prefix_map.get(str(config.model_name), f"{model_slug}-")
     dataset_slug = str(config.dataset).lower()
@@ -218,14 +300,30 @@ def build_model(config, ckpt_path: str, device: torch.device, batched_query_subr
         "volume_channels": len(VOLUME_FIELDS),
         "parameter_channels": 0,
     }
-    if model_name in {"SMART", "SMART_SATLOSS2"}:
-        model = SMART(**base_kwargs, **arch).to(device)
+    if model_name in {"SMART", "SMART_SATLOSS3"}:
+        model = SMART(**base_kwargs, **arch)
+    elif model_name == "SMART_SAT":
+        model = SMARTSAT(**base_kwargs, **arch)
     elif model_name == "SMART_SAT2":
-        model = SMARTSAT2(**base_kwargs, **arch).to(device)
+        model = SMARTSAT2(**base_kwargs, **arch)
     elif model_name == "SMART_SAT3":
-        model = SMARTSAT3(**base_kwargs, **arch).to(device)
+        model = SMARTSAT3(**base_kwargs, **arch)
     elif model_name == "SMART_SAT4":
-        model = SMARTSAT4(**base_kwargs, **arch).to(device)
+        model = SMARTSAT4(**base_kwargs, **arch)
+    elif model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3"}:
+        model = TransolverPP(**base_kwargs, **arch)
+    elif model_name == "TRANSOLVERPP_SAT":
+        model = TransolverPPSAT(**base_kwargs, **arch)
+    elif model_name in {"GINOT", "GINOT_SATLOSS3"}:
+        model = GINOT(**base_kwargs, **arch)
+    elif model_name == "GINOT_SAT":
+        model = GINOTSAT(**base_kwargs, **arch)
+    elif model_name in {"ABUPT", "ABUPT_SATLOSS3"}:
+        model = ABUPT(**base_kwargs, **arch)
+    elif model_name == "ABUPT_SAT":
+        model = ABUPTSAT(**base_kwargs, **arch)
+    elif model_name in {"POINTNET", "POINTNET_SATLOSS3"}:
+        model = PointNet(**base_kwargs, **arch)
     else:
         raise ValueError(f"Unsupported model_name for this evaluator: {model_name}")
 
@@ -278,6 +376,13 @@ def safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", name)
 
 
+def choose_fixed_query_indices(n_total: int, n_keep: int, seed_components: Sequence[int]) -> np.ndarray:
+    rng = np.random.default_rng(np.random.SeedSequence([int(x) for x in seed_components]))
+    idx = sample_uniform_without_replacement(n_total, n_keep, rng)
+    idx.sort()
+    return idx
+
+
 def write_polydata_vtk(path: Path, points_xyz: np.ndarray, point_data: Dict[str, np.ndarray]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pts = np.asarray(points_xyz, dtype=np.float32)
@@ -317,6 +422,46 @@ def write_polydata_vtk(path: Path, points_xyz: np.ndarray, point_data: Dict[str,
                 f.write(b"LOOKUP_TABLE default\n")
                 f.write(a.astype(">f4", copy=False).tobytes())
                 f.write(b"\n")
+
+
+def save_density_histogram(path: Path, log_density_values: np.ndarray, title: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    log_vals = np.asarray(log_density_values, dtype=np.float64)
+    density_vals = np.exp(log_vals)
+    finite_mask = np.isfinite(log_vals) & np.isfinite(density_vals)
+    finite_log = log_vals[finite_mask]
+    finite_density = density_vals[finite_mask]
+    if finite_density.size == 0:
+        finite_density = np.array([1.0], dtype=np.float64)
+        finite_log = np.array([0.0], dtype=np.float64)
+    lo_log = float(np.percentile(finite_log, 5.0))
+    hi_log = float(np.percentile(finite_log, 95.0))
+    kept_mask = (finite_log >= lo_log) & (finite_log <= hi_log)
+    clipped = finite_density[kept_mask]
+    if clipped.size == 0:
+        clipped = finite_density
+    fig, ax = plt.subplots(figsize=(8.0, 5.0), constrained_layout=True)
+    ax.hist(clipped, bins=80, color="#4C78A8", alpha=0.9, edgecolor="white", linewidth=0.3)
+    ax.set_xlabel("Density")
+    ax.set_ylabel("Count")
+    ax.set_yscale("log")
+    ax.set_title(title)
+    mean_val = float(np.mean(clipped))
+    std_val = float(np.std(clipped))
+    ax.axvline(mean_val, color="#E45756", linestyle="--", linewidth=1.5, label=f"mean={mean_val:.3g}")
+    ax.legend()
+    ax.text(
+        0.98,
+        0.95,
+        f"std={std_val:.3g}\nN={clipped.size}\ntrim=[p5,p95 log]",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=10,
+        bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "#CCCCCC"},
+    )
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
 
 
 def load_surface_query_from_dir(surface_query_dir: Path) -> Tuple[np.ndarray, np.ndarray]:
@@ -369,7 +514,15 @@ def compute_metrics(surf_gt: np.ndarray, surf_pred: np.ndarray, vol_gt: np.ndarr
 
 
 def model_uses_density(model_name: str) -> bool:
-    return model_name in {"SMART_SAT2", "SMART_SAT3", "SMART_SAT4"}
+    return model_name in {
+        "SMART_SAT",
+        "SMART_SAT2",
+        "SMART_SAT3",
+        "SMART_SAT4",
+        "TRANSOLVERPP_SAT",
+        "GINOT_SAT",
+        "ABUPT_SAT",
+    }
 
 
 @torch.inference_mode()
@@ -492,20 +645,37 @@ def _metric_display_name(metric_key: str) -> str:
     return metric_key
 
 
-def _grouped_bar_on_axis(ax, rows: List[Dict[str, object]], metric_key: str, mode_order: Sequence[str]):
+def mode_color(mode_name: str) -> str:
+    if mode_name == "aligned_uniform_wor":
+        return "#4C78A8"
+    beta_match = re.search(r"beta_([0-9]+\.[0-9]+)", mode_name)
+    if beta_match:
+        beta = float(beta_match.group(1))
+        palette = {
+            0.00: "#B279A2",
+            0.25: "#9C755F",
+            0.50: "#F58518",
+            0.75: "#72B7B2",
+            1.00: "#E45756",
+        }
+        return palette.get(round(beta, 2), "#999999")
+    return "#999999"
+
+
+def _grouped_bar_on_axis(ax, rows: List[Dict[str, object]], metric_key: str, mode_order: Sequence[str], model_order: Sequence[str]):
     means = defaultdict(dict)
     stds = defaultdict(dict)
-    for model_name in MODEL_ORDER:
+    for model_name in model_order:
         for mode_name in mode_order:
             vals = [float(r[metric_key]) for r in mode_rows(rows, model_name, mode_name)]
             means[model_name][mode_name] = float(np.mean(vals)) if vals else math.nan
             stds[model_name][mode_name] = float(np.std(vals)) if vals else math.nan
 
-    x = np.arange(len(MODEL_ORDER), dtype=np.float64)
+    x = np.arange(len(model_order), dtype=np.float64)
     width = 0.8 / max(len(mode_order), 1)
     for i, mode_name in enumerate(mode_order):
-        vals = [means[m][mode_name] for m in MODEL_ORDER]
-        err = [stds[m][mode_name] for m in MODEL_ORDER]
+        vals = [means[m][mode_name] for m in model_order]
+        err = [stds[m][mode_name] for m in model_order]
         offset = (i - 0.5 * (len(mode_order) - 1)) * width
         ax.bar(
             x + offset,
@@ -513,20 +683,22 @@ def _grouped_bar_on_axis(ax, rows: List[Dict[str, object]], metric_key: str, mod
             width=width,
             yerr=err,
             capsize=4,
-            color=MODE_COLORS.get(mode_name, "#999999"),
+            color=mode_color(mode_name),
             label=mode_name,
             alpha=0.88,
         )
     ax.set_xticks(x)
-    ax.set_xticklabels([MODEL_LABELS[m] for m in MODEL_ORDER], rotation=15)
+    ax.set_xticklabels([MODEL_LABELS[m] for m in model_order], rotation=15)
     ax.set_ylabel(metric_key)
     ax.set_title(_metric_display_name(metric_key))
+    ax.legend(fontsize=8)
 
 
 def plot_metric_grid(
     rows: List[Dict[str, object]],
     metric_keys: Sequence[str],
     mode_order: Sequence[str],
+    model_order: Sequence[str],
     out_path: Path,
     title: str,
     ncols: int = 2,
@@ -537,20 +709,17 @@ def plot_metric_grid(
     fig, axes = plt.subplots(nrows, ncols, figsize=(7.2 * ncols, 4.8 * nrows), constrained_layout=True)
     axes_arr = np.atleast_1d(axes).reshape(nrows, ncols)
     for ax, metric_key in zip(axes_arr.flat, metric_keys):
-        _grouped_bar_on_axis(ax, rows, metric_key, mode_order)
-    handles, labels = axes_arr.flat[0].get_legend_handles_labels()
+        _grouped_bar_on_axis(ax, rows, metric_key, mode_order, model_order)
     for ax in axes_arr.flat[n_metrics:]:
         ax.axis("off")
-    if handles:
-        fig.legend(handles, labels, loc="upper center", ncol=min(len(labels), 4))
     fig.suptitle(title, fontsize=18)
     fig.savefig(out_path, dpi=220)
     plt.close(fig)
 
 
-def plot_shift_curve_with_band(aggregate_rows: List[Dict[str, object]], metric_key: str, out_path: Path, title: str) -> None:
+def plot_shift_curve_with_band(aggregate_rows: List[Dict[str, object]], metric_key: str, out_path: Path, title: str, model_order: Sequence[str]) -> None:
     fig, ax = plt.subplots(figsize=(8.8, 5.8), constrained_layout=True)
-    for model_name in MODEL_ORDER:
+    for model_name in model_order:
         model_rows = [r for r in aggregate_rows if r["model_name"] == model_name]
         model_rows = sorted(model_rows, key=lambda r: float(r["shift_beta"]))
         xs = np.array([float(r["shift_beta"]) for r in model_rows], dtype=np.float64)
@@ -572,7 +741,8 @@ def plot_delta_bars(run_delta_rows: List[Dict[str, object]], metric_key: str, ou
     stds = []
     labels = []
     colors = []
-    for model_name in MODEL_ORDER:
+    present_models = [m for m in MODEL_ORDER if any(r["model_name"] == m for r in run_delta_rows)]
+    for model_name in present_models:
         vals = np.array([float(r[metric_key]) for r in run_delta_rows if r["model_name"] == model_name], dtype=np.float64)
         means.append(float(np.mean(vals)) if vals.size else math.nan)
         stds.append(float(np.std(vals)) if vals.size else math.nan)
@@ -598,7 +768,7 @@ def plot_density_shift_bars(per_view_rows: List[Dict[str, object]], out_path: Pa
         means.append(float(np.mean(vals)) if vals.size else math.nan)
         stds.append(float(np.std(vals)) if vals.size else math.nan)
     fig, ax = plt.subplots(figsize=(9.2, 5.4), constrained_layout=True)
-    ax.bar(np.arange(len(mode_order)), means, yerr=stds, capsize=4, color=[MODE_COLORS.get(m, "#999999") for m in mode_order], alpha=0.88)
+    ax.bar(np.arange(len(mode_order)), means, yerr=stds, capsize=4, color=[mode_color(m) for m in mode_order], alpha=0.88)
     ax.set_xticks(np.arange(len(mode_order)))
     ax.set_xticklabels(mode_order, rotation=15)
     ax.set_ylabel("subset_log_density_mean")
@@ -609,11 +779,10 @@ def plot_density_shift_bars(per_view_rows: List[Dict[str, object]], out_path: Pa
 
 def plot_comprehensive_dashboard(
     per_run_mode_rows: List[Dict[str, object]],
-    aggregate_rows: List[Dict[str, object]],
-    run_delta_rows: List[Dict[str, object]],
+    model_order: Sequence[str],
     mode_order: Sequence[str],
-    strongest_mode: str,
     out_path: Path,
+    title: str,
 ) -> None:
     fig, axes = plt.subplots(3, 2, figsize=(15, 15), constrained_layout=True)
     dashboard_metrics = [
@@ -625,15 +794,8 @@ def plot_comprehensive_dashboard(
         "volume_velocity_mag_rel_l2",
     ]
     for ax, metric_key in zip(axes.flat, dashboard_metrics):
-        _grouped_bar_on_axis(ax, per_run_mode_rows, metric_key, mode_order)
-    fig.suptitle(
-        f"SMART vs SATLOSS2 / SAT2 / SAT3 / SAT4\n"
-        f"Aligned mode and strongest shifted mode ({strongest_mode}) are included in every panel",
-        fontsize=18,
-    )
-    handles, labels = axes.flat[0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, loc="upper center", ncol=min(len(labels), 4))
+        _grouped_bar_on_axis(ax, per_run_mode_rows, metric_key, mode_order, model_order)
+    fig.suptitle(title, fontsize=18)
     fig.savefig(out_path, dpi=220)
     plt.close(fig)
 
@@ -643,21 +805,28 @@ def main():
     device = resolve_device(args.device)
     print(f"Device: {device}")
 
-    smart_cfg = load_cfg(args.smart_config)
-    satloss2_cfg = load_cfg(args.satloss2_config)
-    sat2_cfg = load_cfg(args.sat2_config)
-    sat3_cfg = load_cfg(args.sat3_config)
-    sat4_cfg = load_cfg(args.sat4_config)
+    config_name_map = OrderedDict(
+        [
+            ("SMART", args.smart_config),
+            ("SMART_SAT", args.smart_sat_config),
+            ("SMART_SATLOSS3", args.smart_satloss3_config),
+            ("TRANSOLVERPP", args.transolverpp_config),
+            ("TRANSOLVERPP_SAT", args.transolverpp_sat_config),
+            ("TRANSOLVERPP_SATLOSS3", args.transolverpp_satloss3_config),
+            ("GINOT", args.ginot_config),
+            ("GINOT_SATLOSS3", args.ginot_satloss3_config),
+            ("ABUPT", args.abupt_config),
+            ("ABUPT_SATLOSS3", args.abupt_satloss3_config),
+            ("POINTNET", args.pointnet_config),
+            ("POINTNET_SATLOSS3", args.pointnet_satloss3_config),
+        ]
+    )
+    configs = OrderedDict((model_name, load_cfg(cfg_name)) for model_name, cfg_name in config_name_map.items())
 
-    data_paths = {
-        str(smart_cfg.data_path),
-        str(satloss2_cfg.data_path),
-        str(sat2_cfg.data_path),
-        str(sat3_cfg.data_path),
-        str(sat4_cfg.data_path),
-    }
+    data_paths = {str(cfg.data_path) for cfg in configs.values()}
     if len(data_paths) != 1:
         raise ValueError(f"Expected one shared DrivAerML data path, got: {sorted(data_paths)}")
+    smart_cfg = configs["SMART"]
 
     input_points = int(args.input_points) if args.input_points is not None else 131072
     if input_points <= 0:
@@ -679,10 +848,11 @@ def main():
             "id": i,
         }
 
-    density_knn_k = int(getattr(sat4_cfg.architecture, "density_knn_k", 24))
-    density_neighbor_hops = int(getattr(sat4_cfg.architecture, "density_neighbor_hops", 1))
-    density_estimator = str(getattr(sat4_cfg.architecture, "density_estimator", "tangent_cov"))
-    density_cache_dtype = str(getattr(sat4_cfg, "geometry_density_cache_dtype", "float16"))
+    density_cfg = configs["SMART_SAT"]
+    density_knn_k = int(getattr(density_cfg.architecture, "density_knn_k", 24))
+    density_neighbor_hops = int(getattr(density_cfg.architecture, "density_neighbor_hops", 1))
+    density_estimator = str(getattr(density_cfg.architecture, "density_estimator", "tangent_cov"))
+    density_cache_dtype = str(getattr(density_cfg, "geometry_density_cache_dtype", "float16"))
 
     dataset = AhmedMLDatasetV2(
         saved_folder=str(smart_cfg.data_path),
@@ -711,14 +881,23 @@ def main():
     min_pos = dataset.min_pos
     max_pos = dataset.max_pos
 
+    checkpoint_arg_map = {
+        "SMART": args.smart_checkpoint,
+        "SMART_SAT": args.smart_sat_checkpoint,
+        "SMART_SATLOSS3": args.smart_satloss3_checkpoint,
+        "TRANSOLVERPP": args.transolverpp_checkpoint,
+        "TRANSOLVERPP_SAT": args.transolverpp_sat_checkpoint,
+        "TRANSOLVERPP_SATLOSS3": args.transolverpp_satloss3_checkpoint,
+        "GINOT": args.ginot_checkpoint,
+        "GINOT_SATLOSS3": args.ginot_satloss3_checkpoint,
+        "ABUPT": args.abupt_checkpoint,
+        "ABUPT_SATLOSS3": args.abupt_satloss3_checkpoint,
+        "POINTNET": args.pointnet_checkpoint,
+        "POINTNET_SATLOSS3": args.pointnet_satloss3_checkpoint,
+    }
     model_specs = OrderedDict(
-        [
-            ("SMART", {"config": smart_cfg, "checkpoint": choose_ckpt(smart_cfg, args.smart_checkpoint)}),
-            ("SMART_SATLOSS2", {"config": satloss2_cfg, "checkpoint": choose_ckpt(satloss2_cfg, args.satloss2_checkpoint)}),
-            ("SMART_SAT2", {"config": sat2_cfg, "checkpoint": choose_ckpt(sat2_cfg, args.sat2_checkpoint)}),
-            ("SMART_SAT3", {"config": sat3_cfg, "checkpoint": choose_ckpt(sat3_cfg, args.sat3_checkpoint)}),
-            ("SMART_SAT4", {"config": sat4_cfg, "checkpoint": choose_ckpt(sat4_cfg, args.sat4_checkpoint)}),
-        ]
+        (model_name, {"config": configs[model_name], "checkpoint": choose_ckpt(configs[model_name], checkpoint_arg_map[model_name])})
+        for model_name in MODEL_ORDER
     )
     for model_name, spec in model_specs.items():
         print(f"{model_name} checkpoint: {spec['checkpoint']}")
@@ -728,9 +907,15 @@ def main():
         for model_name, spec in model_specs.items()
     }
 
+    auto_surface_query_points = min(int(spec["config"].num_surface_points) for spec in model_specs.values())
+    auto_volume_query_points = min(int(spec["config"].num_volume_points) for spec in model_specs.values())
+    surface_query_points = int(args.surface_query_points) if int(args.surface_query_points) > 0 else auto_surface_query_points
+    volume_query_points = int(args.volume_query_points) if int(args.volume_query_points) > 0 else auto_volume_query_points
+    print(f"Using fixed fair query budgets: {surface_query_points} surface points, {volume_query_points} volume points.")
+
     out_root = Path(
         args.output_dir
-        or (SMART_ROOT.parent / "results" / "drivaerml_sampling_invariance_5models" / f"seed_{args.seed}_runs_{len(run_ids)}_views_{args.views_per_mode}")
+        or (SMART_ROOT.parent / "results" / "drivaerml_sampling_invariance_multifamily" / f"seed_{args.seed}_runs_{len(run_ids)}_views_{args.views_per_mode}")
     )
     out_root.mkdir(parents=True, exist_ok=True)
 
@@ -740,23 +925,31 @@ def main():
 
     for run_id in tqdm(run_ids, desc="Runs", dynamic_ncols=True):
         run_dir = Path(smart_cfg.data_path) / f"run_{run_id}"
-        surf_coords = np.load(run_dir / "surface_coords.npy").astype(np.float32, copy=False)
+        surf_coords_full = np.load(run_dir / "surface_coords.npy").astype(np.float32, copy=False)
         surf_p = np.load(run_dir / "surface_pMeanTrim.npy").astype(np.float32, copy=False).reshape(-1, 1)
         surf_n = np.load(run_dir / "surface_normals.npy").astype(np.float32, copy=False)
         surf_wx = np.load(run_dir / "surface_wallShearStressMeanTrim_x.npy").astype(np.float32, copy=False).reshape(-1, 1)
         surf_wy = np.load(run_dir / "surface_wallShearStressMeanTrim_y.npy").astype(np.float32, copy=False).reshape(-1, 1)
         surf_wz = np.load(run_dir / "surface_wallShearStressMeanTrim_z.npy").astype(np.float32, copy=False).reshape(-1, 1)
-        surf_gt = np.concatenate([surf_p, surf_n, surf_wx, surf_wy, surf_wz], axis=1)
+        surf_gt_full = np.concatenate([surf_p, surf_n, surf_wx, surf_wy, surf_wz], axis=1)
 
-        vol_coords = np.load(run_dir / "volume_coords.npy").astype(np.float32, copy=False)
+        vol_coords_full = np.load(run_dir / "volume_coords.npy").astype(np.float32, copy=False)
         vol_p = np.load(run_dir / "volume_pMeanTrim.npy").astype(np.float32, copy=False).reshape(-1, 1)
         vol_u = np.load(run_dir / "volume_UMeanTrim.npy").astype(np.float32, copy=False)
-        vol_gt = np.concatenate([vol_p, vol_u], axis=1)
+        vol_gt_full = np.concatenate([vol_p, vol_u], axis=1)
 
+        surf_query_idx = choose_fixed_query_indices(surf_coords_full.shape[0], surface_query_points, [args.seed, int(run_id), 3001])
+        vol_query_idx = choose_fixed_query_indices(vol_coords_full.shape[0], volume_query_points, [args.seed, int(run_id), 3002])
+        surf_coords = surf_coords_full[surf_query_idx]
+        surf_gt = surf_gt_full[surf_query_idx]
+        vol_coords = vol_coords_full[vol_query_idx]
+        vol_gt = vol_gt_full[vol_query_idx]
+
+        full_surf_query_norm = normalize_pos(torch.from_numpy(surf_coords_full), min_pos, max_pos)
         surf_query_norm = normalize_pos(torch.from_numpy(surf_coords), min_pos, max_pos)
         vol_query_norm = normalize_pos(torch.from_numpy(vol_coords), min_pos, max_pos)
 
-        full_geo_log_density = dataset._load_or_compute_full_geometry_density(run_id, expected_n=int(surf_coords.shape[0]))
+        full_geo_log_density = dataset._load_or_compute_full_geometry_density(run_id, expected_n=int(surf_coords_full.shape[0]))
         full_geo_log_density_np = full_geo_log_density.to(dtype=torch.float32).numpy()
 
         for mode_name, mode_info in mode_defs.items():
@@ -765,7 +958,7 @@ def main():
             for view_idx in range(views_per_mode):
                 rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(run_id), int(mode_info["id"]), int(view_idx)]))
                 if mode_info["kind"] == "uniform_wor":
-                    idx = sample_uniform_without_replacement(surf_coords.shape[0], input_points, rng)
+                    idx = sample_uniform_without_replacement(surf_coords_full.shape[0], input_points, rng)
                 else:
                     idx = sample_inverse_density_without_replacement(full_geo_log_density_np, input_points, float(mode_info["beta"]), rng)
                 idx_list.append(idx)
@@ -780,10 +973,12 @@ def main():
                 )
 
             for model_name, model in models.items():
+                model = model.to(device)
+                model.eval()
                 for batch_start in range(0, views_per_mode, view_batch_size):
                     batch_stop = min(batch_start + view_batch_size, views_per_mode)
                     batch_indices = idx_list[batch_start:batch_stop]
-                    geo_view_tensors = [surf_query_norm[torch.from_numpy(idx)] for idx in batch_indices]
+                    geo_view_tensors = [full_surf_query_norm[torch.from_numpy(idx)] for idx in batch_indices]
                     geo_density_tensors = [
                         full_geo_log_density.index_select(0, torch.from_numpy(idx).to(dtype=torch.long))
                         for idx in batch_indices
@@ -829,6 +1024,8 @@ def main():
                     del geo_views_norm, geo_density_views, pred_surf_batch, pred_vol_batch
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
+                model = model.to("cpu")
+                models[model_name] = model
                 gc.collect()
 
     per_view_metric_keys = HEADLINE_METRIC_KEYS + SURFACE_FIELD_METRIC_KEYS + VOLUME_FIELD_METRIC_KEYS
@@ -934,16 +1131,103 @@ def main():
 
     mode_order = list(mode_defs.keys())
     plot_jobs = [
-        (plot_metric_grid, (per_run_mode_rows, HEADLINE_METRIC_KEYS, mode_order, out_root / "headline_metrics_by_mode.png", "Headline metrics by model and encoder-input mode", 3)),
-        (plot_metric_grid, (per_run_mode_rows, SURFACE_FIELD_METRIC_KEYS, mode_order, out_root / "surface_fields_by_mode.png", "Surface field rel-L2 by model and encoder-input mode", 2)),
-        (plot_metric_grid, (per_run_mode_rows, VOLUME_FIELD_METRIC_KEYS, mode_order, out_root / "volume_fields_by_mode.png", "Volume field rel-L2 by model and encoder-input mode", 2)),
-        (plot_shift_curve_with_band, (aggregate_rows, "combined_physics_rel_l2", out_root / "combined_physics_shift_curve.png", "Sampling-shift severity curve (combined physics)")),
-        (plot_shift_curve_with_band, (aggregate_rows, "combined_global_rel_l2", out_root / "combined_global_shift_curve.png", "Sampling-shift severity curve (combined global)")),
-        (plot_delta_bars, (run_delta_rows, "combined_physics_delta", out_root / "combined_physics_degradation_bars.png", f"Per-run degradation under strongest shift ({strongest_mode})")),
-        (plot_delta_bars, (run_delta_rows, "combined_physics_ratio", out_root / "combined_physics_ratio_bars.png", f"Per-run robustness ratio under strongest shift ({strongest_mode})")),
         (plot_density_shift_bars, (per_view_rows, out_root / "density_shift_validation.png", "Subset density-shift validation")),
-        (plot_comprehensive_dashboard, (per_run_mode_rows, aggregate_rows, run_delta_rows, mode_order, strongest_mode, out_root / "comprehensive_dashboard.png")),
+        (plot_delta_bars, (run_delta_rows, "combined_physics_delta", out_root / "combined_physics_degradation_bars_all_models.png", f"Per-run degradation under strongest shift ({strongest_mode})")),
+        (plot_delta_bars, (run_delta_rows, "combined_physics_ratio", out_root / "combined_physics_ratio_bars_all_models.png", f"Per-run robustness ratio under strongest shift ({strongest_mode})")),
     ]
+    for family_key, family_models in FAMILY_GROUPS.items():
+        family_title = FAMILY_TITLES[family_key]
+        family_per_run_mode_rows = [r for r in per_run_mode_rows if r["model_name"] in family_models]
+        family_aggregate_rows = [r for r in aggregate_rows if r["model_name"] in family_models]
+        family_run_delta_rows = [r for r in run_delta_rows if r["model_name"] in family_models]
+        plot_jobs.extend(
+            [
+                (
+                    plot_metric_grid,
+                    (
+                        family_per_run_mode_rows,
+                        HEADLINE_METRIC_KEYS,
+                        mode_order,
+                        family_models,
+                        out_root / f"{family_key}_headline_metrics_by_mode.png",
+                        f"{family_title}: headline metrics by encoder-input mode",
+                        3,
+                    ),
+                ),
+                (
+                    plot_metric_grid,
+                    (
+                        family_per_run_mode_rows,
+                        SURFACE_FIELD_METRIC_KEYS,
+                        mode_order,
+                        family_models,
+                        out_root / f"{family_key}_surface_fields_by_mode.png",
+                        f"{family_title}: surface field rel-L2 by encoder-input mode",
+                        2,
+                    ),
+                ),
+                (
+                    plot_metric_grid,
+                    (
+                        family_per_run_mode_rows,
+                        VOLUME_FIELD_METRIC_KEYS,
+                        mode_order,
+                        family_models,
+                        out_root / f"{family_key}_volume_fields_by_mode.png",
+                        f"{family_title}: volume field rel-L2 by encoder-input mode",
+                        2,
+                    ),
+                ),
+                (
+                    plot_shift_curve_with_band,
+                    (
+                        family_aggregate_rows,
+                        "combined_physics_rel_l2",
+                        out_root / f"{family_key}_combined_physics_shift_curve.png",
+                        f"{family_title}: sampling-shift severity curve (combined physics)",
+                        family_models,
+                    ),
+                ),
+                (
+                    plot_shift_curve_with_band,
+                    (
+                        family_aggregate_rows,
+                        "combined_global_rel_l2",
+                        out_root / f"{family_key}_combined_global_shift_curve.png",
+                        f"{family_title}: sampling-shift severity curve (combined global)",
+                        family_models,
+                    ),
+                ),
+                (
+                    plot_delta_bars,
+                    (
+                        family_run_delta_rows,
+                        "combined_physics_delta",
+                        out_root / f"{family_key}_combined_physics_degradation_bars.png",
+                        f"{family_title}: per-run degradation under strongest shift ({strongest_mode})",
+                    ),
+                ),
+                (
+                    plot_delta_bars,
+                    (
+                        family_run_delta_rows,
+                        "combined_physics_ratio",
+                        out_root / f"{family_key}_combined_physics_ratio_bars.png",
+                        f"{family_title}: per-run robustness ratio under strongest shift ({strongest_mode})",
+                    ),
+                ),
+                (
+                    plot_comprehensive_dashboard,
+                    (
+                        family_per_run_mode_rows,
+                        family_models,
+                        mode_order,
+                        out_root / f"{family_key}_comprehensive_dashboard.png",
+                        f"{family_title}: comprehensive sampling-invariance dashboard",
+                    ),
+                ),
+            ]
+        )
     with ProcessPoolExecutor(max_workers=max(1, int(args.plot_workers))) as pool:
         futures = [pool.submit(func, *func_args) for func, func_args in plot_jobs]
         for future in tqdm(futures, desc="CPU plot tasks", leave=False, dynamic_ncols=True):
@@ -954,9 +1238,14 @@ def main():
     if not representative_run_dir.is_dir():
         raise FileNotFoundError(f"Representative VTK run not found: {representative_run_dir}")
 
-    rep_surf_coords, rep_surf_gt = load_surface_query_from_dir(vtk_surface_query_dir)
-    rep_input_surf_coords = rep_surf_coords
-    rep_vol_coords = np.load(representative_run_dir / "volume_coords.npy").astype(np.float32, copy=False)
+    rep_surf_coords_full, rep_surf_gt_full = load_surface_query_from_dir(vtk_surface_query_dir)
+    rep_input_surf_coords = rep_surf_coords_full
+    rep_vol_coords_full = np.load(representative_run_dir / "volume_coords.npy").astype(np.float32, copy=False)
+    rep_surf_query_idx = choose_fixed_query_indices(rep_surf_coords_full.shape[0], surface_query_points, [args.seed, int(vtk_run_id), 4001])
+    rep_vol_query_idx = choose_fixed_query_indices(rep_vol_coords_full.shape[0], volume_query_points, [args.seed, int(vtk_run_id), 4002])
+    rep_surf_coords = rep_surf_coords_full[rep_surf_query_idx]
+    rep_surf_gt = rep_surf_gt_full[rep_surf_query_idx]
+    rep_vol_coords = rep_vol_coords_full[rep_vol_query_idx]
     rep_surf_query_norm = normalize_pos(torch.from_numpy(rep_surf_coords), min_pos, max_pos)
     rep_vol_query_norm = normalize_pos(torch.from_numpy(rep_vol_coords), min_pos, max_pos)
     rep_input_geo_norm = normalize_pos(torch.from_numpy(rep_input_surf_coords), min_pos, max_pos)
@@ -971,13 +1260,18 @@ def main():
     rep_geo_view_norm = rep_input_geo_norm[torch.from_numpy(rep_idx)].unsqueeze(0)
     rep_geo_density_view = rep_full_geo_log_density.index_select(0, torch.from_numpy(rep_idx).to(dtype=torch.long)).unsqueeze(0)
 
+    sampling_input_surf_coords = np.load(representative_run_dir / "surface_coords.npy").astype(np.float32, copy=False)
+    sampling_input_geo_norm = normalize_pos(torch.from_numpy(sampling_input_surf_coords), min_pos, max_pos)
+    sampling_full_geo_log_density = dataset._load_or_compute_full_geometry_density(vtk_run_id, expected_n=int(sampling_input_surf_coords.shape[0]))
+    sampling_full_geo_log_density_np = sampling_full_geo_log_density.to(dtype=torch.float32).numpy()
+
     surface_point_data: Dict[str, np.ndarray] = {
         "gt_pressure": rep_surf_gt[:, 0],
-        "gt_normal": rep_surf_gt[:, 1:4],
-        "gt_wss": rep_surf_gt[:, 4:7],
-        "gt_wss_mag": vector_mag(rep_surf_gt, 4, 7),
     }
-    for model_name, model in tqdm(models.items(), desc="Representative full-surface predictions", dynamic_ncols=True):
+    representative_models = OrderedDict((m, models[m]) for m in VTK_PRESSURE_MODELS)
+    for model_name, model in tqdm(representative_models.items(), desc="Representative full-surface predictions", dynamic_ncols=True):
+        model = model.to(device)
+        model.eval()
         pred_surf_batch, _ = predict_view_batch(
             model_name=model_name,
             model=model,
@@ -996,18 +1290,30 @@ def main():
         pred_surf = pred_surf_batch[0]
         prefix = MODEL_LABELS[model_name].lower()
         surface_point_data[f"{prefix}_pressure_pred"] = pred_surf[:, 0]
-        surface_point_data[f"{prefix}_pressure_abs_err"] = np.abs(pred_surf[:, 0] - rep_surf_gt[:, 0])
-        surface_point_data[f"{prefix}_normal_pred"] = pred_surf[:, 1:4]
-        surface_point_data[f"{prefix}_normal_abs_err"] = np.abs(pred_surf[:, 1:4] - rep_surf_gt[:, 1:4])
-        surface_point_data[f"{prefix}_wss_pred"] = pred_surf[:, 4:7]
-        surface_point_data[f"{prefix}_wss_abs_err"] = np.abs(pred_surf[:, 4:7] - rep_surf_gt[:, 4:7])
-        surface_point_data[f"{prefix}_wss_mag_pred"] = vector_mag(pred_surf, 4, 7)
-        surface_point_data[f"{prefix}_wss_mag_abs_err"] = np.abs(vector_mag(pred_surf, 4, 7) - vector_mag(rep_surf_gt, 4, 7))
         if device.type == "cuda":
             torch.cuda.empty_cache()
+        model = model.to("cpu")
+        models[model_name] = model
 
-    vtk_path = out_root / f"representative_surface_predictions_run_{vtk_run_id}.vtk"
+    vtk_path = out_root / "audi_surface_pressure_predictions.vtk"
     write_polydata_vtk(vtk_path, rep_surf_coords, surface_point_data)
+
+    sampling_vtk_paths = []
+    sampling_histogram_paths = []
+    for beta in parse_shift_betas(args.shift_betas):
+        sampling_rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(vtk_run_id), 77777, int(round(beta * 100))]))
+        sample_idx = sample_inverse_density_without_replacement(sampling_full_geo_log_density_np, input_points, float(beta), sampling_rng)
+        sampled_points = sampling_input_surf_coords[sample_idx]
+        sample_vtk_path = out_root / f"drivaerml_test_run_{vtk_run_id}_input_points_inverse_density_beta_{beta:.2f}.vtk"
+        write_polydata_vtk(sample_vtk_path, sampled_points, {})
+        sampling_vtk_paths.append(str(sample_vtk_path))
+        sample_hist_path = out_root / f"drivaerml_test_run_{vtk_run_id}_input_points_inverse_density_beta_{beta:.2f}_density_hist.png"
+        save_density_histogram(
+            sample_hist_path,
+            sampling_full_geo_log_density_np[sample_idx],
+            title=f"Run {vtk_run_id} sampled input density histogram (beta={beta:.2f})",
+        )
+        sampling_histogram_paths.append(str(sample_hist_path))
 
     payload = {
         "args": vars(args),
@@ -1026,27 +1332,17 @@ def main():
             "top_level_alignment_note": "Aligned mode matches the training-time 131072-point view sampling rule best: uniform without replacement.",
             "model_internal_note": "Each model keeps its own internal encoder-block subsampling exactly as implemented in that checkpointed architecture.",
             "representative_vtk_surface_query_source": str(vtk_surface_query_dir),
-            "representative_vtk_encoder_input_source": "external surface_coords.npy from the selected VTK query directory, sampled with the same aligned 131072-point rule",
+            "representative_vtk_encoder_input_source": "external surface_coords.npy from the selected Audi VTK query directory, sampled with the same aligned 131072-point rule",
+            "representative_sampling_point_source_run_id": vtk_run_id,
+            "representative_sampling_point_vtks": sampling_vtk_paths,
+            "representative_sampling_point_histograms": sampling_histogram_paths,
         },
-        "configs": {
-            "smart": args.smart_config,
-            "satloss2": args.satloss2_config,
-            "sat2": args.sat2_config,
-            "sat3": args.sat3_config,
-            "sat4": args.sat4_config,
-        },
+        "configs": dict(config_name_map),
         "aggregate_metrics": aggregate_rows,
         "robustness_summary": robustness_rows,
     }
     (out_root / "results.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    config_name_map = {
-        "SMART": args.smart_config,
-        "SMART_SATLOSS2": args.satloss2_config,
-        "SMART_SAT2": args.sat2_config,
-        "SMART_SAT3": args.sat3_config,
-        "SMART_SAT4": args.sat4_config,
-    }
     workflow_lines = [
         "# Sampling-Invariance Evaluation Workflow",
         "",
@@ -1064,10 +1360,13 @@ def main():
         f"- Repeated stochastic forwards per view batch: `{int(args.model_repeats)}`",
         "",
         "## Representative VTK Export",
-        "- The representative VTK keeps the encoder-input sampling rule unchanged: it still draws the 131072-point geometry view with uniform-without-replacement sampling.",
-        "- The representative surface query cloud and the representative encoder-input cloud both come from the external surface folder you selected, so the exported predictions and points share the same coordinate frame.",
-        "- Volume queries for that representative prediction remain the full preprocessed volume coordinates.",
-        f"- Surface-query directory for that export: `{vtk_surface_query_dir}`",
+        "- The Audi pressure-field VTK keeps the encoder-input sampling rule unchanged: it still draws the 131072-point geometry view with uniform-without-replacement sampling from the Audi surface folder you selected.",
+        "- The Audi pressure-field VTK uses the external Audi surface folder for the surface query cloud.",
+        f"- To keep the multi-family comparison feasible and fair, the representative prediction VTK uses the same fixed common query budgets as the benchmark: `{surface_query_points}` surface and `{volume_query_points}` volume points.",
+        "- The representative prediction VTK stores only ground-truth pressure and model pressure predictions.",
+        f"- Surface-query directory for the Audi pressure-field export: `{vtk_surface_query_dir}`",
+        f"- Separate point-cloud VTKs are exported from DrivAerML test run `{vtk_run_id}` for inverse-density sampling betas `0, 0.25, 0.5, 0.75, 1.0` so you can directly inspect the sampled 131k encoder-input points.",
+        "- Each sampled-point VTK also gets a separate PNG histogram of the sampled log-density distribution.",
         "",
         "## Aggregation",
         "- First aggregate multiple independently sampled views within each `(run, model, mode)` tuple.",
@@ -1086,7 +1385,9 @@ def main():
             "- `per_run_mode_metrics.csv`: per-run averages across views with standard deviations.",
             "- `aggregate_metrics.csv`: across-run means/stds for every model and sampling mode.",
             "- `robustness_summary.csv`: strongest-shift robustness summary.",
-            f"- `representative_surface_predictions_run_{vtk_run_id}.vtk`: full-surface ground truth plus all model predictions/errors.",
+            "- `audi_surface_pressure_predictions.vtk`: Audi surface pressure ground truth plus selected model pressure predictions.",
+            f"- `drivaerml_test_run_{vtk_run_id}_input_points_inverse_density_beta_*.vtk`: sampled 131k input points for each inverse-density beta from one evaluated DrivAerML test run.",
+            f"- `drivaerml_test_run_{vtk_run_id}_input_points_inverse_density_beta_*_density_hist.png`: density-distribution histogram for each sampled input-point VTK.",
         ]
     )
     (out_root / "workflow.md").write_text("\n".join(workflow_lines), encoding="utf-8")
@@ -1120,8 +1421,9 @@ def main():
             "## Interpretation",
             "- Lower strongest-shift absolute error means better robustness under changed encoder-input sampling.",
             "- Lower strongest-shift delta means less degradation relative to aligned sampling.",
-            "- Lower strongest-shift ratio means better robustness relative to the model's own aligned baseline.",
-            "- The field-level bar charts show whether robustness is consistent across surface and volume prediction categories or concentrated in only a subset of fields.",
+        "- Lower strongest-shift ratio means better robustness relative to the model's own aligned baseline.",
+        "- The field-level bar charts show whether robustness is consistent across surface and volume prediction categories or concentrated in only a subset of fields.",
+        "- Family-specific figures let you compare each baseline only against its intended SAT / SATLOSS3 variants under the same sampling sweep.",
         ]
     )
     (out_root / "summary.md").write_text("\n".join(summary_lines), encoding="utf-8")

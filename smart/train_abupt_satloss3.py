@@ -35,17 +35,27 @@ class ABUPTWithLatent(ABUPT):
 
         num_surface_anchor = prepared["surface_anchor_position"].shape[1]
         num_volume_anchor = prepared["volume_anchor_position"].shape[1]
-        surface_anchor_tokens = x_surface[:, :num_surface_anchor]
-        volume_anchor_tokens = x_volume[:, :num_volume_anchor]
         for block in self.surface_blocks:
+            surface_anchor_tokens = x_surface[:, :num_surface_anchor]
             x_surface = block(x_surface, surface_anchor_tokens, params=params, x_pos=surface_position_all, anchor_pos=prepared["surface_anchor_position"])
         for block in self.volume_blocks:
+            volume_anchor_tokens = x_volume[:, :num_volume_anchor]
             x_volume = block(x_volume, volume_anchor_tokens, params=params, x_pos=volume_position_all, anchor_pos=prepared["volume_anchor_position"])
 
         pred_surface_all = self.surface_decoder(x_surface)
         pred_volume_all = self.volume_decoder(x_volume)
-        pred_surf = pred_surface_all[:, num_surface_anchor:]
-        pred_vol = pred_volume_all[:, num_volume_anchor:]
+        pred_surf = self._restore_full_predictions(
+            pred_surface_all,
+            prepared["surface_anchor_idx"],
+            prepared["surface_query_idx"],
+            prepared["surface_total_points"],
+        )
+        pred_vol = self._restore_full_predictions(
+            pred_volume_all,
+            prepared["volume_anchor_idx"],
+            prepared["volume_query_idx"],
+            prepared["volume_total_points"],
+        )
         if return_latent:
             return pred_surf, pred_vol, geometry_encoding
         return pred_surf, pred_vol

@@ -20,13 +20,13 @@ experiment:
   manifest_variant: "full"
 
   architecture:
-    latent_dim: 192
+    latent_dim: 128
     latent_geometry_points: 2048
-    subsampled_geometry_points: 65536
-    anchor_points: 1024
+    anchor_points: 512
     supernode_group_k: 32
-    num_encoder_decoder_blocks: 6
-    num_heads: 8
+    num_encoder_decoder_blocks: 4
+    geometry_depth: 1
+    num_heads: 4
     pos_scale_factor: 100
     block_pattern: "pscs"
 
@@ -34,7 +34,7 @@ experiment:
   loss_fn: "rel_l2"
   scheduler: "cosine"
   scheduler_warumup_fraction: 0.2
-  batch_size: 4
+  batch_size: 3
   epochs: 300
   learning_rate: 2.e-4
   gradient_norm: null
@@ -48,7 +48,8 @@ experiment:
   num_workers: 8
   prefetch_factor: 4
   pin_memory: True
-  num_body_points: 131072
-  num_surface_points: 4096
-  num_volume_points: 4096
+  geometry_epoch_seeded_sampling: True
+  num_body_points: 16384
+  num_surface_points: 65536
+  num_volume_points: 65536
   scale_positions: False

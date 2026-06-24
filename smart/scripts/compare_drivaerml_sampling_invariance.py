@@ -2,10 +2,11 @@
 """Compare SMART-family models under controlled encoder-input sampling shift.
 
 Workflow:
-1) Fix the query points to the full preprocessed surface/volume coordinates.
+1) Fix the benchmark query points to common per-run surface/volume subsets.
 2) Change only the encoder input geometry points.
-3) Use an aligned mode that matches training best: 131072 geometry points
-   sampled uniformly without replacement from the full surface cloud.
+3) Use an aligned mode that matches the training view rule best:
+   a fixed-size geometry subset sampled uniformly without replacement
+   from the full surface cloud.
 4) Use shifted modes that keep the same number of geometry points but sample
    them with inverse-density probabilities.
 5) Evaluate multiple independently drawn encoder-input views per run/mode.
@@ -192,7 +193,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--run-ids", default=None, help="Optional comma-separated explicit run ids.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default=None)
-    p.add_argument("--input-points", type=int, default=None, help="Encoder input size. Default: 131072.")
+    p.add_argument("--input-points", type=int, default=None, help="Encoder input size. Default: inferred from the active model configs.")
     p.add_argument(
         "--shift-betas",
         default="0,0.25,0.5,0.75,1.0",
@@ -212,6 +213,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--plot-workers", type=int, default=max(1, min(6, (os.cpu_count() or 1) // 2)), help="Worker count for CPU-side plot generation.")
     p.add_argument("--surface-query-points", type=int, default=0, help="Fixed surface query budget for all models. Use 0 to auto-pick the minimum training budget across compared models.")
     p.add_argument("--volume-query-points", type=int, default=0, help="Fixed volume query budget for all models. Use 0 to auto-pick the minimum training budget across compared models.")
+    p.add_argument("--abupt-surface-query-points", type=int, default=0, help="Optional ABUPT-family surface query override. Use 0 to follow --surface-query-points.")
+    p.add_argument("--abupt-volume-query-points", type=int, default=0, help="Optional ABUPT-family volume query override. Use 0 to follow --volume-query-points.")
+    p.add_argument("--audi-surface-chunk-size", type=int, default=2048, help="Chunk size used only for the full Audi surface-pressure visualization export.")
     p.add_argument("--output-dir", default=None)
     return p.parse_args()
 
@@ -429,19 +433,18 @@ def save_density_histogram(path: Path, log_density_values: np.ndarray, title: st
     log_vals = np.asarray(log_density_values, dtype=np.float64)
     density_vals = np.exp(log_vals)
     finite_mask = np.isfinite(log_vals) & np.isfinite(density_vals)
-    finite_log = log_vals[finite_mask]
     finite_density = density_vals[finite_mask]
     if finite_density.size == 0:
         finite_density = np.array([1.0], dtype=np.float64)
-        finite_log = np.array([0.0], dtype=np.float64)
-    lo_log = float(np.percentile(finite_log, 5.0))
-    hi_log = float(np.percentile(finite_log, 95.0))
-    kept_mask = (finite_log >= lo_log) & (finite_log <= hi_log)
-    clipped = finite_density[kept_mask]
+    lo_density = float(np.percentile(finite_density, 5.0))
+    hi_density = float(np.percentile(finite_density, 90.0))
+    clipped = finite_density[(finite_density >= lo_density) & (finite_density < hi_density)]
+    if clipped.size == 0:
+        clipped = finite_density[finite_density < hi_density]
     if clipped.size == 0:
         clipped = finite_density
     fig, ax = plt.subplots(figsize=(8.0, 5.0), constrained_layout=True)
-    ax.hist(clipped, bins=80, color="#4C78A8", alpha=0.9, edgecolor="white", linewidth=0.3)
+    ax.hist(clipped, bins=60, range=(lo_density, hi_density), color="#4C78A8", alpha=0.9, edgecolor="white", linewidth=0.3)
     ax.set_xlabel("Density")
     ax.set_ylabel("Count")
     ax.set_yscale("log")
@@ -453,7 +456,7 @@ def save_density_histogram(path: Path, log_density_values: np.ndarray, title: st
     ax.text(
         0.98,
         0.95,
-        f"std={std_val:.3g}\nN={clipped.size}\ntrim=[p5,p95 log]",
+        f"std={std_val:.3g}\nN={clipped.size}\ntrim=[p5,p90 density]",
         transform=ax.transAxes,
         ha="right",
         va="top",
@@ -573,6 +576,131 @@ def predict_view_batch(
     return surf_np, vol_np
 
 
+@torch.inference_mode()
+def predict_audi_surface_pressure(
+    model_name: str,
+    model,
+    geo_view_norm: torch.Tensor,
+    surf_query_norm: torch.Tensor,
+    dummy_vol_query_norm: torch.Tensor,
+    geo_log_density_view: torch.Tensor | None,
+    mean_s: torch.Tensor,
+    std_s: torch.Tensor,
+    device: torch.device,
+    base_seed: int,
+    repeats: int,
+    surface_chunk_size: int,
+) -> np.ndarray:
+    n_surface = int(surf_query_norm.shape[0])
+    pred_surf = np.empty((n_surface,), dtype=np.float32)
+
+    geo_b = geo_view_norm.to(device, non_blocking=True)
+    dummy_vol_b = dummy_vol_query_norm.to(device, non_blocking=True)
+    geo_log_b = None if geo_log_density_view is None else geo_log_density_view.to(device, non_blocking=True)
+    use_autocast = device.type == "cuda"
+
+    def _build_surface_decoder():
+        if model_name in {"SMART", "SMART_SATLOSS3"}:
+            intermediate_latent_geometries, latent_geo_pos = model.encode(geo_b, None)
+
+            def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
+                pred_norm = model.decode(intermediate_latent_geometries, latent_geo_pos, None, chunk)
+                return pred_norm[:, :, 0]
+
+            return decode_chunk
+
+        if model_name == "SMART_SAT":
+            intermediate_latent_geometries, latent_geo_pos, latent_geo_log_density = model.encode(
+                geo_b,
+                None,
+                geo_log_density=geo_log_b,
+                return_latent_density=True,
+            )
+
+            def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
+                pred_norm = model.decode(
+                    intermediate_latent_geometries,
+                    latent_geo_pos,
+                    None,
+                    chunk,
+                    latent_geo_log_density=latent_geo_log_density,
+                )
+                return pred_norm[:, :, 0]
+
+            return decode_chunk
+
+        if model_name in {"GINOT", "GINOT_SATLOSS3"}:
+            geometry_latents, geometry_pos = model.encode_geometry(geo_b, params=None)
+
+            def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
+                query_features = model.decode_features(geometry_latents, geometry_pos, chunk, chunk[:, :0], params=None)
+                pred = model.head(query_features)
+                return pred[:, :, 0]
+
+            return decode_chunk
+
+        if model_name in {"POINTNET", "POINTNET_SATLOSS3"}:
+            _, global_feat = model.encode_geometry(geo_b, params=None)
+
+            def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
+                query_features = model.decode_features(global_feat, chunk, chunk[:, :0], params=None)
+                pred = model.output_head(query_features)
+                return pred[:, :, 0]
+
+            return decode_chunk
+
+        if model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3"}:
+            geo_pos = model._select_geometry_tokens(geo_b, geo_log_density=None)
+            geometry_tokens = model.geometry_preprocess(geo_pos)
+            geometry_context_input = geometry_tokens.mean(dim=1)
+            geometry_condition_token = model.geometry_condition(
+                geometry_context_input.to(dtype=geometry_tokens.dtype)
+            ).unsqueeze(1)
+            placeholder = model.placeholder.view(1, 1, -1)
+
+            def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
+                surf_pos = chunk * model.pos_scale_factor
+                query_tokens = model.preprocess(surf_pos)
+                query_tokens = query_tokens + placeholder
+                condition_token = geometry_condition_token + placeholder
+                tokens = torch.cat([condition_token, query_tokens], dim=1)
+                tokens = model.cond(tokens, None)
+                tokens = model._run_blocks(tokens)
+                query_latent = tokens[:, 1:]
+                pred = model.output_head(query_latent)
+                return pred[:, :, 0]
+
+            return decode_chunk
+
+        def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
+            if model_uses_density(model_name):
+                pred_s_norm, _ = model.inference(geo_b, chunk, dummy_vol_b[:, :0], None, geo_log_density=geo_log_b)
+            else:
+                pred_s_norm, _ = model.inference(geo_b, chunk, dummy_vol_b[:, :0], None)
+            return pred_s_norm[:, :, 0]
+
+        return decode_chunk
+
+    surf_acc = np.zeros((n_surface,), dtype=np.float32)
+    for rep in range(int(repeats)):
+        seed = int(base_seed + rep)
+        torch.manual_seed(seed)
+        if device.type == "cuda":
+            torch.cuda.manual_seed_all(seed)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_autocast):
+            decode_chunk = _build_surface_decoder()
+            rep_pred = np.empty((n_surface,), dtype=np.float32)
+            for start in range(0, n_surface, max(1, int(surface_chunk_size))):
+                stop = min(start + max(1, int(surface_chunk_size)), n_surface)
+                surf_chunk = surf_query_norm[start:stop].unsqueeze(0).to(device, non_blocking=True)
+                pred_s_norm = decode_chunk(surf_chunk)
+                rep_pred[start:stop] = (pred_s_norm.cpu() * float(std_s[0]) + float(mean_s[0])).numpy()
+        surf_acc += rep_pred
+
+    pred_surf[:] = surf_acc / float(repeats)
+    return pred_surf
+
+
 def select_run_ids(test_ids: Iterable[int], num_runs: int, run_ids_arg: str | None, seed: int) -> List[int]:
     test_ids = sorted(int(x) for x in test_ids)
     if run_ids_arg:
@@ -584,6 +712,24 @@ def select_run_ids(test_ids: Iterable[int], num_runs: int, run_ids_arg: str | No
     rng = np.random.default_rng(int(seed) + 7001)
     n = min(int(num_runs), len(test_ids))
     return sorted(int(x) for x in rng.choice(np.array(test_ids, dtype=np.int64), size=n, replace=False))
+
+
+def train_encoder_input_points(cfg) -> int:
+    num_body_points = int(getattr(cfg, "num_body_points", 0))
+    if num_body_points > 0:
+        return num_body_points
+    architecture = getattr(cfg, "architecture", None)
+    if architecture is not None:
+        arch_subsampled_geometry_points = int(getattr(architecture, "subsampled_geometry_points", 0))
+        if arch_subsampled_geometry_points > 0:
+            return arch_subsampled_geometry_points
+    eval_view_geometry_points = int(getattr(cfg, "eval_view_geometry_points", 0))
+    if eval_view_geometry_points > 0:
+        return eval_view_geometry_points
+    view_geometry_points = int(getattr(cfg, "view_geometry_points", 0))
+    if view_geometry_points > 0:
+        return view_geometry_points
+    raise ValueError("Could not infer training encoder input point budget from config.")
 
 
 def write_csv(path: Path, rows: List[Dict[str, object]], fieldnames: List[str]) -> None:
@@ -828,16 +974,12 @@ def main():
         raise ValueError(f"Expected one shared DrivAerML data path, got: {sorted(data_paths)}")
     smart_cfg = configs["SMART"]
 
-    input_points = int(args.input_points) if args.input_points is not None else 131072
-    if input_points <= 0:
-        raise ValueError("This evaluator expects a positive encoder input size.")
-
     shift_betas = parse_shift_betas(args.shift_betas)
     mode_defs = OrderedDict()
     mode_defs["aligned_uniform_wor"] = {
         "kind": "uniform_wor",
         "beta": 0.0,
-        "description": "Uniform without replacement, aligned with the 131072-point training view sampling.",
+        "description": "Uniform without replacement, aligned with training-view sampling.",
         "id": 0,
     }
     for i, beta in enumerate(shift_betas, start=1):
@@ -848,6 +990,51 @@ def main():
             "id": i,
         }
 
+    checkpoint_arg_map = {
+        "SMART": args.smart_checkpoint,
+        "SMART_SAT": args.smart_sat_checkpoint,
+        "SMART_SATLOSS3": args.smart_satloss3_checkpoint,
+        "TRANSOLVERPP": args.transolverpp_checkpoint,
+        "TRANSOLVERPP_SAT": args.transolverpp_sat_checkpoint,
+        "TRANSOLVERPP_SATLOSS3": args.transolverpp_satloss3_checkpoint,
+        "GINOT": args.ginot_checkpoint,
+        "GINOT_SATLOSS3": args.ginot_satloss3_checkpoint,
+        "ABUPT": args.abupt_checkpoint,
+        "ABUPT_SATLOSS3": args.abupt_satloss3_checkpoint,
+        "POINTNET": args.pointnet_checkpoint,
+        "POINTNET_SATLOSS3": args.pointnet_satloss3_checkpoint,
+    }
+    requested_model_names = [model_name for model_name in MODEL_ORDER if checkpoint_arg_map[model_name] is not None]
+    if not requested_model_names:
+        raise ValueError("No model checkpoints were provided. Pass at least one --*-checkpoint argument.")
+    model_specs = OrderedDict(
+        (
+            model_name,
+            {"config": configs[model_name], "checkpoint": choose_ckpt(configs[model_name], checkpoint_arg_map[model_name])},
+        )
+        for model_name in requested_model_names
+    )
+    for model_name, spec in model_specs.items():
+        print(f"{model_name} checkpoint: {spec['checkpoint']}")
+
+    per_model_input_budgets = {
+        model_name: (
+            int(args.input_points)
+            if args.input_points is not None
+            else int(train_encoder_input_points(spec["config"]))
+        )
+        for model_name, spec in model_specs.items()
+    }
+    if any(v <= 0 for v in per_model_input_budgets.values()):
+        raise ValueError("This evaluator expects a positive encoder input size for every active model.")
+    unique_input_budgets = sorted(set(int(v) for v in per_model_input_budgets.values()))
+    if len(unique_input_budgets) == 1:
+        print(f"Using shared train-aligned encoder input budget: {unique_input_budgets[0]} points.")
+    else:
+        budget_text = ", ".join(f"{k}={v}" for k, v in per_model_input_budgets.items())
+        print(f"Using per-model train-aligned encoder input budgets: {budget_text}")
+    dataset_geometry_points = max(unique_input_budgets)
+
     density_cfg = configs["SMART_SAT"]
     density_knn_k = int(getattr(density_cfg.architecture, "density_knn_k", 24))
     density_neighbor_hops = int(getattr(density_cfg.architecture, "density_neighbor_hops", 1))
@@ -857,7 +1044,7 @@ def main():
     dataset = AhmedMLDatasetV2(
         saved_folder=str(smart_cfg.data_path),
         if_test=True,
-        geometry_points=input_points,
+        geometry_points=dataset_geometry_points,
         surface_points=int(smart_cfg.num_surface_points),
         volume_points=int(smart_cfg.num_volume_points),
         scale_positions=bool(smart_cfg.scale_positions),
@@ -881,27 +1068,6 @@ def main():
     min_pos = dataset.min_pos
     max_pos = dataset.max_pos
 
-    checkpoint_arg_map = {
-        "SMART": args.smart_checkpoint,
-        "SMART_SAT": args.smart_sat_checkpoint,
-        "SMART_SATLOSS3": args.smart_satloss3_checkpoint,
-        "TRANSOLVERPP": args.transolverpp_checkpoint,
-        "TRANSOLVERPP_SAT": args.transolverpp_sat_checkpoint,
-        "TRANSOLVERPP_SATLOSS3": args.transolverpp_satloss3_checkpoint,
-        "GINOT": args.ginot_checkpoint,
-        "GINOT_SATLOSS3": args.ginot_satloss3_checkpoint,
-        "ABUPT": args.abupt_checkpoint,
-        "ABUPT_SATLOSS3": args.abupt_satloss3_checkpoint,
-        "POINTNET": args.pointnet_checkpoint,
-        "POINTNET_SATLOSS3": args.pointnet_satloss3_checkpoint,
-    }
-    model_specs = OrderedDict(
-        (model_name, {"config": configs[model_name], "checkpoint": choose_ckpt(configs[model_name], checkpoint_arg_map[model_name])})
-        for model_name in MODEL_ORDER
-    )
-    for model_name, spec in model_specs.items():
-        print(f"{model_name} checkpoint: {spec['checkpoint']}")
-
     models = {
         model_name: build_model(spec["config"], spec["checkpoint"], device, batched_query_subregion_size=args.batched_query_subregion_size)
         for model_name, spec in model_specs.items()
@@ -912,6 +1078,68 @@ def main():
     surface_query_points = int(args.surface_query_points) if int(args.surface_query_points) > 0 else auto_surface_query_points
     volume_query_points = int(args.volume_query_points) if int(args.volume_query_points) > 0 else auto_volume_query_points
     print(f"Using fixed fair query budgets: {surface_query_points} surface points, {volume_query_points} volume points.")
+    per_model_query_budgets = {}
+    for model_name in model_specs:
+        model_surface_query_points = surface_query_points
+        model_volume_query_points = volume_query_points
+        if model_name in {"ABUPT", "ABUPT_SATLOSS3"}:
+            if int(args.abupt_surface_query_points) > 0:
+                model_surface_query_points = int(args.abupt_surface_query_points)
+            if int(args.abupt_volume_query_points) > 0:
+                model_volume_query_points = int(args.abupt_volume_query_points)
+        per_model_query_budgets[model_name] = {
+            "surface": model_surface_query_points,
+            "volume": model_volume_query_points,
+        }
+    for model_name, budget in per_model_query_budgets.items():
+        if budget["surface"] != surface_query_points or budget["volume"] != volume_query_points:
+            print(
+                f"[info] {model_name} query override: "
+                f"{budget['surface']} surface / {budget['volume']} volume "
+                f"(global default is {surface_query_points} / {volume_query_points})."
+            )
+    encoder_budget_mismatch_models = []
+    for model_name, spec in model_specs.items():
+        train_encoder_points = train_encoder_input_points(spec["config"])
+        eval_encoder_points = int(per_model_input_budgets[model_name])
+        if int(eval_encoder_points) != int(train_encoder_points):
+            encoder_budget_mismatch_models.append(
+                {
+                    "model_name": model_name,
+                    "train_encoder_input_points": int(train_encoder_points),
+                    "eval_encoder_input_points": int(eval_encoder_points),
+                }
+            )
+    for item in encoder_budget_mismatch_models:
+        print(
+            "[warning] "
+            f"{item['model_name']} was trained with "
+            f"{item['train_encoder_input_points']} encoder input points, "
+            f"but this evaluation uses {item['eval_encoder_input_points']}."
+        )
+    query_budget_mismatch_models = []
+    for model_name, spec in model_specs.items():
+        train_surface = int(spec["config"].num_surface_points)
+        train_volume = int(spec["config"].num_volume_points)
+        eval_surface = int(per_model_query_budgets[model_name]["surface"])
+        eval_volume = int(per_model_query_budgets[model_name]["volume"])
+        if eval_surface > train_surface or eval_volume > train_volume:
+            query_budget_mismatch_models.append(
+                {
+                    "model_name": model_name,
+                    "train_surface_query_points": train_surface,
+                    "train_volume_query_points": train_volume,
+                    "eval_surface_query_points": eval_surface,
+                    "eval_volume_query_points": eval_volume,
+                }
+            )
+    for item in query_budget_mismatch_models:
+        print(
+            "[warning] "
+            f"{item['model_name']} was trained with "
+            f"{item['train_surface_query_points']} surface / {item['train_volume_query_points']} volume query points, "
+            f"but this evaluation requests {item['eval_surface_query_points']} surface / {item['eval_volume_query_points']} volume query points."
+        )
 
     out_root = Path(
         args.output_dir
@@ -938,43 +1166,48 @@ def main():
         vol_u = np.load(run_dir / "volume_UMeanTrim.npy").astype(np.float32, copy=False)
         vol_gt_full = np.concatenate([vol_p, vol_u], axis=1)
 
-        surf_query_idx = choose_fixed_query_indices(surf_coords_full.shape[0], surface_query_points, [args.seed, int(run_id), 3001])
-        vol_query_idx = choose_fixed_query_indices(vol_coords_full.shape[0], volume_query_points, [args.seed, int(run_id), 3002])
-        surf_coords = surf_coords_full[surf_query_idx]
-        surf_gt = surf_gt_full[surf_query_idx]
-        vol_coords = vol_coords_full[vol_query_idx]
-        vol_gt = vol_gt_full[vol_query_idx]
-
         full_surf_query_norm = normalize_pos(torch.from_numpy(surf_coords_full), min_pos, max_pos)
-        surf_query_norm = normalize_pos(torch.from_numpy(surf_coords), min_pos, max_pos)
-        vol_query_norm = normalize_pos(torch.from_numpy(vol_coords), min_pos, max_pos)
+        max_surface_query_points = max(int(b["surface"]) for b in per_model_query_budgets.values())
+        max_volume_query_points = max(int(b["volume"]) for b in per_model_query_budgets.values())
+        surf_query_idx_master = choose_fixed_query_indices(surf_coords_full.shape[0], max_surface_query_points, [args.seed, int(run_id), 3001])
+        vol_query_idx_master = choose_fixed_query_indices(vol_coords_full.shape[0], max_volume_query_points, [args.seed, int(run_id), 3002])
 
         full_geo_log_density = dataset._load_or_compute_full_geometry_density(run_id, expected_n=int(surf_coords_full.shape[0]))
         full_geo_log_density_np = full_geo_log_density.to(dtype=torch.float32).numpy()
 
         for mode_name, mode_info in mode_defs.items():
-            idx_list: List[np.ndarray] = []
-            subset_density_stats: List[Dict[str, float]] = []
-            for view_idx in range(views_per_mode):
-                rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(run_id), int(mode_info["id"]), int(view_idx)]))
-                if mode_info["kind"] == "uniform_wor":
-                    idx = sample_uniform_without_replacement(surf_coords_full.shape[0], input_points, rng)
-                else:
-                    idx = sample_inverse_density_without_replacement(full_geo_log_density_np, input_points, float(mode_info["beta"]), rng)
-                idx_list.append(idx)
-                subset = full_geo_log_density_np[idx]
-                subset_density_stats.append(
-                    {
-                        "subset_log_density_mean": float(np.mean(subset)),
-                        "subset_log_density_std": float(np.std(subset)),
-                        "subset_log_density_p05": float(np.percentile(subset, 5)),
-                        "subset_log_density_p95": float(np.percentile(subset, 95)),
-                    }
-                )
-
             for model_name, model in models.items():
                 model = model.to(device)
                 model.eval()
+                model_input_points = int(per_model_input_budgets[model_name])
+                idx_list: List[np.ndarray] = []
+                subset_density_stats: List[Dict[str, float]] = []
+                for view_idx in range(views_per_mode):
+                    rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(run_id), int(mode_info["id"]), int(view_idx)]))
+                    if mode_info["kind"] == "uniform_wor":
+                        idx = sample_uniform_without_replacement(surf_coords_full.shape[0], model_input_points, rng)
+                    else:
+                        idx = sample_inverse_density_without_replacement(full_geo_log_density_np, model_input_points, float(mode_info["beta"]), rng)
+                    idx_list.append(idx)
+                    subset = full_geo_log_density_np[idx]
+                    subset_density_stats.append(
+                        {
+                            "subset_log_density_mean": float(np.mean(subset)),
+                            "subset_log_density_std": float(np.std(subset)),
+                            "subset_log_density_p05": float(np.percentile(subset, 5)),
+                            "subset_log_density_p95": float(np.percentile(subset, 95)),
+                        }
+                    )
+                model_surface_query_points = int(per_model_query_budgets[model_name]["surface"])
+                model_volume_query_points = int(per_model_query_budgets[model_name]["volume"])
+                surf_query_idx = surf_query_idx_master[:model_surface_query_points]
+                vol_query_idx = vol_query_idx_master[:model_volume_query_points]
+                surf_coords = surf_coords_full[surf_query_idx]
+                surf_gt = surf_gt_full[surf_query_idx]
+                vol_coords = vol_coords_full[vol_query_idx]
+                vol_gt = vol_gt_full[vol_query_idx]
+                surf_query_norm = normalize_pos(torch.from_numpy(surf_coords), min_pos, max_pos)
+                vol_query_norm = normalize_pos(torch.from_numpy(vol_coords), min_pos, max_pos)
                 for batch_start in range(0, views_per_mode, view_batch_size):
                     batch_stop = min(batch_start + view_batch_size, views_per_mode)
                     batch_indices = idx_list[batch_start:batch_stop]
@@ -1015,6 +1248,8 @@ def main():
                                 "shift_beta": float(mode_info["beta"]),
                                 "checkpoint": model_specs[model_name]["checkpoint"],
                                 "input_points": int(batch_indices[local_idx].shape[0]),
+                                "surface_query_points": model_surface_query_points,
+                                "volume_query_points": model_volume_query_points,
                                 "full_log_density_mean": float(np.mean(full_geo_log_density_np)),
                                 **density_stats,
                                 **metrics,
@@ -1038,6 +1273,8 @@ def main():
         "shift_beta",
         "checkpoint",
         "input_points",
+        "surface_query_points",
+        "volume_query_points",
         "full_log_density_mean",
         "subset_log_density_mean",
         "subset_log_density_std",
@@ -1078,7 +1315,8 @@ def main():
     run_delta_rows: List[Dict[str, object]] = []
     robustness_rows: List[Dict[str, object]] = []
     delta_metric_keys = HEADLINE_METRIC_KEYS + SURFACE_FIELD_METRIC_KEYS + VOLUME_FIELD_METRIC_KEYS
-    for model_name in MODEL_ORDER:
+    evaluated_model_names = list(model_specs.keys())
+    for model_name in evaluated_model_names:
         aligned_agg = next(r for r in aggregate_rows if r["model_name"] == model_name and r["sampling_mode"] == "aligned_uniform_wor")
         strongest_agg = next(r for r in aggregate_rows if r["model_name"] == model_name and r["sampling_mode"] == strongest_mode)
         row = {
@@ -1115,7 +1353,7 @@ def main():
                 delta_row[f"{metric_key}_ratio"] = float(row_mode[metric_key] / max(aligned_row[metric_key], 1e-12))
             run_delta_rows.append(delta_row)
 
-    robustness_rows.sort(key=lambda x: MODEL_ORDER.index(x["model_name"]))
+    robustness_rows.sort(key=lambda x: evaluated_model_names.index(x["model_name"]))
     robustness_fieldnames = [
         "model_name",
         "aligned_combined_global_rel_l2",
@@ -1136,6 +1374,9 @@ def main():
         (plot_delta_bars, (run_delta_rows, "combined_physics_ratio", out_root / "combined_physics_ratio_bars_all_models.png", f"Per-run robustness ratio under strongest shift ({strongest_mode})")),
     ]
     for family_key, family_models in FAMILY_GROUPS.items():
+        family_models = [m for m in family_models if m in model_specs]
+        if not family_models:
+            continue
         family_title = FAMILY_TITLES[family_key]
         family_per_run_mode_rows = [r for r in per_run_mode_rows if r["model_name"] in family_models]
         family_aggregate_rows = [r for r in aggregate_rows if r["model_name"] in family_models]
@@ -1246,8 +1487,8 @@ def main():
     rep_surf_coords = rep_surf_coords_full[rep_surf_query_idx]
     rep_surf_gt = rep_surf_gt_full[rep_surf_query_idx]
     rep_vol_coords = rep_vol_coords_full[rep_vol_query_idx]
-    rep_surf_query_norm = normalize_pos(torch.from_numpy(rep_surf_coords), min_pos, max_pos)
-    rep_vol_query_norm = normalize_pos(torch.from_numpy(rep_vol_coords), min_pos, max_pos)
+    audi_surf_query_norm = normalize_pos(torch.from_numpy(rep_surf_coords_full), min_pos, max_pos)
+    rep_dummy_vol_query_norm = normalize_pos(torch.from_numpy(rep_vol_coords[:1]), min_pos, max_pos).unsqueeze(0)
     rep_input_geo_norm = normalize_pos(torch.from_numpy(rep_input_surf_coords), min_pos, max_pos)
     rep_full_geo_log_density = estimate_log_sampling_density(
         rep_input_geo_norm.unsqueeze(0),
@@ -1255,10 +1496,6 @@ def main():
         neighbor_hops=dataset.geometry_density_neighbor_hops,
         estimator=dataset.geometry_density_estimator,
     ).squeeze(0).cpu()
-    rep_rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(vtk_run_id), 99991]))
-    rep_idx = sample_uniform_without_replacement(rep_input_surf_coords.shape[0], input_points, rep_rng)
-    rep_geo_view_norm = rep_input_geo_norm[torch.from_numpy(rep_idx)].unsqueeze(0)
-    rep_geo_density_view = rep_full_geo_log_density.index_select(0, torch.from_numpy(rep_idx).to(dtype=torch.long)).unsqueeze(0)
 
     sampling_input_surf_coords = np.load(representative_run_dir / "surface_coords.npy").astype(np.float32, copy=False)
     sampling_input_geo_norm = normalize_pos(torch.from_numpy(sampling_input_surf_coords), min_pos, max_pos)
@@ -1266,52 +1503,61 @@ def main():
     sampling_full_geo_log_density_np = sampling_full_geo_log_density.to(dtype=torch.float32).numpy()
 
     surface_point_data: Dict[str, np.ndarray] = {
-        "gt_pressure": rep_surf_gt[:, 0],
+        "gt_pressure": rep_surf_gt_full[:, 0],
     }
-    representative_models = OrderedDict((m, models[m]) for m in VTK_PRESSURE_MODELS)
+    representative_models = OrderedDict((m, models[m]) for m in VTK_PRESSURE_MODELS if m in models)
+    audi_vtk_skipped_models: List[str] = []
     for model_name, model in tqdm(representative_models.items(), desc="Representative full-surface predictions", dynamic_ncols=True):
         model = model.to(device)
         model.eval()
-        pred_surf_batch, _ = predict_view_batch(
-            model_name=model_name,
-            model=model,
-            geo_views_norm=rep_geo_view_norm,
-            surf_query_norm=rep_surf_query_norm,
-            vol_query_norm=rep_vol_query_norm,
-            geo_log_density_views=rep_geo_density_view if model_uses_density(model_name) else None,
-            mean_s=mean_s,
-            std_s=std_s,
-            mean_v=mean_v,
-            std_v=std_v,
-            device=device,
-            base_seed=int(args.seed + 900000 + MODEL_ORDER.index(model_name) * 37),
-            repeats=args.model_repeats,
-        )
-        pred_surf = pred_surf_batch[0]
-        prefix = MODEL_LABELS[model_name].lower()
-        surface_point_data[f"{prefix}_pressure_pred"] = pred_surf[:, 0]
+        try:
+            model_input_points = int(per_model_input_budgets[model_name])
+            rep_rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(vtk_run_id), 99991, MODEL_ORDER.index(model_name)]))
+            rep_idx = sample_uniform_without_replacement(rep_input_surf_coords.shape[0], model_input_points, rep_rng)
+            rep_geo_view_norm = rep_input_geo_norm[torch.from_numpy(rep_idx)].unsqueeze(0)
+            rep_geo_density_view = rep_full_geo_log_density.index_select(0, torch.from_numpy(rep_idx).to(dtype=torch.long)).unsqueeze(0)
+            pred_pressure = predict_audi_surface_pressure(
+                model_name=model_name,
+                model=model,
+                geo_view_norm=rep_geo_view_norm,
+                surf_query_norm=audi_surf_query_norm,
+                dummy_vol_query_norm=rep_dummy_vol_query_norm,
+                geo_log_density_view=rep_geo_density_view if model_uses_density(model_name) else None,
+                mean_s=mean_s,
+                std_s=std_s,
+                device=device,
+                base_seed=int(args.seed + 900000 + MODEL_ORDER.index(model_name) * 37),
+                repeats=args.model_repeats,
+                surface_chunk_size=int(args.audi_surface_chunk_size),
+            )
+            prefix = MODEL_LABELS[model_name].lower()
+            surface_point_data[f"{prefix}_pressure_pred"] = pred_pressure
+        except Exception as exc:
+            audi_vtk_skipped_models.append(model_name)
+            print(f"[warning] Skipping Audi VTK export for {model_name}: {exc}")
         if device.type == "cuda":
             torch.cuda.empty_cache()
         model = model.to("cpu")
         models[model_name] = model
 
     vtk_path = out_root / "audi_surface_pressure_predictions.vtk"
-    write_polydata_vtk(vtk_path, rep_surf_coords, surface_point_data)
+    write_polydata_vtk(vtk_path, rep_surf_coords_full, surface_point_data)
 
     sampling_vtk_paths = []
     sampling_histogram_paths = []
+    sampling_budget = max(unique_input_budgets)
     for beta in parse_shift_betas(args.shift_betas):
         sampling_rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(vtk_run_id), 77777, int(round(beta * 100))]))
-        sample_idx = sample_inverse_density_without_replacement(sampling_full_geo_log_density_np, input_points, float(beta), sampling_rng)
+        sample_idx = sample_inverse_density_without_replacement(sampling_full_geo_log_density_np, sampling_budget, float(beta), sampling_rng)
         sampled_points = sampling_input_surf_coords[sample_idx]
-        sample_vtk_path = out_root / f"drivaerml_test_run_{vtk_run_id}_input_points_inverse_density_beta_{beta:.2f}.vtk"
+        sample_vtk_path = out_root / f"drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_{beta:.2f}.vtk"
         write_polydata_vtk(sample_vtk_path, sampled_points, {})
         sampling_vtk_paths.append(str(sample_vtk_path))
-        sample_hist_path = out_root / f"drivaerml_test_run_{vtk_run_id}_input_points_inverse_density_beta_{beta:.2f}_density_hist.png"
+        sample_hist_path = out_root / f"drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_{beta:.2f}_density_hist.png"
         save_density_histogram(
             sample_hist_path,
             sampling_full_geo_log_density_np[sample_idx],
-            title=f"Run {vtk_run_id} sampled input density histogram (beta={beta:.2f})",
+            title=f"Run {vtk_run_id} sampled input density histogram (beta={beta:.2f}, points={sampling_budget})",
         )
         sampling_histogram_paths.append(str(sample_hist_path))
 
@@ -1322,22 +1568,30 @@ def main():
         "models": {k: v["checkpoint"] for k, v in model_specs.items()},
         "mode_definitions": mode_defs,
         "workflow": {
-            "queries_fixed_to_full_surface_and_volume": True,
-            "encoder_input_points": input_points,
+            "benchmark_queries_fixed_per_run": True,
+            "benchmark_surface_query_points": surface_query_points,
+            "benchmark_volume_query_points": volume_query_points,
+            "per_model_query_budgets": per_model_query_budgets,
+            "query_budget_mismatch_models": query_budget_mismatch_models,
+            "per_model_encoder_input_budgets": per_model_input_budgets,
             "aligned_mode": "uniform_wor",
             "shift_modes": [name for name in mode_defs if name != "aligned_uniform_wor"],
             "views_per_mode": views_per_mode,
             "view_batch_size": view_batch_size,
             "model_repeats": int(args.model_repeats),
-            "top_level_alignment_note": "Aligned mode matches the training-time 131072-point view sampling rule best: uniform without replacement.",
+            "top_level_alignment_note": "Aligned mode matches each model's training-time view sampling rule best: uniform without replacement at that model's own encoder input budget.",
             "model_internal_note": "Each model keeps its own internal encoder-block subsampling exactly as implemented in that checkpointed architecture.",
             "representative_vtk_surface_query_source": str(vtk_surface_query_dir),
-            "representative_vtk_encoder_input_source": "external surface_coords.npy from the selected Audi VTK query directory, sampled with the same aligned 131072-point rule",
+            "representative_vtk_encoder_input_source": "external surface_coords.npy from the selected Audi VTK query directory, sampled with each model's own aligned encoder input budget",
+            "representative_vtk_dummy_volume_query_source": f"first point from DrivAerML run {vtk_run_id} fixed volume-query subset; used only if a model cannot execute an empty-volume surface-only export path",
             "representative_sampling_point_source_run_id": vtk_run_id,
             "representative_sampling_point_vtks": sampling_vtk_paths,
             "representative_sampling_point_histograms": sampling_histogram_paths,
+            "audi_vtk_skipped_models": audi_vtk_skipped_models,
+            "encoder_budget_mismatches": encoder_budget_mismatch_models,
+            "query_budget_mismatches": query_budget_mismatch_models,
         },
-        "configs": dict(config_name_map),
+        "configs": {k: config_name_map[k] for k in model_specs},
         "aggregate_metrics": aggregate_rows,
         "robustness_summary": robustness_rows,
     }
@@ -1350,23 +1604,30 @@ def main():
         "Measure how much prediction quality changes when only the encoder-input geometry sampling distribution changes, while keeping query points fixed.",
         "",
         "## Fairness Rules Used",
-        f"- Evaluated models: `{', '.join(MODEL_ORDER)}`",
-        "- Surface and volume query coordinates are fixed to the full preprocessed coordinates for every model, run, and mode.",
-        f"- Encoder input point budget is fixed to `{input_points}` for every model and every sampling mode.",
-        "- The aligned mode uses `uniform_wor` because SMART's top-level 131072-point training view is sampled uniformly without replacement by the dataset, and the consistency-trained models also use a uniform primary training view.",
+        f"- Evaluated models: `{', '.join(model_specs.keys())}`",
+        f"- Surface query coordinates are fixed per run to one common subset of `{surface_query_points}` points for every model and every sampling mode.",
+        f"- Volume query coordinates are fixed per run to one common subset of `{volume_query_points}` points for every model and every sampling mode.",
+        "- If a family-specific query override is requested, that family uses its own fixed per-run query subset while the other families keep the global benchmark subset.",
+        "- Encoder input point budget is train-aligned per model by default. That keeps each family on its own training budget instead of forcing all families to the smallest one.",
+        "- If a model was trained with smaller query budgets than this evaluation uses, the script reports that mismatch explicitly in the console and `results.json`.",
+        "- The aligned mode uses `uniform_wor` because the training-time top-level view rule is uniform without replacement, and this evaluation preserves each model's own encoder input budget unless you explicitly override `--input-points`.",
         f"- Shifted modes use inverse-density sampling without replacement at betas `{shift_betas}` and keep the same point budget.",
+        "- If `beta=0` is included in the shifted list, it acts as a uniform-without-replacement sanity-check mode and should match the aligned mode up to sampling randomness.",
         "- Internal model behavior is not overridden beyond safe batched-query chunking. In particular, each model keeps its own trained latent-anchor logic and encoder-block 16k subsampling behavior.",
+        "- In-family fairness is strongest when all compared checkpoints in that family were trained with the same encoder input budget and the evaluation uses that same budget.",
+        "- Cross-family fairness is weaker when families were trained with different encoder input budgets; the script records those mismatches explicitly in `results.json`.",
         f"- Views per run/mode: `{views_per_mode}`",
         f"- Repeated stochastic forwards per view batch: `{int(args.model_repeats)}`",
         "",
         "## Representative VTK Export",
-        "- The Audi pressure-field VTK keeps the encoder-input sampling rule unchanged: it still draws the 131072-point geometry view with uniform-without-replacement sampling from the Audi surface folder you selected.",
-        "- The Audi pressure-field VTK uses the external Audi surface folder for the surface query cloud.",
-        f"- To keep the multi-family comparison feasible and fair, the representative prediction VTK uses the same fixed common query budgets as the benchmark: `{surface_query_points}` surface and `{volume_query_points}` volume points.",
+        "- The Audi pressure-field VTK uses the full Audi surface point cloud for the surface query cloud.",
+        "- The Audi VTK export is visualization-only and does not affect the benchmark statistics.",
         "- The representative prediction VTK stores only ground-truth pressure and model pressure predictions.",
+        "- If a model cannot execute a true empty-volume surface-only export path, the script falls back to one fixed representative volume query point from the selected DrivAerML run. This affects only the Audi visualization export, not the benchmark metrics.",
+        "- If a model still cannot complete the full-Audi visualization export safely, it is skipped only for this VTK step and recorded in the results payload.",
         f"- Surface-query directory for the Audi pressure-field export: `{vtk_surface_query_dir}`",
-        f"- Separate point-cloud VTKs are exported from DrivAerML test run `{vtk_run_id}` for inverse-density sampling betas `0, 0.25, 0.5, 0.75, 1.0` so you can directly inspect the sampled 131k encoder-input points.",
-        "- Each sampled-point VTK also gets a separate PNG histogram of the sampled log-density distribution.",
+        f"- Separate point-cloud VTKs are exported from DrivAerML test run `{vtk_run_id}` for inverse-density sampling betas `0, 0.25, 0.5, 0.75, 1.0` using the largest active encoder budget `{sampling_budget}` so you can directly inspect one representative input cloud.",
+        "- Each sampled-point VTK also gets a separate PNG histogram of the sampled density distribution, with a log-count y-axis.",
         "",
         "## Aggregation",
         "- First aggregate multiple independently sampled views within each `(run, model, mode)` tuple.",
@@ -1376,7 +1637,12 @@ def main():
         "## Configs and Checkpoints",
     ]
     for model_name, spec in model_specs.items():
-        workflow_lines.append(f"- `{model_name}`: config=`{config_name_map[model_name]}` checkpoint=`{spec['checkpoint']}`")
+        budget = per_model_query_budgets[model_name]
+        workflow_lines.append(
+            f"- `{model_name}`: config=`{config_name_map[model_name]}` checkpoint=`{spec['checkpoint']}` "
+            f"eval_queries=({budget['surface']} surface, {budget['volume']} volume) "
+            f"eval_encoder_input={per_model_input_budgets[model_name]}"
+        )
     workflow_lines.extend(
         [
             "",
@@ -1385,9 +1651,10 @@ def main():
             "- `per_run_mode_metrics.csv`: per-run averages across views with standard deviations.",
             "- `aggregate_metrics.csv`: across-run means/stds for every model and sampling mode.",
             "- `robustness_summary.csv`: strongest-shift robustness summary.",
-            "- `audi_surface_pressure_predictions.vtk`: Audi surface pressure ground truth plus selected model pressure predictions.",
-            f"- `drivaerml_test_run_{vtk_run_id}_input_points_inverse_density_beta_*.vtk`: sampled 131k input points for each inverse-density beta from one evaluated DrivAerML test run.",
-            f"- `drivaerml_test_run_{vtk_run_id}_input_points_inverse_density_beta_*_density_hist.png`: density-distribution histogram for each sampled input-point VTK.",
+            "- `audi_surface_pressure_predictions.vtk`: full Audi surface pressure ground truth plus selected model pressure predictions.",
+            "- `results.json`: machine-readable summary including any representative-VTK model skips.",
+            f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_*.vtk`: sampled `{sampling_budget}` input points for each inverse-density beta from one evaluated DrivAerML test run.",
+            f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_*_density_hist.png`: density-distribution histogram for each sampled input-point VTK.",
         ]
     )
     (out_root / "workflow.md").write_text("\n".join(workflow_lines), encoding="utf-8")
@@ -1397,12 +1664,13 @@ def main():
         "",
         f"- Evaluated test runs: `{run_ids}`",
         f"- Representative VTK run: `{vtk_run_id}`",
-        f"- Input points per encoder call: `{input_points}`",
+        f"- Per-model encoder input budgets: `{per_model_input_budgets}`",
         f"- Views per run/mode: `{views_per_mode}`",
         f"- View batch size: `{view_batch_size}`",
         f"- Strongest shift mode: `{strongest_mode}`",
         f"- Shift betas: `{shift_betas}`",
-        "- Full queries fixed for every model and every mode: `True`",
+        f"- Fixed benchmark query subsets per run: `{surface_query_points}` surface + `{volume_query_points}` volume",
+        f"- ABUPT-family query override: `{int(args.abupt_surface_query_points) if int(args.abupt_surface_query_points) > 0 else surface_query_points}` surface + `{int(args.abupt_volume_query_points) if int(args.abupt_volume_query_points) > 0 else volume_query_points}` volume",
         f"- Representative VTK surface query source: `{vtk_surface_query_dir}`",
         "",
         "## Robustness Summary",
@@ -1419,9 +1687,11 @@ def main():
         [
             "",
             "## Interpretation",
-            "- Lower strongest-shift absolute error means better robustness under changed encoder-input sampling.",
-            "- Lower strongest-shift delta means less degradation relative to aligned sampling.",
+        "- Lower strongest-shift absolute error means better robustness under changed encoder-input sampling.",
+        "- Lower strongest-shift delta means less degradation relative to aligned sampling.",
         "- Lower strongest-shift ratio means better robustness relative to the model's own aligned baseline.",
+        "- For in-family conclusions, the most trustworthy comparison is when that family shares the same train-time encoder input budget and this evaluation uses that same budget.",
+        "- For cross-family conclusions, treat differences more cautiously unless the encoder-input budget also matched across the compared families.",
         "- The field-level bar charts show whether robustness is consistent across surface and volume prediction categories or concentrated in only a subset of fields.",
         "- Family-specific figures let you compare each baseline only against its intended SAT / SATLOSS3 variants under the same sampling sweep.",
         ]

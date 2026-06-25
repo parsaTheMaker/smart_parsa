@@ -156,8 +156,6 @@ VTK_PRESSURE_MODELS = [
     "TRANSOLVERPP_SATLOSS3",
     "GINOT",
     "GINOT_SATLOSS3",
-    "ABUPT",
-    "ABUPT_SATLOSS3",
     "POINTNET",
     "POINTNET_SATLOSS3",
 ]
@@ -593,11 +591,49 @@ def predict_audi_surface_pressure(
 ) -> np.ndarray:
     n_surface = int(surf_query_norm.shape[0])
     pred_surf = np.empty((n_surface,), dtype=np.float32)
+    abupt_audi_query_subsamples = 10
 
     geo_b = geo_view_norm.to(device, non_blocking=True)
     dummy_vol_b = dummy_vol_query_norm.to(device, non_blocking=True)
+    full_surf_b = surf_query_norm.unsqueeze(0).to(device, non_blocking=True)
     geo_log_b = None if geo_log_density_view is None else geo_log_density_view.to(device, non_blocking=True)
     use_autocast = device.type == "cuda"
+
+    if model_name in {"ABUPT", "ABUPT_SATLOSS3"}:
+        surf_acc = np.zeros((n_surface,), dtype=np.float32)
+        original_subregion_size = int(getattr(model, "subregion_size", max(1, int(surface_chunk_size))))
+        model.subregion_size = max(1, int(surface_chunk_size))
+        try:
+            for rep in range(int(repeats)):
+                seed = int(base_seed + rep)
+                torch.manual_seed(seed)
+                if device.type == "cuda":
+                    torch.cuda.manual_seed_all(seed)
+                # For the Audi visualization only, predict on a random partition of
+                # the external surface cloud instead of one monolithic full-cloud
+                # forward. This keeps the export tractable and avoids axis-aligned
+                # chunk artifacts from sequential slicing.
+                rep_rng = np.random.default_rng(seed)
+                perm = rep_rng.permutation(n_surface)
+                query_subsets = [chunk for chunk in np.array_split(perm, abupt_audi_query_subsamples) if len(chunk) > 0]
+                rep_pred = np.empty((n_surface,), dtype=np.float32)
+                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=False):
+                    for subset_idx in query_subsets:
+                        surf_subset_b = full_surf_b[:, torch.from_numpy(np.asarray(subset_idx, dtype=np.int64)).to(device=device, dtype=torch.long)]
+                        if model_uses_density(model_name):
+                            pred_s_norm, _ = model.inference(geo_b, surf_subset_b, dummy_vol_b, None, geo_log_density=geo_log_b)
+                        else:
+                            pred_s_norm, _ = model.inference(geo_b, surf_subset_b, dummy_vol_b, None)
+                        rep_pred[np.asarray(subset_idx, dtype=np.int64)] = (
+                            pred_s_norm[0, :, 0].detach().to(torch.float32).cpu().numpy() * float(std_s[0]) + float(mean_s[0])
+                        )
+                    if not np.isfinite(rep_pred).all():
+                        raise RuntimeError(f"{model_name} produced non-finite surface predictions during Audi VTK export.")
+                surf_acc += rep_pred
+        finally:
+            model.subregion_size = original_subregion_size
+        pred_surf[:] = surf_acc / float(repeats)
+        return pred_surf
 
     def _build_surface_decoder():
         if model_name in {"SMART", "SMART_SATLOSS3"}:
@@ -673,10 +709,13 @@ def predict_audi_surface_pressure(
             return decode_chunk
 
         def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
+            vol_query = dummy_vol_b if model_name in {"ABUPT", "ABUPT_SATLOSS3"} else dummy_vol_b[:, :0]
             if model_uses_density(model_name):
-                pred_s_norm, _ = model.inference(geo_b, chunk, dummy_vol_b[:, :0], None, geo_log_density=geo_log_b)
+                pred_s_norm, _ = model.inference(geo_b, chunk, vol_query, None, geo_log_density=geo_log_b)
             else:
-                pred_s_norm, _ = model.inference(geo_b, chunk, dummy_vol_b[:, :0], None)
+                pred_s_norm, _ = model.inference(geo_b, chunk, vol_query, None)
+            if not torch.isfinite(pred_s_norm).all():
+                raise RuntimeError(f"{model_name} produced non-finite surface predictions during Audi VTK export.")
             return pred_s_norm[:, :, 0]
 
         return decode_chunk
@@ -1507,9 +1546,11 @@ def main():
     }
     representative_models = OrderedDict((m, models[m]) for m in VTK_PRESSURE_MODELS if m in models)
     audi_vtk_skipped_models: List[str] = []
+    n_surface_points = int(rep_surf_gt_full.shape[0])
     for model_name, model in tqdm(representative_models.items(), desc="Representative full-surface predictions", dynamic_ncols=True):
         model = model.to(device)
         model.eval()
+        prefix = MODEL_LABELS[model_name].lower()
         try:
             model_input_points = int(per_model_input_budgets[model_name])
             rep_rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(vtk_run_id), 99991, MODEL_ORDER.index(model_name)]))
@@ -1530,11 +1571,11 @@ def main():
                 repeats=args.model_repeats,
                 surface_chunk_size=int(args.audi_surface_chunk_size),
             )
-            prefix = MODEL_LABELS[model_name].lower()
             surface_point_data[f"{prefix}_pressure_pred"] = pred_pressure
         except Exception as exc:
             audi_vtk_skipped_models.append(model_name)
             print(f"[warning] Skipping Audi VTK export for {model_name}: {exc}")
+            surface_point_data[f"{prefix}_pressure_pred"] = np.full((n_surface_points,), np.nan, dtype=np.float32)
         if device.type == "cuda":
             torch.cuda.empty_cache()
         model = model.to("cpu")

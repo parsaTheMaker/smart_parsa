@@ -30,15 +30,16 @@ experiment:
   optimizer: "adamw"
   loss_fn: "rel_l2"
   scheduler: "cosine"
-  scheduler_warumup_fraction: 0.2
-  batch_size: 1
+  scheduler_warmup_fraction: 0.2
+  batch_size: 2
   epochs: 300
   learning_rate: 2.e-4
   gradient_norm: null
   amp: True
   precision: "float16"
-  log_every_n_steps: 10
+  log_every_n_steps: 5
   inspect_first_sample: False
+  init_ckpt: "/home/parsa/smart_parsa/checkpoints/smart-smart-drivaerml-131k16kwr-drivaerml-s42_best.pt"
   resume_ckpt: ""
   resume_full_state: False
   wandb_watch_model: False
@@ -71,10 +72,13 @@ experiment:
   secondary_inverse_density_beta_max: 0.5
   mixed_inverse_density_prob: 1.0
   prediction_consistency_weight: 1.0
-  latent_consistency_weight: 0.0
+  use_latent_consistency: False
   consistency_warmup_epochs: 0
   fuse_consistency_views: True
   use_gradnorm: True
   gradnorm_alpha: 1.5
-  gradnorm_lr: 0.025
-  gradnorm_update_interval: 32
+  gradnorm_lr: 0.01
+  gradnorm_update_interval: 2
+  gradnorm_clamp_start: 0.1
+  gradnorm_clamp_end: 1.2
+  gradnorm_clamp_warmup_epochs: 100

@@ -94,6 +94,7 @@ MODEL_ORDER = [
     "SMART",
     "SMART_SAT",
     "SMART_SATLOSS3",
+    "SMART_SATLOSS4",
     "TRANSOLVERPP",
     "TRANSOLVERPP_SAT",
     "TRANSOLVERPP_SATLOSS3",
@@ -108,6 +109,7 @@ MODEL_LABELS = {
     "SMART": "SMART",
     "SMART_SAT": "SMART-SAT",
     "SMART_SATLOSS3": "SMART-SATLOSS3",
+    "SMART_SATLOSS4": "SMART-SATLOSS4",
     "TRANSOLVERPP": "TransolverPP",
     "TRANSOLVERPP_SAT": "TransolverPP-SAT",
     "TRANSOLVERPP_SATLOSS3": "TransolverPP-SATLOSS3",
@@ -122,6 +124,7 @@ MODEL_COLORS = {
     "SMART": "#6C6F7D",
     "SMART_SAT": "#4C78A8",
     "SMART_SATLOSS3": "#F58518",
+    "SMART_SATLOSS4": "#72B7B2",
     "TRANSOLVERPP": "#6C6F7D",
     "TRANSOLVERPP_SAT": "#54A24B",
     "TRANSOLVERPP_SATLOSS3": "#E45756",
@@ -134,7 +137,7 @@ MODEL_COLORS = {
 }
 FAMILY_GROUPS = OrderedDict(
     [
-        ("smart_family", ["SMART", "SMART_SAT", "SMART_SATLOSS3"]),
+        ("smart_family", ["SMART", "SMART_SAT", "SMART_SATLOSS3", "SMART_SATLOSS4"]),
         ("transolverpp_family", ["TRANSOLVERPP", "TRANSOLVERPP_SAT", "TRANSOLVERPP_SATLOSS3"]),
         ("ginot_family", ["GINOT", "GINOT_SATLOSS3"]),
         ("abupt_family", ["ABUPT", "ABUPT_SATLOSS3"]),
@@ -142,7 +145,7 @@ FAMILY_GROUPS = OrderedDict(
     ]
 )
 FAMILY_TITLES = {
-    "smart_family": "SMART vs SMART-SAT vs SMART-SATLOSS3",
+    "smart_family": "SMART vs SMART-SAT vs SMART-SATLOSS3 vs SMART-SATLOSS4",
     "transolverpp_family": "TransolverPP vs TransolverPP-SAT vs TransolverPP-SATLOSS3",
     "ginot_family": "GINOT vs GINOT-SATLOSS3",
     "abupt_family": "ABUPT vs ABUPT-SATLOSS3",
@@ -152,6 +155,7 @@ VTK_PRESSURE_MODELS = [
     "SMART",
     "SMART_SAT",
     "SMART_SATLOSS3",
+    "SMART_SATLOSS4",
     "TRANSOLVERPP",
     "TRANSOLVERPP_SATLOSS3",
     "GINOT",
@@ -166,6 +170,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smart-config", default="drivaerml")
     p.add_argument("--smart-sat-config", default="drivaerml_sat")
     p.add_argument("--smart-satloss3-config", default="drivaerml_satloss3")
+    p.add_argument("--smart-satloss4-config", default="drivaerml_satloss4")
     p.add_argument("--transolverpp-config", default="drivaerml_transolverpp")
     p.add_argument("--transolverpp-sat-config", default="drivaerml_transolverpp_sat")
     p.add_argument("--transolverpp-satloss3-config", default="drivaerml_transolverpp_satloss3")
@@ -178,6 +183,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smart-checkpoint", default=None)
     p.add_argument("--smart-sat-checkpoint", default=None)
     p.add_argument("--smart-satloss3-checkpoint", default=None)
+    p.add_argument("--smart-satloss4-checkpoint", default=None)
     p.add_argument("--transolverpp-checkpoint", default=None)
     p.add_argument("--transolverpp-sat-checkpoint", default=None)
     p.add_argument("--transolverpp-satloss3-checkpoint", default=None)
@@ -252,6 +258,7 @@ def choose_ckpt(config, explicit: str | None) -> str:
         "SMART": "smart-smart-",
         "SMART_SAT": "smart-sat-",
         "SMART_SATLOSS3": "smart-satloss3-",
+        "SMART_SATLOSS4": "smart-satloss4-",
         "TRANSOLVERPP": "transolverpp-",
         "TRANSOLVERPP_SAT": "transolverpp-sat-",
         "TRANSOLVERPP_SATLOSS3": "transolverpp-satloss3-",
@@ -302,7 +309,7 @@ def build_model(config, ckpt_path: str, device: torch.device, batched_query_subr
         "volume_channels": len(VOLUME_FIELDS),
         "parameter_channels": 0,
     }
-    if model_name in {"SMART", "SMART_SATLOSS3"}:
+    if model_name in {"SMART", "SMART_SATLOSS3", "SMART_SATLOSS4"}:
         model = SMART(**base_kwargs, **arch)
     elif model_name == "SMART_SAT":
         model = SMARTSAT(**base_kwargs, **arch)
@@ -636,7 +643,7 @@ def predict_audi_surface_pressure(
         return pred_surf
 
     def _build_surface_decoder():
-        if model_name in {"SMART", "SMART_SATLOSS3"}:
+        if model_name in {"SMART", "SMART_SATLOSS3", "SMART_SATLOSS4"}:
             intermediate_latent_geometries, latent_geo_pos = model.encode(geo_b, None)
 
             def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
@@ -995,6 +1002,7 @@ def main():
             ("SMART", args.smart_config),
             ("SMART_SAT", args.smart_sat_config),
             ("SMART_SATLOSS3", args.smart_satloss3_config),
+            ("SMART_SATLOSS4", args.smart_satloss4_config),
             ("TRANSOLVERPP", args.transolverpp_config),
             ("TRANSOLVERPP_SAT", args.transolverpp_sat_config),
             ("TRANSOLVERPP_SATLOSS3", args.transolverpp_satloss3_config),
@@ -1033,6 +1041,7 @@ def main():
         "SMART": args.smart_checkpoint,
         "SMART_SAT": args.smart_sat_checkpoint,
         "SMART_SATLOSS3": args.smart_satloss3_checkpoint,
+        "SMART_SATLOSS4": args.smart_satloss4_checkpoint,
         "TRANSOLVERPP": args.transolverpp_checkpoint,
         "TRANSOLVERPP_SAT": args.transolverpp_sat_checkpoint,
         "TRANSOLVERPP_SATLOSS3": args.transolverpp_satloss3_checkpoint,

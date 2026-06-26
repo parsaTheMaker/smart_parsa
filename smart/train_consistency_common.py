@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+import torch.nn as nn
 import wandb
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.nn.parallel import DataParallel
@@ -47,6 +48,34 @@ def is_main_process():
 
 def unwrap_model(model):
     return model.module if isinstance(model, (DDP, DataParallel)) else model
+
+
+def _last_linear_params(module):
+    last_linear = None
+    for submodule in module.modules():
+        if isinstance(submodule, nn.Linear):
+            last_linear = submodule
+    if last_linear is None:
+        return []
+    params = [last_linear.weight]
+    if last_linear.bias is not None:
+        params.append(last_linear.bias)
+    return params
+
+
+def resolve_gradnorm_reference_params(model):
+    base_model = unwrap_model(model)
+    for attr_name in ("mlp", "output_head", "head", "surface_decoder", "volume_decoder"):
+        if hasattr(base_model, attr_name):
+            params = _last_linear_params(getattr(base_model, attr_name))
+            if params:
+                # Use the last linear weight as the GradNorm reference layer.
+                return (params[0],)
+
+    trainable_params = [param for param in base_model.parameters() if param.requires_grad]
+    if not trainable_params:
+        raise ValueError("Could not resolve GradNorm reference parameters for the model.")
+    return (trainable_params[-1],)
 
 
 def setup_distributed():
@@ -103,10 +132,32 @@ def init_metric_dict(surface_fields, volume_fields, extra_keys=None):
     return metrics
 
 
+def init_metric_tensor_dict(surface_fields, volume_fields, device, extra_keys=None):
+    metrics = {
+        "loss": torch.zeros((), device=device, dtype=torch.float32),
+        "rel_l2": torch.zeros((), device=device, dtype=torch.float32),
+        "rel_l2_surf": torch.zeros((), device=device, dtype=torch.float32),
+        "rel_l2_vol": torch.zeros((), device=device, dtype=torch.float32),
+    }
+    for field_name in surface_fields:
+        metrics[f"rel_l2_surf_{field_name}"] = torch.zeros((), device=device, dtype=torch.float32)
+    for field_name in volume_fields:
+        metrics[f"rel_l2_vol_{field_name}"] = torch.zeros((), device=device, dtype=torch.float32)
+    for key in extra_keys or []:
+        metrics[key] = torch.zeros((), device=device, dtype=torch.float32)
+    return metrics
+
+
 def accumulate_channel_metrics(metrics, prefix, pred, gt, field_names, rel_l2_loss_fn, batch_size, metric_weight=1.0):
     for channel_idx, field_name in enumerate(field_names):
         channel_loss = rel_l2_loss_fn(pred[..., channel_idx:channel_idx + 1], gt[..., channel_idx:channel_idx + 1])
         metrics[f"{prefix}_{field_name}"] += channel_loss.item() * batch_size * metric_weight
+
+
+def accumulate_channel_metrics_tensor(metrics, prefix, pred, gt, field_names, rel_l2_loss_fn, batch_size, metric_weight=1.0):
+    for channel_idx, field_name in enumerate(field_names):
+        channel_loss = rel_l2_loss_fn(pred[..., channel_idx:channel_idx + 1], gt[..., channel_idx:channel_idx + 1]).detach()
+        metrics[f"{prefix}_{field_name}"] += channel_loss * float(batch_size) * float(metric_weight)
 
 
 def add_canonical_field_metrics(wandb_dict, split, surface_fields, volume_fields, metric_values=None):
@@ -200,7 +251,14 @@ def load_full_training_state(
         gradnorm_state = checkpoint.get("gradnorm_balancer_state_dict")
         if gradnorm_state is None:
             raise KeyError(f"Checkpoint {checkpoint_path} is missing gradnorm_balancer_state_dict required for full-state resume.")
-        gradnorm_balancer.load_state_dict(gradnorm_state)
+        gradnorm_incompat = gradnorm_balancer.load_state_dict(gradnorm_state, strict=False)
+        missing_keys = getattr(gradnorm_incompat, "missing_keys", [])
+        unexpected_keys = getattr(gradnorm_incompat, "unexpected_keys", [])
+        if missing_keys or unexpected_keys:
+            print(
+                f"[resume] Loaded gradnorm balancer from {checkpoint_path} with "
+                f"missing_keys={missing_keys} unexpected_keys={unexpected_keys}"
+            )
     if gradnorm_optimizer is not None:
         gradnorm_opt_state = checkpoint.get("gradnorm_optimizer_state_dict")
         if gradnorm_opt_state is None:
@@ -360,17 +418,47 @@ def sample_geometry_view(geo_mesh, geo_log_density, num_points, mode, inverse_de
 
 
 class GradNormBalancer(torch.nn.Module):
-    def __init__(self, num_tasks, alpha=1.5):
+    def __init__(
+        self,
+        num_tasks,
+        alpha=1.5,
+        update_interval=1,
+        clamp_start=0.2,
+        clamp_end=2.0,
+        clamp_warmup_epochs=50,
+    ):
         super().__init__()
         self.num_tasks = int(num_tasks)
         self.alpha = float(alpha)
+        self.update_interval = max(1, int(update_interval))
+        self.clamp_start = float(clamp_start)
+        self.clamp_end = float(clamp_end)
+        self.clamp_warmup_epochs = max(0, int(clamp_warmup_epochs))
         self.log_task_weights = torch.nn.Parameter(torch.zeros(self.num_tasks, dtype=torch.float32))
         self.register_buffer("initial_losses", torch.zeros(self.num_tasks, dtype=torch.float32))
         self.register_buffer("initialized", torch.tensor(False, dtype=torch.bool))
+        self.register_buffer("last_update_step", torch.tensor(-1, dtype=torch.long))
 
-    def normalized_weights(self):
-        raw = torch.exp(self.log_task_weights)
-        return self.num_tasks * raw / torch.clamp(raw.sum(), min=1e-8)
+    def clamp_for_epoch(self, epoch_idx=None):
+        start = max(0.0, float(self.clamp_start))
+        end = max(start, float(self.clamp_end))
+        if epoch_idx is None or self.clamp_warmup_epochs <= 0:
+            return end
+        if self.clamp_warmup_epochs == 1:
+            return end
+        progress = min(max(int(epoch_idx), 0), self.clamp_warmup_epochs - 1) / float(self.clamp_warmup_epochs - 1)
+        return start + (end - start) * progress
+
+    def normalized_weights(self, epoch_idx=None):
+        clamp_mag = self.clamp_for_epoch(epoch_idx)
+        logits = torch.clamp(self.log_task_weights, min=-clamp_mag, max=clamp_mag)
+        weights = torch.nan_to_num(
+            torch.softmax(logits, dim=0),
+            nan=1.0 / max(self.num_tasks, 1),
+            posinf=1.0,
+            neginf=1.0,
+        )
+        return weights / torch.clamp(weights.sum(), min=1e-8)
 
     def maybe_initialize(self, losses):
         if bool(self.initialized.item()):
@@ -382,52 +470,68 @@ class GradNormBalancer(torch.nn.Module):
     def compute(
         self,
         losses,
-        task_output_groups,
+        reference_params,
+        epoch_idx=None,
+        step_idx=None,
     ):
         if len(losses) != self.num_tasks:
             raise ValueError(f"GradNorm expected {self.num_tasks} losses, got {len(losses)}.")
-        if len(task_output_groups) != self.num_tasks:
-            raise ValueError(f"GradNorm expected {self.num_tasks} output groups, got {len(task_output_groups)}.")
+        if len(reference_params) == 0:
+            raise ValueError("GradNorm requires at least one reference parameter.")
 
         self.maybe_initialize(losses)
-        weights = self.normalized_weights()
-
-        base_grad_norms = []
-        for loss, outputs in zip(losses, task_output_groups):
-            outputs = tuple(x for x in outputs if x is not None)
-            grads = torch.autograd.grad(
-                loss,
-                outputs,
-                retain_graph=True,
-                create_graph=False,
-                allow_unused=True,
-            )
-            grad_sq_sum = None
-            for grad in grads:
-                if grad is None:
-                    continue
-                contrib = grad.float().pow(2).sum()
-                grad_sq_sum = contrib if grad_sq_sum is None else (grad_sq_sum + contrib)
-            if grad_sq_sum is None:
-                base_grad_norms.append(loss.new_tensor(0.0, dtype=torch.float32))
-            else:
-                base_grad_norms.append(torch.sqrt(torch.clamp(grad_sq_sum, min=1e-12)).detach())
-        base_grad_norms = torch.stack(base_grad_norms)
-        grad_norms = weights * base_grad_norms
+        weights = self.normalized_weights(epoch_idx=epoch_idx)
+        should_update = True
+        if step_idx is not None:
+            should_update = (int(step_idx) % self.update_interval) == 0
 
         loss_ratios = torch.stack([loss.detach().float().clamp_min(1e-8) for loss in losses]) / torch.clamp(self.initial_losses, min=1e-8)
-        inverse_train_rates = loss_ratios / torch.clamp(loss_ratios.mean(), min=1e-8)
-        mean_grad_norm = grad_norms.detach().mean()
-        targets = mean_grad_norm * inverse_train_rates.pow(self.alpha)
-        gradnorm_loss = torch.abs(grad_norms - targets).sum()
+        loss_ratios = torch.nan_to_num(loss_ratios, nan=1.0, posinf=1.0, neginf=1.0)
+
+        if should_update:
+            base_grad_norms = []
+            for loss in losses:
+                grads = torch.autograd.grad(
+                    loss,
+                    reference_params,
+                    retain_graph=True,
+                    create_graph=False,
+                    allow_unused=True,
+                )
+                grad_sq_sum = None
+                for grad in grads:
+                    if grad is None:
+                        continue
+                    contrib = grad.float().pow(2).sum()
+                    grad_sq_sum = contrib if grad_sq_sum is None else (grad_sq_sum + contrib)
+                if grad_sq_sum is None:
+                    base_grad_norms.append(loss.new_tensor(0.0, dtype=torch.float32))
+                else:
+                    base_grad_norms.append(torch.sqrt(torch.clamp(grad_sq_sum, min=1e-12)).detach())
+            base_grad_norms = torch.stack(base_grad_norms)
+            base_grad_norms = torch.nan_to_num(base_grad_norms, nan=0.0, posinf=1e6, neginf=0.0)
+            self.last_update_step.fill_(int(step_idx) if step_idx is not None else -1)
+            inverse_train_rates = loss_ratios / torch.clamp(loss_ratios.mean(), min=1e-8)
+            grad_norms = weights * base_grad_norms
+            mean_grad_norm = grad_norms.detach().mean()
+            targets = mean_grad_norm * inverse_train_rates.pow(self.alpha)
+            gradnorm_loss = torch.abs(grad_norms - targets).sum()
+            gradnorm_loss = torch.nan_to_num(gradnorm_loss, nan=0.0, posinf=1e6, neginf=0.0)
+        else:
+            base_grad_norms = torch.zeros_like(loss_ratios)
+            inverse_train_rates = (loss_ratios / torch.clamp(loss_ratios.mean(), min=1e-8)).detach()
+            grad_norms = torch.zeros_like(loss_ratios)
+            gradnorm_loss = losses[0].detach().new_zeros(())
 
         return {
             "weights": weights,
             "weights_detached": weights.detach(),
             "gradnorm_loss": gradnorm_loss,
+            "clamp_mag": torch.tensor(float(self.clamp_for_epoch(epoch_idx)), device=weights.device),
             "base_grad_norms": base_grad_norms,
             "grad_norms": grad_norms.detach(),
             "inverse_train_rates": inverse_train_rates.detach(),
+            "should_update": should_update,
         }
 
 
@@ -487,7 +591,7 @@ def evaluate_loader(
     sample_count = 0
 
     pbar = tqdm(loader, desc=f"Eval {mode_name}", leave=False, dynamic_ncols=True, disable=not is_main_process())
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch_idx, batch in enumerate(pbar):
             geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, geo_log_density = unpack_batch(batch, params_dim)
 
@@ -685,45 +789,73 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
     use_gradnorm = bool(getattr(config, "use_gradnorm", False))
     gradnorm_balancer = None
     gradnorm_optimizer = None
-    gradnorm_update_interval = max(1, int(getattr(config, "gradnorm_update_interval", 1)))
+    gradnorm_reference_params = ()
     if use_gradnorm:
         gradnorm_balancer = GradNormBalancer(
             num_tasks=3,
             alpha=float(getattr(config, "gradnorm_alpha", 1.5)),
+            update_interval=int(getattr(config, "gradnorm_update_interval", 1)),
+            clamp_start=float(getattr(config, "gradnorm_clamp_start", 0.2)),
+            clamp_end=float(getattr(config, "gradnorm_clamp_end", 2.0)),
+            clamp_warmup_epochs=int(getattr(config, "gradnorm_clamp_warmup_epochs", 50)),
         ).to(device)
         gradnorm_optimizer = torch.optim.Adam(
             gradnorm_balancer.parameters(),
             lr=float(getattr(config, "gradnorm_lr", 2.5e-2)),
         )
+        gradnorm_reference_params = resolve_gradnorm_reference_params(model)
 
     best_robust_rel_l2 = np.inf
     global_step = 0
     start_epoch = 0
     log_every_n_steps = getattr(config, "log_every_n_steps", 10)
 
+    init_ckpt = str(getattr(config, "init_ckpt", "")).strip()
     resume_ckpt = str(getattr(config, "resume_ckpt", "")).strip()
     resume_full_state = bool(getattr(config, "resume_full_state", False))
-    if resume_ckpt:
-        if resume_full_state:
-            start_epoch, global_step, best_robust_rel_l2 = load_full_training_state(
-                model,
-                optimizer,
-                scheduler,
-                scaler,
-                resume_ckpt,
-                device,
-                load_scaler=bool(amp),
-                gradnorm_balancer=gradnorm_balancer,
-                gradnorm_optimizer=gradnorm_optimizer,
-            )
-        else:
-            load_partial_state_dict(model, resume_ckpt, device)
+    if resume_full_state:
+        if not resume_ckpt:
+            raise ValueError("resume_full_state=True requires experiment.resume_ckpt to be set.")
+        start_epoch, global_step, best_robust_rel_l2 = load_full_training_state(
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            resume_ckpt,
+            device,
+            load_scaler=bool(amp),
+            gradnorm_balancer=gradnorm_balancer,
+            gradnorm_optimizer=gradnorm_optimizer,
+        )
+    elif init_ckpt:
+        if is_main_process():
+            print(f"[init] Loading model weights from {init_ckpt}")
+        load_partial_state_dict(model, init_ckpt, device)
+    elif resume_ckpt:
+        if is_main_process():
+            print(f"[init] experiment.resume_ckpt is being used for partial model initialization from {resume_ckpt}")
+        load_partial_state_dict(model, resume_ckpt, device)
 
     train_model = model
     if multi_gpu_strategy == "data_parallel" and torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        train_model = DataParallel(model)
+        visible_gpus = torch.cuda.device_count()
+        if int(config.batch_size) < visible_gpus and is_main_process():
+            print(
+                f"[multi-gpu warning] batch_size={int(config.batch_size)} is smaller than the number of visible GPUs "
+                f"({visible_gpus}); DataParallel will underutilize devices."
+            )
+        # Keep DataParallel as lightweight as possible:
+        # - make device placement explicit
+        # - avoid buffer broadcasts because SMART-family models do not use BN/SyncBN
+        device_ids = list(range(visible_gpus))
+        train_model = DataParallel(
+            model,
+            device_ids=device_ids,
+            output_device=device_ids[0],
+            dim=0,
+        )
         if is_main_process():
-            print(f"[multi-gpu] Using DataParallel on {torch.cuda.device_count()} GPUs.")
+            print(f"[multi-gpu] Using DataParallel on {visible_gpus} GPUs.")
     elif dist_info["enabled"]:
         ddp_kwargs = {
             "device_ids": [dist_info["local_rank"]] if device.type == "cuda" else None,
@@ -739,7 +871,6 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
         "loss_supervised_primary",
         "loss_supervised_secondary",
         "loss_prediction_consistency",
-        "loss_latent_consistency",
         "secondary_inverse_density_fraction",
         "secondary_inverse_density_beta",
         "gradnorm_weight_primary",
@@ -756,7 +887,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             if train_sampler is not None:
                 train_sampler.set_epoch(ep)
 
-            train_losses = init_metric_dict(fields["surface"], fields["volume"], extra_keys=train_extra_keys)
+            train_losses = init_metric_tensor_dict(fields["surface"], fields["volume"], device, extra_keys=train_extra_keys)
             train_model.train()
             train_sample_count = 0
             train_pbar = tqdm(
@@ -764,19 +895,23 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                 desc=f"Train {ep + 1}/{config.epochs}",
                 leave=False,
                 dynamic_ncols=True,
+                miniters=max(1, int(log_every_n_steps)),
+                mininterval=1.0,
+                smoothing=0.0,
                 disable=not is_main_process(),
             )
 
             warmup = consistency_warmup_factor(ep, getattr(config, "consistency_warmup_epochs", 0))
             pred_consistency_weight = warmup * float(getattr(config, "prediction_consistency_weight", 1.0))
-            configured_latent_weight = float(getattr(config, "latent_consistency_weight", 0.0))
-            latent_consistency_weight = warmup * configured_latent_weight
-            use_latent_consistency = configured_latent_weight > 0.0
+            use_latent_consistency = bool(getattr(config, "use_latent_consistency", False))
 
             for batch_idx, batch in enumerate(train_pbar):
                 geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, geo_log_density = unpack_batch(batch, params_dim)
                 if geo_log_density is None:
-                    raise RuntimeError(f"{config.model_name} requires geometry log density from the dataset.")
+                    raise RuntimeError(
+                        f"{config.model_name} consistency training requires geometry log density from the dataset "
+                        "for geometry-view resampling."
+                    )
 
                 primary_view_geo, primary_view_density, _ = sample_geometry_view(
                     geo_mesh,
@@ -832,22 +967,39 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                         fused_params = duplicate_batch_tensor(params)
                         if model_requires_density:
                             fused_density = torch.cat([primary_view_density, secondary_view_density], dim=0)
-                            fused_out = train_model(
-                                fused_geo,
-                                fused_surf_mesh,
-                                fused_vol_mesh,
-                                fused_params,
-                                geo_log_density=fused_density,
-                                return_latent=use_latent_consistency,
-                            )
+                            if use_latent_consistency:
+                                fused_out = train_model(
+                                    fused_geo,
+                                    fused_surf_mesh,
+                                    fused_vol_mesh,
+                                    fused_params,
+                                    geo_log_density=fused_density,
+                                    return_latent=True,
+                                )
+                            else:
+                                fused_out = train_model(
+                                    fused_geo,
+                                    fused_surf_mesh,
+                                    fused_vol_mesh,
+                                    fused_params,
+                                    geo_log_density=fused_density,
+                                )
                         else:
-                            fused_out = train_model(
-                                fused_geo,
-                                fused_surf_mesh,
-                                fused_vol_mesh,
-                                fused_params,
-                                return_latent=use_latent_consistency,
-                            )
+                            if use_latent_consistency:
+                                fused_out = train_model(
+                                    fused_geo,
+                                    fused_surf_mesh,
+                                    fused_vol_mesh,
+                                    fused_params,
+                                    return_latent=True,
+                                )
+                            else:
+                                fused_out = train_model(
+                                    fused_geo,
+                                    fused_surf_mesh,
+                                    fused_vol_mesh,
+                                    fused_params,
+                                )
                         if use_latent_consistency:
                             fused_surf, fused_vol, fused_latent = fused_out
                             y1_surf, y2_surf = fused_surf.chunk(2, dim=0)
@@ -861,90 +1013,122 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             latent2 = None
                     else:
                         if model_requires_density:
-                            primary_out = train_model(
-                                primary_view_geo,
-                                surf_mesh,
-                                vol_mesh,
-                                params,
-                                geo_log_density=primary_view_density,
-                                return_latent=use_latent_consistency,
-                            )
+                            if use_latent_consistency:
+                                primary_out = train_model(
+                                    primary_view_geo,
+                                    surf_mesh,
+                                    vol_mesh,
+                                    params,
+                                    geo_log_density=primary_view_density,
+                                    return_latent=True,
+                                )
+                            else:
+                                primary_out = train_model(
+                                    primary_view_geo,
+                                    surf_mesh,
+                                    vol_mesh,
+                                    params,
+                                    geo_log_density=primary_view_density,
+                                )
                         else:
-                            primary_out = train_model(
-                                primary_view_geo,
-                                surf_mesh,
-                                vol_mesh,
-                                params,
-                                return_latent=use_latent_consistency,
-                            )
+                            if use_latent_consistency:
+                                primary_out = train_model(
+                                    primary_view_geo,
+                                    surf_mesh,
+                                    vol_mesh,
+                                    params,
+                                    return_latent=True,
+                                )
+                            else:
+                                primary_out = train_model(
+                                    primary_view_geo,
+                                    surf_mesh,
+                                    vol_mesh,
+                                    params,
+                                )
                         if use_latent_consistency:
                             y1_surf, y1_vol, latent1 = primary_out
                         else:
                             y1_surf, y1_vol = primary_out
                             latent1 = None
                         if model_requires_density:
-                            secondary_out = train_model(
-                                secondary_view_geo,
-                                surf_mesh,
-                                vol_mesh,
-                                params,
-                                geo_log_density=secondary_view_density,
-                                return_latent=use_latent_consistency,
-                            )
+                            if use_latent_consistency:
+                                secondary_out = train_model(
+                                    secondary_view_geo,
+                                    surf_mesh,
+                                    vol_mesh,
+                                    params,
+                                    geo_log_density=secondary_view_density,
+                                    return_latent=True,
+                                )
+                            else:
+                                secondary_out = train_model(
+                                    secondary_view_geo,
+                                    surf_mesh,
+                                    vol_mesh,
+                                    params,
+                                    geo_log_density=secondary_view_density,
+                                )
                         else:
-                            secondary_out = train_model(
-                                secondary_view_geo,
-                                surf_mesh,
-                                vol_mesh,
-                                params,
-                                return_latent=use_latent_consistency,
-                            )
+                            if use_latent_consistency:
+                                secondary_out = train_model(
+                                    secondary_view_geo,
+                                    surf_mesh,
+                                    vol_mesh,
+                                    params,
+                                    return_latent=True,
+                                )
+                            else:
+                                secondary_out = train_model(
+                                    secondary_view_geo,
+                                    surf_mesh,
+                                    vol_mesh,
+                                    params,
+                                )
                         if use_latent_consistency:
                             y2_surf, y2_vol, latent2 = secondary_out
                         else:
                             y2_surf, y2_vol = secondary_out
                             latent2 = None
 
-                    supervised_primary = combined_loss_fn(y1_surf, y1_vol, surf_data, vol_data) if use_surface_supervision else loss_fn(y1_vol, vol_data)
-                    supervised_secondary = combined_loss_fn(y2_surf, y2_vol, surf_data, vol_data) if use_surface_supervision else loss_fn(y2_vol, vol_data)
-                    y1_surf_teacher = y1_surf.detach()
-                    y1_vol_teacher = y1_vol.detach()
-                    latent1_teacher = latent1.detach() if latent1 is not None else None
-                    pred_consistency = prediction_consistency_loss(y1_surf_teacher, y1_vol_teacher, y2_surf, y2_vol)
-                    if use_latent_consistency:
-                        lat_consistency = latent_consistency_loss(latent1_teacher, latent2)
-                    else:
-                        lat_consistency = y2_surf.new_zeros(())
-                    task_losses = [
-                        supervised_primary,
-                        supervised_secondary,
-                        pred_consistency_weight * pred_consistency,
-                    ]
-                    task_output_groups = [
-                        (y1_surf, y1_vol),
-                        (y2_surf, y2_vol),
-                        (y2_surf, y2_vol),
-                    ]
-                    gradnorm_should_update = use_gradnorm and ((global_step + 1) % gradnorm_update_interval == 0)
-                    if use_gradnorm:
-                        if gradnorm_should_update:
-                            gradnorm_info = gradnorm_balancer.compute(task_losses, task_output_groups)
-                            current_task_weights = gradnorm_info["weights_detached"]
-                        else:
-                            gradnorm_info = None
-                            current_task_weights = gradnorm_balancer.normalized_weights().detach()
-                        weighted_total_loss = sum(
-                            current_task_weights[i] * task_losses[i] for i in range(len(task_losses))
-                        ) + latent_consistency_weight * lat_consistency
-                    else:
-                        gradnorm_info = None
-                        current_task_weights = None
-                        weighted_total_loss = (
-                            0.5 * supervised_primary
-                            + 0.5 * supervised_secondary
-                            + pred_consistency_weight * pred_consistency
-                            + latent_consistency_weight * lat_consistency
-                        )
+                    y1_surf_f = y1_surf.float()
+                    y1_vol_f = y1_vol.float()
+                    y2_surf_f = y2_surf.float()
+                    y2_vol_f = y2_vol.float()
+                    latent1_f = latent1.float() if latent1 is not None else None
+                    latent2_f = latent2.float() if latent2 is not None else None
+
+                supervised_primary = combined_loss_fn(y1_surf_f, y1_vol_f, surf_data, vol_data) if use_surface_supervision else loss_fn(y1_vol_f, vol_data)
+                supervised_secondary = combined_loss_fn(y2_surf_f, y2_vol_f, surf_data, vol_data) if use_surface_supervision else loss_fn(y2_vol_f, vol_data)
+                y1_surf_teacher = y1_surf_f.detach()
+                y1_vol_teacher = y1_vol_f.detach()
+                pred_consistency = prediction_consistency_loss(y1_surf_teacher, y1_vol_teacher, y2_surf_f, y2_vol_f)
+                task_losses = [
+                    supervised_primary.float(),
+                    supervised_secondary.float(),
+                    (pred_consistency_weight * pred_consistency).float(),
+                ]
+                if use_gradnorm:
+                    gradnorm_info = gradnorm_balancer.compute(
+                        task_losses,
+                        gradnorm_reference_params,
+                        epoch_idx=ep,
+                        step_idx=global_step,
+                    )
+                    current_task_weights = gradnorm_info["weights_detached"].float()
+                    gradnorm_should_update = bool(gradnorm_info.get("should_update", True))
+                    weighted_total_loss = sum(
+                        current_task_weights[i] * task_losses[i] for i in range(len(task_losses))
+                    )
+                else:
+                    gradnorm_info = None
+                    current_task_weights = None
+                    gradnorm_should_update = False
+                    weighted_total_loss = (
+                        0.5 * supervised_primary
+                        + 0.5 * supervised_secondary
+                        + pred_consistency_weight * pred_consistency
+                    ).float()
 
                 if gradnorm_should_update:
                     gradnorm_grads = torch.autograd.grad(
@@ -968,8 +1152,11 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     if gradient_norm is not None:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
                     optimizer.step()
-                if gradnorm_optimizer is not None:
+                if gradnorm_optimizer is not None and gradnorm_should_update:
                     gradnorm_optimizer.step()
+                    with torch.no_grad():
+                        clamp_mag = float(gradnorm_balancer.clamp_for_epoch(ep))
+                        gradnorm_balancer.log_task_weights.clamp_(-clamp_mag, clamp_mag)
                 scheduler.step()
 
                 total_loss = weighted_total_loss.detach()
@@ -979,7 +1166,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     sum(mode.startswith("inverse_density") for mode in secondary_modes) / max(len(secondary_modes), 1)
                 )
 
-                with torch.no_grad():
+                with torch.inference_mode():
                     surf_rel_primary = rel_l2_loss_fn(y1_surf_teacher, surf_data) if use_surface_supervision else torch.tensor(0.0, device=device)
                     vol_rel_primary = rel_l2_loss_fn(y1_vol_teacher, vol_data)
                     surf_rel_secondary = rel_l2_loss_fn(y2_surf, surf_data) if use_surface_supervision else torch.tensor(0.0, device=device)
@@ -988,39 +1175,43 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     surface_loss = 0.5 * (surf_rel_primary + surf_rel_secondary)
                     volume_loss = 0.5 * (vol_rel_primary + vol_rel_secondary)
 
-                    train_losses["loss"] += total_loss.item() * batch_size
-                    train_losses["rel_l2_surf"] += surface_loss.item() * batch_size
-                    train_losses["rel_l2_vol"] += volume_loss.item() * batch_size
-                    train_losses["rel_l2"] += (surface_loss + volume_loss).item() * batch_size
-                    train_losses["loss_supervised_primary"] += supervised_primary.item() * batch_size
-                    train_losses["loss_supervised_secondary"] += supervised_secondary.item() * batch_size
-                    train_losses["loss_prediction_consistency"] += pred_consistency.item() * batch_size
-                    train_losses["loss_latent_consistency"] += lat_consistency.item() * batch_size
-                    train_losses["secondary_inverse_density_fraction"] += secondary_inverse_density_fraction * batch_size
-                    train_losses["secondary_inverse_density_beta"] += float(secondary_inverse_density_beta) * batch_size
+                    batch_size_float = float(batch_size)
+                    train_losses["loss"] += total_loss.detach().float() * batch_size_float
+                    train_losses["rel_l2_surf"] += surface_loss.detach().float() * batch_size_float
+                    train_losses["rel_l2_vol"] += volume_loss.detach().float() * batch_size_float
+                    train_losses["rel_l2"] += (surface_loss + volume_loss).detach().float() * batch_size_float
+                    train_losses["loss_supervised_primary"] += supervised_primary.detach().float() * batch_size_float
+                    train_losses["loss_supervised_secondary"] += supervised_secondary.detach().float() * batch_size_float
+                    train_losses["loss_prediction_consistency"] += pred_consistency.detach().float() * batch_size_float
+                    train_losses["secondary_inverse_density_fraction"] += torch.tensor(
+                        secondary_inverse_density_fraction, device=device, dtype=torch.float32
+                    ) * batch_size_float
+                    train_losses["secondary_inverse_density_beta"] += torch.tensor(
+                        float(secondary_inverse_density_beta), device=device, dtype=torch.float32
+                    ) * batch_size_float
                     if current_task_weights is not None:
-                        gradnorm_weights_np = current_task_weights.detach().cpu().numpy()
-                        train_losses["gradnorm_weight_primary"] += float(gradnorm_weights_np[0]) * batch_size
-                        train_losses["gradnorm_weight_secondary"] += float(gradnorm_weights_np[1]) * batch_size
-                        train_losses["gradnorm_weight_prediction_consistency"] += float(gradnorm_weights_np[2]) * batch_size
+                        train_losses["gradnorm_weight_primary"] += current_task_weights[0].detach().float() * batch_size_float
+                        train_losses["gradnorm_weight_secondary"] += current_task_weights[1].detach().float() * batch_size_float
+                        train_losses["gradnorm_weight_prediction_consistency"] += current_task_weights[2].detach().float() * batch_size_float
                     if gradnorm_info is not None:
-                        train_losses["gradnorm_loss"] += float(gradnorm_info["gradnorm_loss"].detach().item()) * batch_size
+                        train_losses["gradnorm_loss"] += gradnorm_info["gradnorm_loss"].detach().float() * batch_size_float
 
                     if use_surface_supervision:
                         pred_surf_primary = y1_surf_teacher * std_surf + mean_surf
                         pred_surf_secondary = y2_surf.detach() * std_surf + mean_surf
                         gt_surf = surf_data * std_surf + mean_surf
-                        accumulate_channel_metrics(train_losses, "rel_l2_surf", pred_surf_primary, gt_surf, fields["surface"], rel_l2_loss_fn, batch_size, metric_weight=0.5)
-                        accumulate_channel_metrics(train_losses, "rel_l2_surf", pred_surf_secondary, gt_surf, fields["surface"], rel_l2_loss_fn, batch_size, metric_weight=0.5)
+                        accumulate_channel_metrics_tensor(train_losses, "rel_l2_surf", pred_surf_primary, gt_surf, fields["surface"], rel_l2_loss_fn, batch_size, metric_weight=0.5)
+                        accumulate_channel_metrics_tensor(train_losses, "rel_l2_surf", pred_surf_secondary, gt_surf, fields["surface"], rel_l2_loss_fn, batch_size, metric_weight=0.5)
 
                     pred_vol_primary = y1_vol_teacher * std_vol + mean_vol
                     pred_vol_secondary = y2_vol.detach() * std_vol + mean_vol
                     gt_vol = vol_data * std_vol + mean_vol
-                    accumulate_channel_metrics(train_losses, "rel_l2_vol", pred_vol_primary, gt_vol, fields["volume"], rel_l2_loss_fn, batch_size, metric_weight=0.5)
-                    accumulate_channel_metrics(train_losses, "rel_l2_vol", pred_vol_secondary, gt_vol, fields["volume"], rel_l2_loss_fn, batch_size, metric_weight=0.5)
+                    accumulate_channel_metrics_tensor(train_losses, "rel_l2_vol", pred_vol_primary, gt_vol, fields["volume"], rel_l2_loss_fn, batch_size, metric_weight=0.5)
+                    accumulate_channel_metrics_tensor(train_losses, "rel_l2_vol", pred_vol_secondary, gt_vol, fields["volume"], rel_l2_loss_fn, batch_size, metric_weight=0.5)
 
                 global_step += 1
-                if (batch_idx % log_every_n_steps == 0 or batch_idx == len(train_loader) - 1) and run is not None:
+                should_log = batch_idx % log_every_n_steps == 0 or batch_idx == len(train_loader) - 1
+                if should_log and run is not None:
                     log_scalars = distributed_average_scalars(
                         [
                             total_loss.item(),
@@ -1030,7 +1221,6 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             supervised_primary.item(),
                             supervised_secondary.item(),
                             pred_consistency.item(),
-                            lat_consistency.item(),
                             secondary_inverse_density_fraction,
                             float(secondary_inverse_density_beta),
                         ]
@@ -1044,11 +1234,9 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             "train/batch_supervised_primary": log_scalars[4],
                             "train/batch_supervised_secondary": log_scalars[5],
                             "train/batch_prediction_consistency": log_scalars[6],
-                            "train/batch_latent_consistency": log_scalars[7],
-                            "train/batch_secondary_inverse_density_fraction": log_scalars[8],
-                            "train/batch_secondary_inverse_density_beta": log_scalars[9],
+                            "train/batch_secondary_inverse_density_fraction": log_scalars[7],
+                            "train/batch_secondary_inverse_density_beta": log_scalars[8],
                             "train/prediction_consistency_weight": pred_consistency_weight,
-                            "train/latent_consistency_weight": latent_consistency_weight,
                             "lr": scheduler.get_last_lr()[0],
                             "epoch": ep,
                         },
@@ -1082,7 +1270,9 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             },
                             step=global_step,
                         )
+                if should_log:
                     train_pbar.set_postfix(loss=f"{total_loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
+                    train_pbar.refresh()
 
             if is_dist_enabled():
                 dist.barrier()
@@ -1140,18 +1330,20 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             if is_dist_enabled():
                 key_list = list(train_losses.keys())
                 metric_tensor = torch.tensor(
-                    [train_losses[key] for key in key_list] + [float(train_sample_count)],
+                    [float(train_losses[key].item()) for key in key_list] + [float(train_sample_count)],
                     device=device,
                     dtype=torch.float64,
                 )
                 dist.all_reduce(metric_tensor, op=dist.ReduceOp.SUM)
                 train_sample_count = max(int(metric_tensor[-1].item()), 1)
                 for idx, key in enumerate(key_list):
-                    train_losses[key] = float(metric_tensor[idx].item())
+                    train_losses[key] = metric_tensor[idx].to(device=device, dtype=torch.float32)
 
             denom = max(int(train_sample_count), 1)
             for loss_name in train_losses.keys():
-                train_losses[loss_name] /= denom
+                train_losses[loss_name] = train_losses[loss_name] / float(denom)
+
+            train_losses_log = {key: float(value.detach().cpu().item()) for key, value in train_losses.items()}
 
             robust_rel_l2 = 0.5 * (aligned_metrics["rel_l2"] + shifted_metrics["rel_l2"])
             robust_loss = 0.5 * (aligned_metrics["loss"] + shifted_metrics["loss"])
@@ -1211,7 +1403,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             if is_main_process():
                 print(
                     f"epoch: {ep}, t2-t1 (epoch time): {t2 - t1:.5f}, "
-                    f"train loss: {train_losses['loss']:.5f}, "
+                    f"train loss: {train_losses_log['loss']:.5f}, "
                     f"aligned rel_l2: {aligned_metrics['rel_l2']:.5f}, "
                     f"shifted rel_l2: {shifted_metrics['rel_l2']:.5f}, "
                     f"robust rel_l2: {robust_rel_l2:.5f}"
@@ -1223,15 +1415,14 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     "test/robust_rel_l2": robust_rel_l2,
                     "test/robust_loss": robust_loss,
                     "train/prediction_consistency_weight": pred_consistency_weight,
-                    "train/latent_consistency_weight": latent_consistency_weight,
                 }
-                wandb_dict.update({f"train/{key}": value for key, value in train_losses.items()})
+                wandb_dict.update({f"train/{key}": value for key, value in train_losses_log.items()})
                 wandb_dict.update({f"test_aligned/{key}": value for key, value in aligned_metrics.items()})
                 wandb_dict.update({f"test_shifted/{key}": value for key, value in shifted_metrics.items()})
-                add_all_field_metrics(wandb_dict, "train", fields["surface"], fields["volume"], metric_values=train_losses)
+                add_all_field_metrics(wandb_dict, "train", fields["surface"], fields["volume"], metric_values=train_losses_log)
                 add_all_field_metrics(wandb_dict, "test_aligned", fields["surface"], fields["volume"], metric_values=aligned_metrics)
                 add_all_field_metrics(wandb_dict, "test_shifted", fields["surface"], fields["volume"], metric_values=shifted_metrics)
-                add_canonical_field_metrics(wandb_dict, "train", fields["surface"], fields["volume"], metric_values=train_losses)
+                add_canonical_field_metrics(wandb_dict, "train", fields["surface"], fields["volume"], metric_values=train_losses_log)
                 add_canonical_field_metrics(wandb_dict, "test_aligned", fields["surface"], fields["volume"], metric_values=aligned_metrics)
                 add_canonical_field_metrics(wandb_dict, "test_shifted", fields["surface"], fields["volume"], metric_values=shifted_metrics)
                 wandb_dict["meta/training_surface_signals"] = ",".join(fields["surface"])

@@ -40,6 +40,7 @@ import numpy as np
 import torch
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
+from matplotlib.lines import Line2D
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -83,6 +84,7 @@ HEADLINE_METRIC_KEYS = [
     "volume_global_rel_l2",
     "surface_pressure_rel_l2",
     "surface_wss_mag_rel_l2",
+    "surface_drag_force_x_rel_l2",
     "surface_normal_mag_rel_l2",
     "volume_pressure_rel_l2",
     "volume_velocity_mag_rel_l2",
@@ -205,6 +207,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default=None)
     p.add_argument("--input-points", type=int, default=None, help="Encoder input size. Default: inferred from the active model configs.")
     p.add_argument(
+        "--density-estimator",
+        default="kde",
+        choices=["rk2", "tangent_cov", "kde"],
+        help="Geometry-density estimator used for the sampling shifts and density histograms.",
+    )
+    p.add_argument(
+        "--density-knn-k",
+        type=int,
+        default=None,
+        help="k used for the sampling-shift density study. Default: inferred from the active density config.",
+    )
+    p.add_argument(
         "--shift-betas",
         default="0,0.25,0.5,0.75,1.0",
         help="Comma-separated inverse-density shift severities. Example: 0,0.25,0.5,0.75,1.0",
@@ -235,6 +249,52 @@ def load_cfg(name: str):
     if not path.is_file():
         raise FileNotFoundError(f"Config not found: {path}")
     return OmegaConf.load(path).experiment
+
+
+def resolve_density_spec(cfg) -> Tuple[str, int, int, str]:
+    architecture = getattr(cfg, "architecture", None)
+    if architecture is not None:
+        density_estimator = str(
+            getattr(architecture, "density_estimator", getattr(cfg, "density_estimator", "rk2"))
+        )
+        density_knn_k = int(getattr(architecture, "density_knn_k", getattr(cfg, "density_knn_k", 8)))
+        density_neighbor_hops = int(
+            getattr(architecture, "density_neighbor_hops", getattr(cfg, "density_neighbor_hops", 1))
+        )
+    else:
+        density_estimator = str(getattr(cfg, "density_estimator", "rk2"))
+        density_knn_k = int(getattr(cfg, "density_knn_k", 8))
+        density_neighbor_hops = int(getattr(cfg, "density_neighbor_hops", 1))
+    density_cache_dtype = str(getattr(cfg, "geometry_density_cache_dtype", "float16"))
+    return density_estimator, density_knn_k, density_neighbor_hops, density_cache_dtype
+
+
+def infer_density_spec_from_checkpoint_name(
+    ckpt_path: str, base_estimator: str, base_knn_k: int
+) -> Tuple[str, int]:
+    name = Path(ckpt_path).stem.lower()
+    kde_match = re.search(r"(?:^|[-_])kde(\d+)(?:[-_]|$)", name)
+    if kde_match:
+        return "kde", int(kde_match.group(1))
+    if "kde" in name:
+        return "kde", int(base_knn_k)
+    return str(base_estimator), int(base_knn_k)
+
+
+def checkpoint_density_tag_is_explicit(ckpt_path: str) -> bool:
+    name = Path(ckpt_path).stem.lower()
+    return bool(re.search(r"(?:^|[-_])(kde\d+|kde|tangent[_-]?cov|rk2)(?:[-_]|$)", name))
+
+
+def resolve_model_internal_density_spec(model_name: str, cfg, ckpt_path: str) -> Tuple[str, int, int, str]:
+    density_estimator, density_knn_k, density_neighbor_hops, density_cache_dtype = resolve_density_spec(cfg)
+    if model_uses_density(model_name):
+        density_estimator, density_knn_k = infer_density_spec_from_checkpoint_name(
+            ckpt_path,
+            density_estimator,
+            density_knn_k,
+        )
+    return density_estimator, density_knn_k, density_neighbor_hops, density_cache_dtype
 
 
 def resolve_device(device_arg: str | None) -> torch.device:
@@ -496,36 +556,126 @@ def save_density_histogram(path: Path, log_density_values: np.ndarray, title: st
     path.parent.mkdir(parents=True, exist_ok=True)
     log_vals = np.asarray(log_density_values, dtype=np.float64)
     density_vals = np.exp(log_vals)
-    finite_mask = np.isfinite(log_vals) & np.isfinite(density_vals)
+    finite_mask = np.isfinite(log_vals) & np.isfinite(density_vals) & (density_vals > 0.0)
     finite_density = density_vals[finite_mask]
     if finite_density.size == 0:
         finite_density = np.array([1.0], dtype=np.float64)
     lo_density = float(np.percentile(finite_density, 5.0))
-    hi_density = float(np.percentile(finite_density, 90.0))
-    clipped = finite_density[(finite_density >= lo_density) & (finite_density < hi_density)]
-    if clipped.size == 0:
-        clipped = finite_density[finite_density < hi_density]
-    if clipped.size == 0:
-        clipped = finite_density
+    hi_density = float(np.percentile(finite_density, 95.0))
+    lo_density = max(lo_density, 1e-24)
+    hi_density = max(hi_density, lo_density * 1.0001)
+    window_density = finite_density[(finite_density >= lo_density) & (finite_density <= hi_density)]
+    if window_density.size == 0:
+        window_density = finite_density
+    bins = np.logspace(np.log10(lo_density), np.log10(hi_density), 60)
     fig, ax = plt.subplots(figsize=(8.0, 5.0), constrained_layout=True)
-    ax.hist(clipped, bins=60, range=(lo_density, hi_density), color="#4C78A8", alpha=0.9, edgecolor="white", linewidth=0.3)
+    ax.hist(window_density, bins=bins, color="#4C78A8", alpha=0.9, edgecolor="white", linewidth=0.3)
+    ax.set_xscale("log")
     ax.set_xlabel("Density")
     ax.set_ylabel("Count")
     ax.set_yscale("log")
     ax.set_title(title)
-    mean_val = float(np.mean(clipped))
-    std_val = float(np.std(clipped))
-    ax.axvline(mean_val, color="#E45756", linestyle="--", linewidth=1.5, label=f"mean={mean_val:.3g}")
-    ax.legend()
+    mean_val = float(np.mean(window_density))
+    std_val = float(np.std(window_density))
+    mean_handle = Line2D([], [], color="#E45756", linestyle="--", linewidth=1.5, label=f"mean={mean_val:.3g}")
+    stats_handle = Line2D(
+        [],
+        [],
+        color="none",
+        label=f"std={std_val:.3g}\nN={window_density.size}\np5={lo_density:.3g}, p95={hi_density:.3g}",
+    )
+    ax.legend(
+        handles=[mean_handle, stats_handle],
+        loc="upper left",
+        frameon=True,
+        fancybox=True,
+        framealpha=0.9,
+        borderpad=0.6,
+        labelspacing=0.5,
+        handlelength=2.0,
+        handletextpad=0.8,
+    )
+    ax.set_xlim(lo_density, hi_density)
     ax.text(
         0.98,
         0.95,
-        f"std={std_val:.3g}\nN={clipped.size}\ntrim=[p5,p90 density]",
+        "trimmed to p5-p95",
         transform=ax.transAxes,
         ha="right",
         va="top",
         fontsize=10,
-        bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "#CCCCCC"},
+        bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "#CCCCCC"},
+    )
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
+
+
+def save_sampling_y_histogram(
+    path: Path,
+    sampled_points_xyz: np.ndarray,
+    reference_points_xyz: np.ndarray,
+    mix_fraction: float,
+    title: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sampled = np.asarray(sampled_points_xyz, dtype=np.float64)
+    reference = np.asarray(reference_points_xyz, dtype=np.float64)
+    if sampled.ndim != 2 or sampled.shape[1] != 3:
+        raise ValueError("sampled_points_xyz must have shape [N, 3]")
+    if reference.ndim != 2 or reference.shape[1] != 3:
+        raise ValueError("reference_points_xyz must have shape [N, 3]")
+
+    y_ref = reference[:, 1]
+    y_samp = sampled[:, 1]
+    y_min = float(min(np.min(y_ref), np.min(y_samp)))
+    y_max = float(max(np.max(y_ref), np.max(y_samp)))
+    if not np.isfinite(y_min) or not np.isfinite(y_max):
+        y_min, y_max = 0.0, 1.0
+    if y_max <= y_min:
+        y_max = y_min + 1e-12
+
+    ref_norm = np.clip((y_ref - y_min) / (y_max - y_min), 0.0, 1.0)
+    samp_norm = np.clip((y_samp - y_min) / (y_max - y_min), 0.0, 1.0)
+    bins = np.linspace(0.0, 1.0, 61)
+    grid = np.linspace(0.0, 1.0, 512)
+    target_pdf = (1.0 - float(mix_fraction)) + float(mix_fraction) * (2.0 * np.sin(np.pi * grid) ** 2)
+
+    fig, ax = plt.subplots(figsize=(8.0, 5.0), constrained_layout=True)
+    ax.hist(
+        ref_norm,
+        bins=bins,
+        density=True,
+        histtype="step",
+        color="#A0A0A0",
+        linewidth=1.2,
+        label="all candidate points",
+        alpha=0.9,
+    )
+    ax.hist(
+        samp_norm,
+        bins=bins,
+        density=True,
+        color="#4C78A8",
+        alpha=0.85,
+        edgecolor="white",
+        linewidth=0.25,
+        label="sampled points",
+    )
+    ax.plot(grid, target_pdf, color="#E45756", linewidth=2.0, label=f"target mix curve (mix={mix_fraction:.2f})")
+    ax.set_xlim(0.0, 1.0)
+    ax.set_xlabel("Normalized y coordinate")
+    ax.set_ylabel("Probability density")
+    ax.set_title(title)
+    ax.legend(loc="upper left", frameon=True, fancybox=True, framealpha=0.92)
+    ax.text(
+        0.98,
+        0.95,
+        f"N={samp_norm.size}\nref={ref_norm.size}",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=10,
+        bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "#CCCCCC"},
     )
     fig.savefig(path, dpi=220)
     plt.close(fig)
@@ -578,6 +728,16 @@ def compute_metrics(surf_gt: np.ndarray, surf_pred: np.ndarray, vol_gt: np.ndarr
     for field_idx, field_name in enumerate(VOLUME_FIELDS):
         metrics[f"volume_field_{field_name}_rel_l2"] = rel_l2(vol_gt[:, field_idx], vol_pred[:, field_idx])
     return metrics
+
+
+def compute_surface_drag_force_x(surf_fields: np.ndarray, surface_areas: np.ndarray) -> float:
+    surf = np.asarray(surf_fields, dtype=np.float64)
+    areas = np.asarray(surface_areas, dtype=np.float64).reshape(-1)
+    if surf.shape[0] != areas.shape[0]:
+        raise ValueError(f"Surface field and area lengths do not match: {surf.shape[0]} vs {areas.shape[0]}")
+    pressure_force_x = -surf[:, 0] * surf[:, 1] * areas
+    shear_force_x = surf[:, 4] * areas
+    return float(np.sum(pressure_force_x + shear_force_x))
 
 
 def model_uses_density(model_name: str) -> bool:
@@ -899,6 +1059,7 @@ def _metric_display_name(metric_key: str) -> str:
         "volume_global_rel_l2": "Volume global rel-L2",
         "surface_pressure_rel_l2": "Surface pressure rel-L2",
         "surface_wss_mag_rel_l2": "Surface WSS magnitude rel-L2",
+        "surface_drag_force_x_rel_l2": "Surface drag force x rel-L2",
         "surface_normal_mag_rel_l2": "Surface normal magnitude rel-L2",
         "volume_pressure_rel_l2": "Volume pressure rel-L2",
         "volume_velocity_mag_rel_l2": "Volume velocity magnitude rel-L2",
@@ -1071,7 +1232,7 @@ def plot_comprehensive_dashboard(
     out_path: Path,
     title: str,
 ) -> None:
-    fig, axes = plt.subplots(3, 2, figsize=(15, 15), constrained_layout=True)
+    fig, axes = plt.subplots(3, 3, figsize=(18, 15), constrained_layout=True)
     dashboard_metrics = [
         "combined_physics_rel_l2",
         "combined_global_rel_l2",
@@ -1082,6 +1243,8 @@ def plot_comprehensive_dashboard(
     ]
     for ax, metric_key in zip(axes.flat, dashboard_metrics):
         _grouped_bar_on_axis(ax, per_run_mode_rows, metric_key, mode_order, model_order)
+    for ax in axes.flat[len(dashboard_metrics):]:
+        ax.axis("off")
     fig.suptitle(title, fontsize=18)
     fig.savefig(out_path, dpi=220)
     plt.close(fig)
@@ -1194,11 +1357,10 @@ def main():
         print(f"Using per-model train-aligned encoder input budgets: {budget_text}")
     dataset_geometry_points = max(unique_input_budgets)
 
-    density_cfg = configs["SMART_SAT"]
-    density_knn_k = int(getattr(density_cfg.architecture, "density_knn_k", 24))
-    density_neighbor_hops = int(getattr(density_cfg.architecture, "density_neighbor_hops", 1))
-    density_estimator = str(getattr(density_cfg.architecture, "density_estimator", "tangent_cov"))
-    density_cache_dtype = str(getattr(density_cfg, "geometry_density_cache_dtype", "float16"))
+    density_cfg = configs["SMART_SAT"] if "SMART_SAT" in configs else next(iter(configs.values()))
+    _, default_density_knn_k, density_neighbor_hops, density_cache_dtype = resolve_density_spec(density_cfg)
+    density_knn_k = int(args.density_knn_k) if args.density_knn_k is not None else int(default_density_knn_k)
+    density_estimator = str(args.density_estimator)
 
     dataset = AhmedMLDatasetV2(
         saved_folder=str(smart_cfg.data_path),
@@ -1231,6 +1393,52 @@ def main():
         model_name: build_model(spec["config"], spec["checkpoint"], device, batched_query_subregion_size=args.batched_query_subregion_size)
         for model_name, spec in model_specs.items()
     }
+    model_internal_density_specs: Dict[str, Dict[str, object]] = {}
+    for model_name, spec in model_specs.items():
+        if not model_uses_density(model_name):
+            continue
+        model_density_estimator, model_density_knn_k, model_density_neighbor_hops, _ = resolve_model_internal_density_spec(
+            model_name,
+            spec["config"],
+            spec["checkpoint"],
+        )
+        model_internal_density_specs[model_name] = {
+            "estimator": model_density_estimator,
+            "knn_k": model_density_knn_k,
+            "neighbor_hops": model_density_neighbor_hops,
+            "checkpoint": spec["checkpoint"],
+        }
+        print(
+            f"{MODEL_LABELS[model_name]} internal density: "
+            f"estimator={model_density_estimator}, knn_k={model_density_knn_k}, neighbor_hops={model_density_neighbor_hops}"
+        )
+        if not checkpoint_density_tag_is_explicit(spec["checkpoint"]):
+            print(
+                f"[warning] {MODEL_LABELS[model_name]} checkpoint name does not explicitly encode its density setup; "
+                "the evaluator is using the active config defaults for any missing density metadata."
+            )
+    density_dataset_cache: Dict[Tuple[str, int, int, str], AhmedMLDatasetV2] = {}
+
+    def get_density_dataset_for_spec(density_estimator_name: str, knn_k: int, neighbor_hops: int, cache_dtype: str) -> AhmedMLDatasetV2:
+        key = (str(density_estimator_name), int(knn_k), int(neighbor_hops), str(cache_dtype))
+        cached = density_dataset_cache.get(key)
+        if cached is not None:
+            return cached
+        density_dataset = AhmedMLDatasetV2(
+            saved_folder=str(smart_cfg.data_path),
+            if_test=True,
+            geometry_points=dataset_geometry_points,
+            surface_points=int(smart_cfg.num_surface_points),
+            volume_points=int(smart_cfg.num_volume_points),
+            scale_positions=bool(smart_cfg.scale_positions),
+            require_preprocessed=True,
+            geometry_density_knn_k=int(knn_k),
+            geometry_density_neighbor_hops=int(neighbor_hops),
+            geometry_density_estimator=str(density_estimator_name),
+            geometry_density_cache_dtype=str(cache_dtype),
+        )
+        density_dataset_cache[key] = density_dataset
+        return density_dataset
 
     auto_surface_query_points = min(int(spec["config"].num_surface_points) for spec in model_specs.values())
     auto_volume_query_points = min(int(spec["config"].num_volume_points) for spec in model_specs.values())
@@ -1318,6 +1526,7 @@ def main():
         surf_wx = np.load(run_dir / "surface_wallShearStressMeanTrim_x.npy").astype(np.float32, copy=False).reshape(-1, 1)
         surf_wy = np.load(run_dir / "surface_wallShearStressMeanTrim_y.npy").astype(np.float32, copy=False).reshape(-1, 1)
         surf_wz = np.load(run_dir / "surface_wallShearStressMeanTrim_z.npy").astype(np.float32, copy=False).reshape(-1, 1)
+        surf_area_full = np.load(run_dir / "surface_areas.npy").astype(np.float32, copy=False)
         surf_gt_full = np.concatenate([surf_p, surf_n, surf_wx, surf_wy, surf_wz], axis=1)
 
         vol_coords_full = np.load(run_dir / "volume_coords.npy").astype(np.float32, copy=False)
@@ -1334,6 +1543,25 @@ def main():
         full_geo_log_density = dataset._load_or_compute_full_geometry_density(run_id, expected_n=int(surf_coords_full.shape[0]))
         full_geo_log_density_np = full_geo_log_density.to(dtype=torch.float32).numpy()
         sine_y_weights = sinusoidal_axis_probabilities(surf_coords_full, axis=1)
+        model_full_geo_log_density_by_name: Dict[str, torch.Tensor] = {}
+        for model_name, spec in model_specs.items():
+            if not model_uses_density(model_name):
+                continue
+            model_density_estimator, model_density_knn_k, model_density_neighbor_hops, model_density_cache_dtype = resolve_model_internal_density_spec(
+                model_name,
+                spec["config"],
+                spec["checkpoint"],
+            )
+            model_density_dataset = get_density_dataset_for_spec(
+                model_density_estimator,
+                model_density_knn_k,
+                model_density_neighbor_hops,
+                model_density_cache_dtype,
+            )
+            model_full_geo_log_density_by_name[model_name] = model_density_dataset._load_or_compute_full_geometry_density(
+                run_id,
+                expected_n=int(surf_coords_full.shape[0]),
+            )
 
         for mode_name, mode_info in mode_defs.items():
             for model_name, model in models.items():
@@ -1373,6 +1601,7 @@ def main():
                 vol_query_idx = vol_query_idx_master[:model_volume_query_points]
                 surf_coords = surf_coords_full[surf_query_idx]
                 surf_gt = surf_gt_full[surf_query_idx]
+                surf_area = surf_area_full[surf_query_idx]
                 vol_coords = vol_coords_full[vol_query_idx]
                 vol_gt = vol_gt_full[vol_query_idx]
                 surf_query_norm = normalize_pos(torch.from_numpy(surf_coords), min_pos, max_pos)
@@ -1381,12 +1610,16 @@ def main():
                     batch_stop = min(batch_start + view_batch_size, views_per_mode)
                     batch_indices = idx_list[batch_start:batch_stop]
                     geo_view_tensors = [full_surf_query_norm[torch.from_numpy(idx)] for idx in batch_indices]
-                    geo_density_tensors = [
-                        full_geo_log_density.index_select(0, torch.from_numpy(idx).to(dtype=torch.long))
-                        for idx in batch_indices
-                    ]
                     geo_views_norm = torch.stack(geo_view_tensors, dim=0)
-                    geo_density_views = torch.stack(geo_density_tensors, dim=0)
+                    if model_uses_density(model_name):
+                        density_source = model_full_geo_log_density_by_name[model_name]
+                        geo_density_tensors = [
+                            density_source.index_select(0, torch.from_numpy(idx).to(dtype=torch.long))
+                            for idx in batch_indices
+                        ]
+                        geo_density_views = torch.stack(geo_density_tensors, dim=0)
+                    else:
+                        geo_density_views = None
 
                     pred_surf_batch, pred_vol_batch = predict_view_batch(
                         model_name=model_name,
@@ -1394,7 +1627,7 @@ def main():
                         geo_views_norm=geo_views_norm,
                         surf_query_norm=surf_query_norm,
                         vol_query_norm=vol_query_norm,
-                        geo_log_density_views=geo_density_views if model_uses_density(model_name) else None,
+                        geo_log_density_views=geo_density_views,
                         mean_s=mean_s,
                         std_s=std_s,
                         mean_v=mean_v,
@@ -1406,6 +1639,12 @@ def main():
 
                     for local_idx, global_view_idx in enumerate(range(batch_start, batch_stop)):
                         metrics = compute_metrics(surf_gt, pred_surf_batch[local_idx], vol_gt, pred_vol_batch[local_idx])
+                        surf_drag_force_gt = compute_surface_drag_force_x(surf_gt, surf_area)
+                        surf_drag_force_pred = compute_surface_drag_force_x(pred_surf_batch[local_idx], surf_area)
+                        metrics["surface_drag_force_x_rel_l2"] = rel_l2(
+                            np.array([surf_drag_force_gt], dtype=np.float64),
+                            np.array([surf_drag_force_pred], dtype=np.float64),
+                        )
                         density_stats = subset_density_stats[global_view_idx]
                         per_view_rows.append(
                             {
@@ -1421,12 +1660,16 @@ def main():
                                 "surface_query_points": model_surface_query_points,
                                 "volume_query_points": model_volume_query_points,
                                 "full_log_density_mean": float(np.mean(full_geo_log_density_np)),
+                                "surface_drag_force_x_gt": float(surf_drag_force_gt),
+                                "surface_drag_force_x_pred": float(surf_drag_force_pred),
                                 **density_stats,
                                 **metrics,
                             }
                         )
 
-                    del geo_views_norm, geo_density_views, pred_surf_batch, pred_vol_batch
+                    del geo_views_norm, pred_surf_batch, pred_vol_batch
+                    if geo_density_views is not None:
+                        del geo_density_views
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
                 model = model.to("cpu")
@@ -1447,6 +1690,8 @@ def main():
         "surface_query_points",
         "volume_query_points",
         "full_log_density_mean",
+        "surface_drag_force_x_gt",
+        "surface_drag_force_x_pred",
         "subset_log_density_mean",
         "subset_log_density_std",
         "subset_log_density_p05",
@@ -1652,6 +1897,32 @@ def main():
                     ),
                 ),
                 (
+                    plot_numeric_mode_curve_with_band,
+                    (
+                        family_aggregate_rows,
+                        "surface_drag_force_x_rel_l2",
+                        out_root / f"{family_key}_surface_drag_force_x_beta_curve.png",
+                        f"{family_title}: inverse-density beta severity curve (surface drag force x)",
+                        family_models,
+                        beta_mode_order,
+                        beta_mode_xs,
+                        "Inverse-density beta",
+                    ),
+                ),
+                (
+                    plot_numeric_mode_curve_with_band,
+                    (
+                        family_aggregate_rows,
+                        "surface_drag_force_x_rel_l2",
+                        out_root / f"{family_key}_surface_drag_force_x_sine_y_curve.png",
+                        f"{family_title}: sinusoidal-y severity curve (surface drag force x)",
+                        family_models,
+                        sine_mode_order,
+                        sine_mode_xs,
+                        "Sinusoidal-y intensity",
+                    ),
+                ),
+                (
                     plot_delta_bars,
                     (
                         family_run_delta_rows,
@@ -1702,7 +1973,7 @@ def main():
     audi_surf_query_norm = normalize_pos(torch.from_numpy(rep_surf_coords_full), min_pos, max_pos)
     rep_dummy_vol_query_norm = normalize_pos(torch.from_numpy(rep_vol_coords[:1]), min_pos, max_pos).unsqueeze(0)
     rep_input_geo_norm = normalize_pos(torch.from_numpy(rep_input_surf_coords), min_pos, max_pos)
-    rep_full_geo_log_density = estimate_log_sampling_density(
+    rep_sampling_geo_log_density = estimate_log_sampling_density(
         rep_input_geo_norm.unsqueeze(0),
         knn_k=dataset.geometry_density_knn_k,
         neighbor_hops=dataset.geometry_density_neighbor_hops,
@@ -1730,14 +2001,28 @@ def main():
             rep_rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(vtk_run_id), 99991, MODEL_ORDER.index(model_name)]))
             rep_idx = sample_uniform_without_replacement(rep_input_surf_coords.shape[0], model_input_points, rep_rng)
             rep_geo_view_norm = rep_input_geo_norm[torch.from_numpy(rep_idx)].unsqueeze(0)
-            rep_geo_density_view = rep_full_geo_log_density.index_select(0, torch.from_numpy(rep_idx).to(dtype=torch.long)).unsqueeze(0)
+            if model_uses_density(model_name):
+                model_density_estimator, model_density_knn_k, model_density_neighbor_hops, _ = resolve_model_internal_density_spec(
+                    model_name,
+                    model_specs[model_name]["config"],
+                    model_specs[model_name]["checkpoint"],
+                )
+                rep_model_full_geo_log_density = estimate_log_sampling_density(
+                    rep_input_geo_norm.unsqueeze(0),
+                    knn_k=model_density_knn_k,
+                    neighbor_hops=model_density_neighbor_hops,
+                    estimator=model_density_estimator,
+                ).squeeze(0).cpu()
+                rep_geo_density_view = rep_model_full_geo_log_density.index_select(0, torch.from_numpy(rep_idx).to(dtype=torch.long)).unsqueeze(0)
+            else:
+                rep_geo_density_view = None
             pred_pressure = predict_audi_surface_pressure(
                 model_name=model_name,
                 model=model,
                 geo_view_norm=rep_geo_view_norm,
                 surf_query_norm=audi_surf_query_norm,
                 dummy_vol_query_norm=rep_dummy_vol_query_norm,
-                geo_log_density_view=rep_geo_density_view if model_uses_density(model_name) else None,
+                geo_log_density_view=rep_geo_density_view,
                 mean_s=mean_s,
                 std_s=std_s,
                 device=device,
@@ -1793,15 +2078,14 @@ def main():
         write_polydata_vtk(sample_vtk_path, sampled_points, {})
         sampling_vtk_paths.append(str(sample_vtk_path))
         sample_hist_path = out_root / (
-            f"drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_ood_sine_y_mix_{float(mix_fraction):.2f}_density_hist.png"
+            f"drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_ood_sine_y_mix_{float(mix_fraction):.2f}_y_hist.png"
         )
-        save_density_histogram(
+        save_sampling_y_histogram(
             sample_hist_path,
-            sampling_full_geo_log_density_np[sample_idx],
-            title=(
-                f"Run {vtk_run_id} sampled input density histogram "
-                f"(OOD sine-y mix={float(mix_fraction):.2f}, points={sampling_budget})"
-            ),
+            sampled_points,
+            sampling_input_surf_coords,
+            float(mix_fraction),
+            title=f"Run {vtk_run_id} sampled y distribution (OOD sine-y mix={float(mix_fraction):.2f}, points={sampling_budget})",
         )
         sampling_histogram_paths.append(str(sample_hist_path))
 
@@ -1828,6 +2112,12 @@ def main():
             "model_repeats": int(args.model_repeats),
             "top_level_alignment_note": "Aligned mode matches each model's training-time view sampling rule best: uniform without replacement at that model's own encoder input budget.",
             "model_internal_note": "Each model keeps its own internal encoder-block subsampling exactly as implemented in that checkpointed architecture.",
+            "sampling_density_study_spec": {
+                "estimator": density_estimator,
+                "knn_k": density_knn_k,
+                "neighbor_hops": density_neighbor_hops,
+            },
+            "model_internal_density_specs": model_internal_density_specs,
             "representative_vtk_surface_query_source": str(vtk_surface_query_dir),
             "representative_vtk_encoder_input_source": "external surface_coords.npy from the selected Audi VTK query directory, sampled with each model's own aligned encoder input budget",
             "representative_vtk_dummy_volume_query_source": f"first point from DrivAerML run {vtk_run_id} fixed volume-query subset; used only if a model cannot execute an empty-volume surface-only export path",
@@ -1859,6 +2149,7 @@ def main():
         "- If a model was trained with smaller query budgets than this evaluation uses, the script reports that mismatch explicitly in the console and `results.json`.",
         "- The aligned mode uses `uniform_wor` because the training-time top-level view rule is uniform without replacement, and this evaluation preserves each model's own encoder input budget unless you explicitly override `--input-points`.",
         f"- Beta-shift modes use inverse-density sampling without replacement at betas `{shift_betas}` and keep the same point budget.",
+        f"- Sampling shifts are computed with the requested CLI density estimator `{density_estimator}`, but density-aware models receive density tensors from their own training config when available.",
         "- Additional out-of-distribution modes use a controlled mixture of uniform sampling and sinusoidal point-selection probabilities along the `y` direction only, sampled without replacement at the same point budget.",
         "- The sinusoidal-y intensity runs from `0.0` to `0.5` and uses the same number of severity steps as `--shift-betas`.",
         "- For an OOD sine mixture severity `s`, the sampler takes exactly `round(s * K)` points from the sinusoidal-weighted rule and the remaining points uniformly from the leftover pool, so the severity has an exact point-count interpretation rather than only a probability interpretation.",
@@ -1866,6 +2157,7 @@ def main():
         "- Internal model behavior is not overridden beyond safe batched-query chunking. In particular, each model keeps its own trained latent-anchor logic and encoder-block 16k subsampling behavior.",
         "- In-family fairness is strongest when all compared checkpoints in that family were trained with the same encoder input budget and the evaluation uses that same budget.",
         "- Cross-family fairness is weaker when families were trained with different encoder input budgets; the script records those mismatches explicitly in `results.json`.",
+        "- Surface-integral drag is computed as the signed x-force `∫(-p n_x + τ_x) dA` using the stored `surface_areas.npy` weights on the fixed benchmark surface query subset.",
         f"- Views per run/mode: `{views_per_mode}`",
         f"- Repeated stochastic forwards per view batch: `{int(args.model_repeats)}`",
         "",
@@ -1877,7 +2169,8 @@ def main():
         "- If a model still cannot complete the full-Audi visualization export safely, it is skipped only for this VTK step and recorded in the results payload.",
         f"- Surface-query directory for the Audi pressure-field export: `{vtk_surface_query_dir}`",
         f"- Separate point-cloud VTKs are exported from DrivAerML test run `{vtk_run_id}` for the inverse-density beta modes and for the OOD sine-y mixture severities, using the largest active encoder budget `{sampling_budget}` so you can directly inspect one representative input cloud.",
-        "- Each sampled-point VTK also gets a separate PNG histogram of the sampled density distribution, with a log-count y-axis.",
+        "- Each inverse-density beta sampled-point VTK also gets a separate PNG histogram of the sampled density distribution, with a log-count y-axis and no percentile trimming.",
+        "- Each OOD sine-y mixture sampled-point VTK gets a y-coordinate distribution histogram that shows the sampled points, the full candidate-point y distribution, and the target sinusoidal mixture curve.",
         "",
         "## Aggregation",
         "- First aggregate multiple independently sampled views within each `(run, model, mode)` tuple.",
@@ -1901,11 +2194,12 @@ def main():
             "- `per_run_mode_metrics.csv`: per-run averages across views with standard deviations.",
             "- `aggregate_metrics.csv`: across-run means/stds for every model and sampling mode.",
             "- `robustness_summary.csv`: strongest-shift robustness summary.",
-            "- `audi_surface_pressure_predictions.vtk`: full Audi surface pressure ground truth plus selected model pressure predictions.",
-            "- `results.json`: machine-readable summary including any representative-VTK model skips.",
-            f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_*.vtk`: sampled `{sampling_budget}` input points for each inverse-density beta from one evaluated DrivAerML test run.",
-            f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_*_density_hist.png`: density-distribution histogram for each sampled input-point VTK.",
-        ]
+        "- `audi_surface_pressure_predictions.vtk`: full Audi surface pressure ground truth plus selected model pressure predictions.",
+        "- `results.json`: machine-readable summary including any representative-VTK model skips.",
+        f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_*.vtk`: sampled `{sampling_budget}` input points for each inverse-density beta from one evaluated DrivAerML test run.",
+        f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_*_density_hist.png`: density-distribution histogram for each sampled input-point VTK.",
+        f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_ood_sine_y_mix_*_y_hist.png`: y-coordinate distribution histogram for each OOD sine-y sampled input-point VTK.",
+    ]
     )
     (out_root / "workflow.md").write_text("\n".join(workflow_lines), encoding="utf-8")
 

@@ -49,9 +49,9 @@ experiment:
   prefetch_factor: 4
   pin_memory: True
   geometry_density_cache_dtype: "float16"
-  density_knn_k: 24
+  density_knn_k: 16
   density_neighbor_hops: 1
-  density_estimator: "tangent_cov"
+  density_estimator: "kde"
   geometry_epoch_seeded_sampling: False
   num_body_points: 0
   num_surface_points: 65536

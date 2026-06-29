@@ -95,6 +95,7 @@ MODEL_ORDER = [
     "SMART_SAT",
     "SMART_SATLOSS3",
     "SMART_SATLOSS4",
+    "SMART_SATLOSS5",
     "TRANSOLVERPP",
     "TRANSOLVERPP_SAT",
     "TRANSOLVERPP_SATLOSS3",
@@ -110,6 +111,7 @@ MODEL_LABELS = {
     "SMART_SAT": "SMART-SAT",
     "SMART_SATLOSS3": "SMART-SATLOSS3",
     "SMART_SATLOSS4": "SMART-SATLOSS4",
+    "SMART_SATLOSS5": "SMART-SATLOSS5",
     "TRANSOLVERPP": "TransolverPP",
     "TRANSOLVERPP_SAT": "TransolverPP-SAT",
     "TRANSOLVERPP_SATLOSS3": "TransolverPP-SATLOSS3",
@@ -125,6 +127,7 @@ MODEL_COLORS = {
     "SMART_SAT": "#4C78A8",
     "SMART_SATLOSS3": "#F58518",
     "SMART_SATLOSS4": "#72B7B2",
+    "SMART_SATLOSS5": "#E45756",
     "TRANSOLVERPP": "#6C6F7D",
     "TRANSOLVERPP_SAT": "#54A24B",
     "TRANSOLVERPP_SATLOSS3": "#E45756",
@@ -137,7 +140,7 @@ MODEL_COLORS = {
 }
 FAMILY_GROUPS = OrderedDict(
     [
-        ("smart_family", ["SMART", "SMART_SAT", "SMART_SATLOSS3", "SMART_SATLOSS4"]),
+        ("smart_family", ["SMART", "SMART_SAT", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5"]),
         ("transolverpp_family", ["TRANSOLVERPP", "TRANSOLVERPP_SAT", "TRANSOLVERPP_SATLOSS3"]),
         ("ginot_family", ["GINOT", "GINOT_SATLOSS3"]),
         ("abupt_family", ["ABUPT", "ABUPT_SATLOSS3"]),
@@ -145,7 +148,7 @@ FAMILY_GROUPS = OrderedDict(
     ]
 )
 FAMILY_TITLES = {
-    "smart_family": "SMART vs SMART-SAT vs SMART-SATLOSS3 vs SMART-SATLOSS4",
+    "smart_family": "SMART vs SMART-SAT vs SMART-SATLOSS3 vs SMART-SATLOSS4 vs SMART-SATLOSS5",
     "transolverpp_family": "TransolverPP vs TransolverPP-SAT vs TransolverPP-SATLOSS3",
     "ginot_family": "GINOT vs GINOT-SATLOSS3",
     "abupt_family": "ABUPT vs ABUPT-SATLOSS3",
@@ -156,6 +159,7 @@ VTK_PRESSURE_MODELS = [
     "SMART_SAT",
     "SMART_SATLOSS3",
     "SMART_SATLOSS4",
+    "SMART_SATLOSS5",
     "TRANSOLVERPP",
     "TRANSOLVERPP_SATLOSS3",
     "GINOT",
@@ -171,6 +175,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smart-sat-config", default="drivaerml_sat")
     p.add_argument("--smart-satloss3-config", default="drivaerml_satloss3")
     p.add_argument("--smart-satloss4-config", default="drivaerml_satloss4")
+    p.add_argument("--smart-satloss5-config", default="drivaerml_satloss5")
     p.add_argument("--transolverpp-config", default="drivaerml_transolverpp")
     p.add_argument("--transolverpp-sat-config", default="drivaerml_transolverpp_sat")
     p.add_argument("--transolverpp-satloss3-config", default="drivaerml_transolverpp_satloss3")
@@ -184,6 +189,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smart-sat-checkpoint", default=None)
     p.add_argument("--smart-satloss3-checkpoint", default=None)
     p.add_argument("--smart-satloss4-checkpoint", default=None)
+    p.add_argument("--smart-satloss5-checkpoint", default=None)
     p.add_argument("--transolverpp-checkpoint", default=None)
     p.add_argument("--transolverpp-sat-checkpoint", default=None)
     p.add_argument("--transolverpp-satloss3-checkpoint", default=None)
@@ -259,6 +265,7 @@ def choose_ckpt(config, explicit: str | None) -> str:
         "SMART_SAT": "smart-sat-",
         "SMART_SATLOSS3": "smart-satloss3-",
         "SMART_SATLOSS4": "smart-satloss4-",
+        "SMART_SATLOSS5": "smart-satloss5-",
         "TRANSOLVERPP": "transolverpp-",
         "TRANSOLVERPP_SAT": "transolverpp-sat-",
         "TRANSOLVERPP_SATLOSS3": "transolverpp-satloss3-",
@@ -309,7 +316,7 @@ def build_model(config, ckpt_path: str, device: torch.device, batched_query_subr
         "volume_channels": len(VOLUME_FIELDS),
         "parameter_channels": 0,
     }
-    if model_name in {"SMART", "SMART_SATLOSS3", "SMART_SATLOSS4"}:
+    if model_name in {"SMART", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5"}:
         model = SMART(**base_kwargs, **arch)
     elif model_name == "SMART_SAT":
         model = SMARTSAT(**base_kwargs, **arch)
@@ -375,6 +382,58 @@ def sample_inverse_density_without_replacement(
     weights = np.clip(weights, 1e-24, None)
     probs = weights / np.clip(weights.sum(), 1e-24, None)
     return rng.choice(n, size=k, replace=False, p=probs).astype(np.int64, copy=False)
+
+
+def sample_weighted_without_replacement(
+    weights: np.ndarray,
+    k: int,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    n = int(weights.shape[0])
+    if k <= 0 or k >= n:
+        return np.arange(n, dtype=np.int64)
+    clipped = np.clip(np.asarray(weights, dtype=np.float64), 1e-24, None)
+    probs = clipped / np.clip(clipped.sum(), 1e-24, None)
+    return rng.choice(n, size=k, replace=False, p=probs).astype(np.int64, copy=False)
+
+
+def sinusoidal_axis_probabilities(coords_xyz: np.ndarray, axis: int) -> np.ndarray:
+    coord = np.asarray(coords_xyz[:, axis], dtype=np.float64)
+    cmin = float(np.min(coord))
+    cmax = float(np.max(coord))
+    span = max(cmax - cmin, 1e-12)
+    t = np.clip((coord - cmin) / span, 0.0, 1.0)
+    # One sinusoidal hump across the full axis extent: low at the ends, high in the middle.
+    scores = np.sin(np.pi * t) ** 2
+    return np.clip(scores + 1e-6, 1e-6, None)
+
+
+def sample_uniform_weighted_mixture_without_replacement(
+    target_weights: np.ndarray,
+    k: int,
+    mix_fraction: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    n = int(target_weights.shape[0])
+    if k <= 0 or k >= n:
+        return np.arange(n, dtype=np.int64)
+    alpha = float(np.clip(mix_fraction, 0.0, 1.0))
+    k_weighted = int(round(alpha * k))
+    k_weighted = min(max(k_weighted, 0), k)
+    k_uniform = k - k_weighted
+
+    if k_weighted == 0:
+        return sample_uniform_without_replacement(n, k, rng)
+    if k_uniform == 0:
+        return sample_weighted_without_replacement(target_weights, k, rng)
+
+    weighted_idx = sample_weighted_without_replacement(target_weights, k_weighted, rng)
+    chosen_mask = np.zeros((n,), dtype=bool)
+    chosen_mask[weighted_idx] = True
+    remaining_idx = np.flatnonzero(~chosen_mask)
+    uniform_take = rng.choice(remaining_idx, size=k_uniform, replace=False).astype(np.int64, copy=False)
+    out = np.concatenate([weighted_idx, uniform_take], axis=0).astype(np.int64, copy=False)
+    return out
 
 
 def vector_mag(arr: np.ndarray, start: int, end: int) -> np.ndarray:
@@ -643,7 +702,7 @@ def predict_audi_surface_pressure(
         return pred_surf
 
     def _build_surface_decoder():
-        if model_name in {"SMART", "SMART_SATLOSS3", "SMART_SATLOSS4"}:
+        if model_name in {"SMART", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5"}:
             intermediate_latent_geometries, latent_geo_pos = model.encode(geo_b, None)
 
             def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
@@ -794,6 +853,24 @@ def parse_shift_betas(text: str) -> List[float]:
     return betas
 
 
+def sine_mix_levels_from_shift_betas(shift_betas: Sequence[float]) -> List[float]:
+    n = max(len(shift_betas), 1)
+    return [float(x) for x in np.linspace(0.0, 0.5, num=n, dtype=np.float64)]
+
+
+def mode_display_name(mode_name: str) -> str:
+    if mode_name == "aligned_uniform_wor":
+        return "aligned uniform"
+    beta_match = re.search(r"beta_([0-9]+\.[0-9]+)", mode_name)
+    if beta_match:
+        return f"inv-density beta={float(beta_match.group(1)):.2f}"
+    sine_match = re.search(r"ood_sine_y_mix_([0-9]+\.[0-9]+)", mode_name)
+    if sine_match:
+        frac = float(sine_match.group(1))
+        return f"OOD sine-y mix={frac:.2f}"
+    return mode_name
+
+
 def mode_rows(rows: List[Dict[str, object]], model_name: str, sampling_mode: str) -> List[Dict[str, object]]:
     return [r for r in rows if r["model_name"] == model_name and r["sampling_mode"] == sampling_mode]
 
@@ -851,6 +928,11 @@ def mode_color(mode_name: str) -> str:
             1.00: "#E45756",
         }
         return palette.get(round(beta, 2), "#999999")
+    sine_match = re.search(r"ood_sine_y_mix_([0-9]+\.[0-9]+)", mode_name)
+    if sine_match:
+        frac = float(sine_match.group(1))
+        norm = min(max(frac / 0.5, 0.0), 1.0)
+        return matplotlib.colors.to_hex(plt.cm.YlOrBr(norm))
     return "#999999"
 
 
@@ -876,7 +958,7 @@ def _grouped_bar_on_axis(ax, rows: List[Dict[str, object]], metric_key: str, mod
             yerr=err,
             capsize=4,
             color=mode_color(mode_name),
-            label=mode_name,
+            label=mode_display_name(mode_name),
             alpha=0.88,
         )
     ax.set_xticks(x)
@@ -909,18 +991,31 @@ def plot_metric_grid(
     plt.close(fig)
 
 
-def plot_shift_curve_with_band(aggregate_rows: List[Dict[str, object]], metric_key: str, out_path: Path, title: str, model_order: Sequence[str]) -> None:
+def plot_numeric_mode_curve_with_band(
+    aggregate_rows: List[Dict[str, object]],
+    metric_key: str,
+    out_path: Path,
+    title: str,
+    model_order: Sequence[str],
+    mode_order: Sequence[str],
+    x_values: Sequence[float],
+    x_label: str,
+) -> None:
     fig, ax = plt.subplots(figsize=(8.8, 5.8), constrained_layout=True)
+    xs = np.asarray(x_values, dtype=np.float64)
     for model_name in model_order:
-        model_rows = [r for r in aggregate_rows if r["model_name"] == model_name]
-        model_rows = sorted(model_rows, key=lambda r: float(r["shift_beta"]))
-        xs = np.array([float(r["shift_beta"]) for r in model_rows], dtype=np.float64)
-        ys = np.array([float(r[metric_key]) for r in model_rows], dtype=np.float64)
-        yerr = np.array([float(r[f"{metric_key}_std"]) for r in model_rows], dtype=np.float64)
+        row_map = {
+            str(r["sampling_mode"]): r
+            for r in aggregate_rows
+            if r["model_name"] == model_name
+        }
+        ys = np.array([float(row_map[mode_name][metric_key]) for mode_name in mode_order], dtype=np.float64)
+        yerr = np.array([float(row_map[mode_name][f"{metric_key}_std"]) for mode_name in mode_order], dtype=np.float64)
         color = MODEL_COLORS[model_name]
         ax.plot(xs, ys, marker="o", linewidth=2, color=color, label=MODEL_LABELS[model_name])
         ax.fill_between(xs, ys - yerr, ys + yerr, color=color, alpha=0.18)
-    ax.set_xlabel("Shift severity beta")
+    ax.set_xticks(xs)
+    ax.set_xlabel(x_label)
     ax.set_ylabel(_metric_display_name(metric_key))
     ax.set_title(title)
     ax.legend()
@@ -962,7 +1057,7 @@ def plot_density_shift_bars(per_view_rows: List[Dict[str, object]], out_path: Pa
     fig, ax = plt.subplots(figsize=(9.2, 5.4), constrained_layout=True)
     ax.bar(np.arange(len(mode_order)), means, yerr=stds, capsize=4, color=[mode_color(m) for m in mode_order], alpha=0.88)
     ax.set_xticks(np.arange(len(mode_order)))
-    ax.set_xticklabels(mode_order, rotation=15)
+    ax.set_xticklabels([mode_display_name(mode_name) for mode_name in mode_order], rotation=20, ha="right")
     ax.set_ylabel("subset_log_density_mean")
     ax.set_title(title)
     fig.savefig(out_path, dpi=220)
@@ -1003,6 +1098,7 @@ def main():
             ("SMART_SAT", args.smart_sat_config),
             ("SMART_SATLOSS3", args.smart_satloss3_config),
             ("SMART_SATLOSS4", args.smart_satloss4_config),
+            ("SMART_SATLOSS5", args.smart_satloss5_config),
             ("TRANSOLVERPP", args.transolverpp_config),
             ("TRANSOLVERPP_SAT", args.transolverpp_sat_config),
             ("TRANSOLVERPP_SATLOSS3", args.transolverpp_satloss3_config),
@@ -1022,6 +1118,7 @@ def main():
     smart_cfg = configs["SMART"]
 
     shift_betas = parse_shift_betas(args.shift_betas)
+    sine_mix_levels = sine_mix_levels_from_shift_betas(shift_betas)
     mode_defs = OrderedDict()
     mode_defs["aligned_uniform_wor"] = {
         "kind": "uniform_wor",
@@ -1036,12 +1133,26 @@ def main():
             "description": f"Inverse-density without replacement, same point budget with beta={beta:.2f}.",
             "id": i,
         }
+    next_mode_id = len(mode_defs)
+    for mix_idx, mix_fraction in enumerate(sine_mix_levels):
+        mode_defs[f"ood_sine_y_mix_{mix_fraction:.2f}"] = {
+            "kind": "sinusoidal_axis_mixture_wor",
+            "beta": math.nan,
+            "axis": 1,
+            "mix_fraction": float(mix_fraction),
+            "description": (
+                f"OOD sine-y mixture without replacement: "
+                f"{mix_fraction:.2f} sinusoidal-weighted sampling + {1.0 - float(mix_fraction):.2f} uniform sampling, same point budget."
+            ),
+            "id": next_mode_id + mix_idx,
+        }
 
     checkpoint_arg_map = {
         "SMART": args.smart_checkpoint,
         "SMART_SAT": args.smart_sat_checkpoint,
         "SMART_SATLOSS3": args.smart_satloss3_checkpoint,
         "SMART_SATLOSS4": args.smart_satloss4_checkpoint,
+        "SMART_SATLOSS5": args.smart_satloss5_checkpoint,
         "TRANSOLVERPP": args.transolverpp_checkpoint,
         "TRANSOLVERPP_SAT": args.transolverpp_sat_checkpoint,
         "TRANSOLVERPP_SATLOSS3": args.transolverpp_satloss3_checkpoint,
@@ -1222,6 +1333,7 @@ def main():
 
         full_geo_log_density = dataset._load_or_compute_full_geometry_density(run_id, expected_n=int(surf_coords_full.shape[0]))
         full_geo_log_density_np = full_geo_log_density.to(dtype=torch.float32).numpy()
+        sine_y_weights = sinusoidal_axis_probabilities(surf_coords_full, axis=1)
 
         for mode_name, mode_info in mode_defs.items():
             for model_name, model in models.items():
@@ -1234,8 +1346,17 @@ def main():
                     rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(run_id), int(mode_info["id"]), int(view_idx)]))
                     if mode_info["kind"] == "uniform_wor":
                         idx = sample_uniform_without_replacement(surf_coords_full.shape[0], model_input_points, rng)
-                    else:
+                    elif mode_info["kind"] == "inverse_density_wor":
                         idx = sample_inverse_density_without_replacement(full_geo_log_density_np, model_input_points, float(mode_info["beta"]), rng)
+                    elif mode_info["kind"] == "sinusoidal_axis_mixture_wor":
+                        idx = sample_uniform_weighted_mixture_without_replacement(
+                            sine_y_weights,
+                            model_input_points,
+                            float(mode_info["mix_fraction"]),
+                            rng,
+                        )
+                    else:
+                        raise ValueError(f"Unsupported sampling kind: {mode_info['kind']}")
                     idx_list.append(idx)
                     subset = full_geo_log_density_np[idx]
                     subset_density_stats.append(
@@ -1294,6 +1415,7 @@ def main():
                                 "sampling_mode": mode_name,
                                 "sampling_kind": mode_info["kind"],
                                 "shift_beta": float(mode_info["beta"]),
+                                "sampling_mode_id": int(mode_info["id"]),
                                 "checkpoint": model_specs[model_name]["checkpoint"],
                                 "input_points": int(batch_indices[local_idx].shape[0]),
                                 "surface_query_points": model_surface_query_points,
@@ -1319,6 +1441,7 @@ def main():
         "sampling_mode",
         "sampling_kind",
         "shift_beta",
+        "sampling_mode_id",
         "checkpoint",
         "input_points",
         "surface_query_points",
@@ -1334,31 +1457,36 @@ def main():
     metric_keys = per_view_metric_keys + ["subset_log_density_mean", "subset_log_density_std"]
     per_run_mode_rows = aggregate_rows_by_keys(
         per_view_rows,
-        ["run_id", "model_name", "sampling_mode", "sampling_kind", "shift_beta"],
+        ["run_id", "model_name", "sampling_mode", "sampling_kind", "sampling_mode_id"],
         metric_keys,
     )
-    per_run_mode_rows.sort(key=lambda x: (x["run_id"], MODEL_ORDER.index(x["model_name"]), x["shift_beta"]))
+    for row in per_run_mode_rows:
+        row["shift_beta"] = float(mode_defs[str(row["sampling_mode"])]["beta"])
+    per_run_mode_rows.sort(key=lambda x: (x["run_id"], MODEL_ORDER.index(x["model_name"]), int(x["sampling_mode_id"])))
     write_csv(
         out_root / "per_run_mode_metrics.csv",
         per_run_mode_rows,
-        ["run_id", "model_name", "sampling_mode", "sampling_kind", "shift_beta", "num_records"]
+        ["run_id", "model_name", "sampling_mode", "sampling_kind", "shift_beta", "sampling_mode_id", "num_records"]
         + [item for k in metric_keys for item in (k, f"{k}_std")],
     )
 
     aggregate_rows = aggregate_rows_by_keys(
         per_run_mode_rows,
-        ["model_name", "sampling_mode", "sampling_kind", "shift_beta"],
+        ["model_name", "sampling_mode", "sampling_kind", "sampling_mode_id"],
         metric_keys,
     )
-    aggregate_rows.sort(key=lambda x: (MODEL_ORDER.index(x["model_name"]), float(x["shift_beta"])))
+    for row in aggregate_rows:
+        row["shift_beta"] = float(mode_defs[str(row["sampling_mode"])]["beta"])
+    aggregate_rows.sort(key=lambda x: (MODEL_ORDER.index(x["model_name"]), int(x["sampling_mode_id"])))
     write_csv(
         out_root / "aggregate_metrics.csv",
         aggregate_rows,
-        ["model_name", "sampling_mode", "sampling_kind", "shift_beta", "num_records"]
+        ["model_name", "sampling_mode", "sampling_kind", "shift_beta", "sampling_mode_id", "num_records"]
         + [item for k in metric_keys for item in (k, f"{k}_std")],
     )
 
-    strongest_mode = max(mode_defs.items(), key=lambda kv: float(kv[1]["beta"]))[0]
+    beta_shift_mode_names = [mode_name for mode_name, mode_info in mode_defs.items() if mode_info["kind"] == "inverse_density_wor"]
+    strongest_mode = max(beta_shift_mode_names, key=lambda mode_name: float(mode_defs[mode_name]["beta"]))
     strongest_beta = float(mode_defs[strongest_mode]["beta"])
     run_delta_rows: List[Dict[str, object]] = []
     robustness_rows: List[Dict[str, object]] = []
@@ -1416,6 +1544,10 @@ def main():
     write_csv(out_root / "robustness_summary.csv", robustness_rows, robustness_fieldnames)
 
     mode_order = list(mode_defs.keys())
+    beta_mode_order = [mode_name for mode_name, mode_info in mode_defs.items() if mode_info["kind"] == "inverse_density_wor"]
+    beta_mode_xs = [float(mode_defs[mode_name]["beta"]) for mode_name in beta_mode_order]
+    sine_mode_order = [mode_name for mode_name, mode_info in mode_defs.items() if mode_info["kind"] == "sinusoidal_axis_mixture_wor"]
+    sine_mode_xs = [float(mode_defs[mode_name]["mix_fraction"]) for mode_name in sine_mode_order]
     plot_jobs = [
         (plot_density_shift_bars, (per_view_rows, out_root / "density_shift_validation.png", "Subset density-shift validation")),
         (plot_delta_bars, (run_delta_rows, "combined_physics_delta", out_root / "combined_physics_degradation_bars_all_models.png", f"Per-run degradation under strongest shift ({strongest_mode})")),
@@ -1425,7 +1557,7 @@ def main():
         family_models = [m for m in family_models if m in model_specs]
         if not family_models:
             continue
-        family_title = FAMILY_TITLES[family_key]
+        family_title = " vs ".join(MODEL_LABELS[m] for m in family_models)
         family_per_run_mode_rows = [r for r in per_run_mode_rows if r["model_name"] in family_models]
         family_aggregate_rows = [r for r in aggregate_rows if r["model_name"] in family_models]
         family_run_delta_rows = [r for r in run_delta_rows if r["model_name"] in family_models]
@@ -1468,23 +1600,55 @@ def main():
                     ),
                 ),
                 (
-                    plot_shift_curve_with_band,
+                    plot_numeric_mode_curve_with_band,
                     (
                         family_aggregate_rows,
                         "combined_physics_rel_l2",
-                        out_root / f"{family_key}_combined_physics_shift_curve.png",
-                        f"{family_title}: sampling-shift severity curve (combined physics)",
+                        out_root / f"{family_key}_combined_physics_beta_curve.png",
+                        f"{family_title}: inverse-density beta severity curve (combined physics)",
                         family_models,
+                        beta_mode_order,
+                        beta_mode_xs,
+                        "Inverse-density beta",
                     ),
                 ),
                 (
-                    plot_shift_curve_with_band,
+                    plot_numeric_mode_curve_with_band,
                     (
                         family_aggregate_rows,
                         "combined_global_rel_l2",
-                        out_root / f"{family_key}_combined_global_shift_curve.png",
-                        f"{family_title}: sampling-shift severity curve (combined global)",
+                        out_root / f"{family_key}_combined_global_beta_curve.png",
+                        f"{family_title}: inverse-density beta severity curve (combined global)",
                         family_models,
+                        beta_mode_order,
+                        beta_mode_xs,
+                        "Inverse-density beta",
+                    ),
+                ),
+                (
+                    plot_numeric_mode_curve_with_band,
+                    (
+                        family_aggregate_rows,
+                        "combined_physics_rel_l2",
+                        out_root / f"{family_key}_combined_physics_sine_y_curve.png",
+                        f"{family_title}: sinusoidal-y severity curve (combined physics)",
+                        family_models,
+                        sine_mode_order,
+                        sine_mode_xs,
+                        "Sinusoidal-y intensity",
+                    ),
+                ),
+                (
+                    plot_numeric_mode_curve_with_band,
+                    (
+                        family_aggregate_rows,
+                        "combined_global_rel_l2",
+                        out_root / f"{family_key}_combined_global_sine_y_curve.png",
+                        f"{family_title}: sinusoidal-y severity curve (combined global)",
+                        family_models,
+                        sine_mode_order,
+                        sine_mode_xs,
+                        "Sinusoidal-y intensity",
                     ),
                 ),
                 (
@@ -1549,6 +1713,7 @@ def main():
     sampling_input_geo_norm = normalize_pos(torch.from_numpy(sampling_input_surf_coords), min_pos, max_pos)
     sampling_full_geo_log_density = dataset._load_or_compute_full_geometry_density(vtk_run_id, expected_n=int(sampling_input_surf_coords.shape[0]))
     sampling_full_geo_log_density_np = sampling_full_geo_log_density.to(dtype=torch.float32).numpy()
+    sampling_sine_y_weights = sinusoidal_axis_probabilities(sampling_input_surf_coords, axis=1)
 
     surface_point_data: Dict[str, np.ndarray] = {
         "gt_pressure": rep_surf_gt_full[:, 0],
@@ -1611,6 +1776,35 @@ def main():
         )
         sampling_histogram_paths.append(str(sample_hist_path))
 
+    for mix_fraction in sine_mix_levels:
+        sampling_rng = np.random.default_rng(
+            np.random.SeedSequence([args.seed, int(vtk_run_id), 88888, 1, int(round(float(mix_fraction) * 1000))])
+        )
+        sample_idx = sample_uniform_weighted_mixture_without_replacement(
+            sampling_sine_y_weights,
+            sampling_budget,
+            float(mix_fraction),
+            sampling_rng,
+        )
+        sampled_points = sampling_input_surf_coords[sample_idx]
+        sample_vtk_path = out_root / (
+            f"drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_ood_sine_y_mix_{float(mix_fraction):.2f}.vtk"
+        )
+        write_polydata_vtk(sample_vtk_path, sampled_points, {})
+        sampling_vtk_paths.append(str(sample_vtk_path))
+        sample_hist_path = out_root / (
+            f"drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_ood_sine_y_mix_{float(mix_fraction):.2f}_density_hist.png"
+        )
+        save_density_histogram(
+            sample_hist_path,
+            sampling_full_geo_log_density_np[sample_idx],
+            title=(
+                f"Run {vtk_run_id} sampled input density histogram "
+                f"(OOD sine-y mix={float(mix_fraction):.2f}, points={sampling_budget})"
+            ),
+        )
+        sampling_histogram_paths.append(str(sample_hist_path))
+
     payload = {
         "args": vars(args),
         "run_ids": run_ids,
@@ -1626,6 +1820,9 @@ def main():
             "per_model_encoder_input_budgets": per_model_input_budgets,
             "aligned_mode": "uniform_wor",
             "shift_modes": [name for name in mode_defs if name != "aligned_uniform_wor"],
+            "ood_modes": [name for name, info in mode_defs.items() if info["kind"] == "sinusoidal_axis_mixture_wor"],
+            "ood_sine_axis": "y",
+            "ood_sine_mix_levels": sine_mix_levels,
             "views_per_mode": views_per_mode,
             "view_batch_size": view_batch_size,
             "model_repeats": int(args.model_repeats),
@@ -1661,7 +1858,10 @@ def main():
         "- Encoder input point budget is train-aligned per model by default. That keeps each family on its own training budget instead of forcing all families to the smallest one.",
         "- If a model was trained with smaller query budgets than this evaluation uses, the script reports that mismatch explicitly in the console and `results.json`.",
         "- The aligned mode uses `uniform_wor` because the training-time top-level view rule is uniform without replacement, and this evaluation preserves each model's own encoder input budget unless you explicitly override `--input-points`.",
-        f"- Shifted modes use inverse-density sampling without replacement at betas `{shift_betas}` and keep the same point budget.",
+        f"- Beta-shift modes use inverse-density sampling without replacement at betas `{shift_betas}` and keep the same point budget.",
+        "- Additional out-of-distribution modes use a controlled mixture of uniform sampling and sinusoidal point-selection probabilities along the `y` direction only, sampled without replacement at the same point budget.",
+        "- The sinusoidal-y intensity runs from `0.0` to `0.5` and uses the same number of severity steps as `--shift-betas`.",
+        "- For an OOD sine mixture severity `s`, the sampler takes exactly `round(s * K)` points from the sinusoidal-weighted rule and the remaining points uniformly from the leftover pool, so the severity has an exact point-count interpretation rather than only a probability interpretation.",
         "- If `beta=0` is included in the shifted list, it acts as a uniform-without-replacement sanity-check mode and should match the aligned mode up to sampling randomness.",
         "- Internal model behavior is not overridden beyond safe batched-query chunking. In particular, each model keeps its own trained latent-anchor logic and encoder-block 16k subsampling behavior.",
         "- In-family fairness is strongest when all compared checkpoints in that family were trained with the same encoder input budget and the evaluation uses that same budget.",
@@ -1676,7 +1876,7 @@ def main():
         "- If a model cannot execute a true empty-volume surface-only export path, the script falls back to one fixed representative volume query point from the selected DrivAerML run. This affects only the Audi visualization export, not the benchmark metrics.",
         "- If a model still cannot complete the full-Audi visualization export safely, it is skipped only for this VTK step and recorded in the results payload.",
         f"- Surface-query directory for the Audi pressure-field export: `{vtk_surface_query_dir}`",
-        f"- Separate point-cloud VTKs are exported from DrivAerML test run `{vtk_run_id}` for inverse-density sampling betas `0, 0.25, 0.5, 0.75, 1.0` using the largest active encoder budget `{sampling_budget}` so you can directly inspect one representative input cloud.",
+        f"- Separate point-cloud VTKs are exported from DrivAerML test run `{vtk_run_id}` for the inverse-density beta modes and for the OOD sine-y mixture severities, using the largest active encoder budget `{sampling_budget}` so you can directly inspect one representative input cloud.",
         "- Each sampled-point VTK also gets a separate PNG histogram of the sampled density distribution, with a log-count y-axis.",
         "",
         "## Aggregation",
@@ -1719,6 +1919,7 @@ def main():
         f"- View batch size: `{view_batch_size}`",
         f"- Strongest shift mode: `{strongest_mode}`",
         f"- Shift betas: `{shift_betas}`",
+        f"- OOD sampling modes: progressive uniform-to-sinusoidal mixtures along `y` only, with severities `{sine_mix_levels}`",
         f"- Fixed benchmark query subsets per run: `{surface_query_points}` surface + `{volume_query_points}` volume",
         f"- ABUPT-family query override: `{int(args.abupt_surface_query_points) if int(args.abupt_surface_query_points) > 0 else surface_query_points}` surface + `{int(args.abupt_volume_query_points) if int(args.abupt_volume_query_points) > 0 else volume_query_points}` volume",
         f"- Representative VTK surface query source: `{vtk_surface_query_dir}`",

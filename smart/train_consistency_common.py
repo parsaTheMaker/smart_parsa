@@ -221,6 +221,7 @@ def load_full_training_state(
     load_scaler=True,
     gradnorm_balancer=None,
     gradnorm_optimizer=None,
+    uncertainty_balancer=None,
 ):
     if not checkpoint_path:
         raise ValueError("checkpoint_path must be provided for full-state resume.")
@@ -264,6 +265,15 @@ def load_full_training_state(
         if gradnorm_opt_state is None:
             raise KeyError(f"Checkpoint {checkpoint_path} is missing gradnorm_optimizer_state_dict required for full-state resume.")
         gradnorm_optimizer.load_state_dict(gradnorm_opt_state)
+    if uncertainty_balancer is not None:
+        uncertainty_state = checkpoint.get("task_weighting_state_dict")
+        if uncertainty_state is None:
+            uncertainty_state = checkpoint.get("uncertainty_balancer_state_dict")
+        if uncertainty_state is None:
+            raise KeyError(
+                f"Checkpoint {checkpoint_path} is missing task_weighting_state_dict required for full-state resume."
+            )
+        uncertainty_balancer.load_state_dict(uncertainty_state, strict=True)
 
     resumed_epoch = int(checkpoint.get("epoch", -1))
     start_epoch = resumed_epoch + 1
@@ -542,14 +552,94 @@ def consistency_warmup_factor(epoch, warmup_epochs):
     return min(1.0, float(epoch + 1) / float(warmup_epochs))
 
 
-def prediction_consistency_loss(y1_surf, y1_vol, y2_surf, y2_vol):
-    return F.mse_loss(y2_surf, y1_surf.detach()) + F.mse_loss(y2_vol, y1_vol.detach())
+def prediction_consistency_smooth_l1_loss(y1_surf, y1_vol, y2_surf, y2_vol, beta=0.05):
+    surf_target = (0.5 * (y1_surf.detach() + y2_surf.detach())).to(dtype=y1_surf.dtype)
+    vol_target = (0.5 * (y1_vol.detach() + y2_vol.detach())).to(dtype=y1_vol.dtype)
+    surf_loss = 0.5 * (
+        F.smooth_l1_loss(y1_surf, surf_target, beta=beta) + F.smooth_l1_loss(y2_surf, surf_target, beta=beta)
+    )
+    vol_loss = 0.5 * (
+        F.smooth_l1_loss(y1_vol, vol_target, beta=beta) + F.smooth_l1_loss(y2_vol, vol_target, beta=beta)
+    )
+    return surf_loss + vol_loss
+
+
+def soft_worst_case_loss(loss_a, loss_b, tau=0.1):
+    tau = max(float(tau), 1e-6)
+    pair = torch.stack([loss_a.float(), loss_b.float()], dim=0)
+    return torch.logsumexp(pair / tau, dim=0) * tau
 
 
 def latent_consistency_loss(latent_teacher, latent_student):
     latent_teacher = F.layer_norm(latent_teacher.detach().float(), (latent_teacher.shape[-1],))
     latent_student = F.layer_norm(latent_student.float(), (latent_student.shape[-1],))
     return F.mse_loss(latent_student, latent_teacher)
+
+
+class LearnedTaskWeighting(nn.Module):
+    def __init__(
+        self,
+        task_names,
+        init_logits=None,
+        min_logit=-4.0,
+        max_logit=4.0,
+        min_weights=None,
+        base_weights=None,
+        warmup_epochs=0,
+    ):
+        super().__init__()
+        self.task_names = tuple(task_names)
+        if init_logits is None:
+            init_logits = [0.0] * len(self.task_names)
+        if len(init_logits) != len(self.task_names):
+            raise ValueError(f"Expected {len(self.task_names)} init logits, got {len(init_logits)}.")
+        self.logits = nn.Parameter(torch.tensor(init_logits, dtype=torch.float32))
+        self.min_logit = float(min_logit)
+        self.max_logit = float(max_logit)
+        if min_weights is None:
+            min_weights = [0.0] * len(self.task_names)
+        if base_weights is None:
+            base_weights = [1.0 / len(self.task_names)] * len(self.task_names)
+        if len(min_weights) != len(self.task_names):
+            raise ValueError(f"Expected {len(self.task_names)} min weights, got {len(min_weights)}.")
+        if len(base_weights) != len(self.task_names):
+            raise ValueError(f"Expected {len(self.task_names)} base weights, got {len(base_weights)}.")
+        min_weights_t = torch.tensor(min_weights, dtype=torch.float32)
+        base_weights_t = torch.tensor(base_weights, dtype=torch.float32)
+        if torch.any(min_weights_t < 0):
+            raise ValueError("min_weights must be non-negative.")
+        if float(min_weights_t.sum().item()) >= 1.0:
+            raise ValueError("Sum of min_weights must be < 1.")
+        if torch.any(base_weights_t < 0):
+            raise ValueError("base_weights must be non-negative.")
+        if not torch.isclose(base_weights_t.sum(), torch.tensor(1.0, dtype=torch.float32), atol=1e-5):
+            raise ValueError("base_weights must sum to 1.")
+        self.register_buffer("min_weights", min_weights_t)
+        self.register_buffer("base_weights", base_weights_t)
+        self.warmup_epochs = int(warmup_epochs)
+
+    def combine(self, losses, epoch_idx=None):
+        if len(losses) != len(self.task_names):
+            raise ValueError(f"Expected {len(self.task_names)} task losses, got {len(losses)}.")
+        stacked_losses = torch.stack([loss.float() for loss in losses])
+        clamped_logits = torch.clamp(self.logits, min=self.min_logit, max=self.max_logit)
+        raw_weights = torch.softmax(clamped_logits, dim=0)
+        free_mass = 1.0 - self.min_weights.sum()
+        learned_weights = self.min_weights + free_mass * raw_weights
+        if self.warmup_epochs > 0 and epoch_idx is not None:
+            mix = min(1.0, float(epoch_idx + 1) / float(self.warmup_epochs))
+            weights = (1.0 - mix) * self.base_weights + mix * learned_weights
+        else:
+            weights = learned_weights
+        weighted_terms = weights * stacked_losses
+        total_loss = weighted_terms.sum()
+        return {
+            "total_loss": total_loss,
+            "weights": weights.detach(),
+            "raw_weights": raw_weights.detach(),
+            "logits": clamped_logits.detach(),
+            "per_task_terms": weighted_terms.detach(),
+        }
 
 
 def move_optional_tensor(x, device):
@@ -783,13 +873,18 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
     if run is not None and bool(getattr(config, "wandb_watch_model", False)):
         run.watch(model, log="all")
 
-    scaler = torch.amp.GradScaler("cuda")
-    optimizer, scheduler, loss_fn, rel_l2_loss_fn = get_optimizer_scheduler_loss(model, config, train_loader, loss_dim=1)
-    combined_loss_fn = CombinedLoss(loss_fn, fields) if use_surface_supervision else None
     use_gradnorm = bool(getattr(config, "use_gradnorm", False))
+    use_learned_task_weighting = bool(
+        getattr(config, "use_learned_task_weighting", getattr(config, "use_uncertainty_weighting", False))
+    )
+    if use_gradnorm and use_learned_task_weighting:
+        raise ValueError("use_gradnorm and use_learned_task_weighting cannot both be enabled.")
+    scaler = torch.amp.GradScaler("cuda")
     gradnorm_balancer = None
     gradnorm_optimizer = None
     gradnorm_reference_params = ()
+    uncertainty_balancer = None
+    extra_optimizer_param_groups = []
     if use_gradnorm:
         gradnorm_balancer = GradNormBalancer(
             num_tasks=3,
@@ -804,6 +899,31 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             lr=float(getattr(config, "gradnorm_lr", 2.5e-2)),
         )
         gradnorm_reference_params = resolve_gradnorm_reference_params(model)
+    if use_learned_task_weighting:
+        uncertainty_balancer = LearnedTaskWeighting(
+            task_names=("supervised_mean", "supervised_worst", "prediction_consistency"),
+            init_logits=list(getattr(config, "task_weight_init_logits", [0.0, 0.0, 0.0])),
+            min_logit=float(getattr(config, "task_weight_logit_min", -4.0)),
+            max_logit=float(getattr(config, "task_weight_logit_max", 4.0)),
+            min_weights=list(getattr(config, "task_weight_min_weights", [0.4, 0.4, 0.0])),
+            base_weights=list(getattr(config, "task_weight_base_weights", [0.45, 0.45, 0.10])),
+            warmup_epochs=int(getattr(config, "task_weight_warmup_epochs", 25)),
+        ).to(device)
+        extra_optimizer_param_groups.append(
+            {
+                "params": list(uncertainty_balancer.parameters()),
+                "lr": float(getattr(config, "task_weight_lr", 1.0e-3)),
+                "weight_decay": 0.0,
+            }
+        )
+    optimizer, scheduler, loss_fn, rel_l2_loss_fn = get_optimizer_scheduler_loss(
+        model,
+        config,
+        train_loader,
+        loss_dim=1,
+        extra_param_groups=extra_optimizer_param_groups,
+    )
+    combined_loss_fn = CombinedLoss(loss_fn, fields) if use_surface_supervision else None
 
     best_robust_rel_l2 = np.inf
     global_step = 0
@@ -826,6 +946,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             load_scaler=bool(amp),
             gradnorm_balancer=gradnorm_balancer,
             gradnorm_optimizer=gradnorm_optimizer,
+            uncertainty_balancer=uncertainty_balancer,
         )
     elif init_ckpt:
         if is_main_process():
@@ -870,6 +991,9 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
     train_extra_keys = [
         "loss_supervised_primary",
         "loss_supervised_secondary",
+        "loss_supervised_mean",
+        "loss_supervised_worst",
+        "loss_supervised_worst_soft",
         "loss_prediction_consistency",
         "secondary_inverse_density_fraction",
         "secondary_inverse_density_beta",
@@ -877,6 +1001,12 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
         "gradnorm_weight_secondary",
         "gradnorm_weight_prediction_consistency",
         "gradnorm_loss",
+        "learned_weight_supervised_mean",
+        "learned_weight_supervised_worst",
+        "learned_weight_prediction_consistency",
+        "learned_logit_supervised_mean",
+        "learned_logit_supervised_worst",
+        "learned_logit_prediction_consistency",
     ]
 
     try:
@@ -1095,22 +1225,39 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     y1_vol_f = y1_vol.float()
                     y2_surf_f = y2_surf.float()
                     y2_vol_f = y2_vol.float()
-                    latent1_f = latent1.float() if latent1 is not None else None
-                    latent2_f = latent2.float() if latent2 is not None else None
 
                 supervised_primary = combined_loss_fn(y1_surf_f, y1_vol_f, surf_data, vol_data) if use_surface_supervision else loss_fn(y1_vol_f, vol_data)
                 supervised_secondary = combined_loss_fn(y2_surf_f, y2_vol_f, surf_data, vol_data) if use_surface_supervision else loss_fn(y2_vol_f, vol_data)
                 y1_surf_teacher = y1_surf_f.detach()
                 y1_vol_teacher = y1_vol_f.detach()
-                pred_consistency = prediction_consistency_loss(y1_surf_teacher, y1_vol_teacher, y2_surf_f, y2_vol_f)
+                pred_consistency = prediction_consistency_smooth_l1_loss(
+                    y1_surf_teacher,
+                    y1_vol_teacher,
+                    y2_surf_f,
+                    y2_vol_f,
+                    beta=float(getattr(config, "prediction_consistency_smooth_l1_beta", 0.05)),
+                )
+                supervised_mean = 0.5 * (supervised_primary + supervised_secondary)
+                supervised_worst = torch.maximum(supervised_primary, supervised_secondary)
+                supervised_worst_soft = soft_worst_case_loss(
+                    supervised_primary,
+                    supervised_secondary,
+                    tau=float(getattr(config, "soft_worst_case_tau", 0.1)),
+                )
                 task_losses = [
                     supervised_primary.float(),
                     supervised_secondary.float(),
-                    (pred_consistency_weight * pred_consistency).float(),
+                    supervised_mean.float(),
+                    supervised_worst_soft.float(),
+                    pred_consistency.float(),
                 ]
                 if use_gradnorm:
                     gradnorm_info = gradnorm_balancer.compute(
-                        task_losses,
+                        [
+                            task_losses[0],
+                            task_losses[1],
+                            (pred_consistency_weight * task_losses[4]).float(),
+                        ],
                         gradnorm_reference_params,
                         epoch_idx=ep,
                         step_idx=global_step,
@@ -1118,15 +1265,36 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     current_task_weights = gradnorm_info["weights_detached"].float()
                     gradnorm_should_update = bool(gradnorm_info.get("should_update", True))
                     weighted_total_loss = sum(
-                        current_task_weights[i] * task_losses[i] for i in range(len(task_losses))
+                        current_task_weights[i] * task_loss
+                        for i, task_loss in enumerate(
+                            [
+                                task_losses[0],
+                                task_losses[1],
+                                (pred_consistency_weight * task_losses[4]).float(),
+                            ]
+                        )
                     )
+                    uncertainty_info = None
+                elif use_learned_task_weighting:
+                    uncertainty_info = uncertainty_balancer.combine(
+                        [
+                            task_losses[2],
+                            task_losses[3],
+                            (pred_consistency_weight * task_losses[4]).float(),
+                        ],
+                        epoch_idx=ep,
+                    )
+                    current_task_weights = uncertainty_info["weights"].float()
+                    gradnorm_should_update = False
+                    gradnorm_info = None
+                    weighted_total_loss = uncertainty_info["total_loss"].float()
                 else:
                     gradnorm_info = None
+                    uncertainty_info = None
                     current_task_weights = None
                     gradnorm_should_update = False
                     weighted_total_loss = (
-                        0.5 * supervised_primary
-                        + 0.5 * supervised_secondary
+                        supervised_mean
                         + pred_consistency_weight * pred_consistency
                     ).float()
 
@@ -1139,6 +1307,16 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     )
                     for param, grad in zip(gradnorm_balancer.parameters(), gradnorm_grads):
                         param.grad = grad.detach()
+
+                if not torch.isfinite(weighted_total_loss):
+                    raise FloatingPointError(
+                        f"Non-finite SATLOSS5 loss detected at epoch={ep} batch={batch_idx}: "
+                        f"supervised_primary={float(supervised_primary.detach().item()):.6g}, "
+                        f"supervised_secondary={float(supervised_secondary.detach().item()):.6g}, "
+                        f"supervised_mean={float(supervised_mean.detach().item()):.6g}, "
+                        f"supervised_worst_soft={float(supervised_worst_soft.detach().item()):.6g}, "
+                        f"pred_consistency={float(pred_consistency.detach().item()):.6g}"
+                    )
 
                 if amp:
                     scaler.scale(weighted_total_loss).backward()
@@ -1182,6 +1360,9 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     train_losses["rel_l2"] += (surface_loss + volume_loss).detach().float() * batch_size_float
                     train_losses["loss_supervised_primary"] += supervised_primary.detach().float() * batch_size_float
                     train_losses["loss_supervised_secondary"] += supervised_secondary.detach().float() * batch_size_float
+                    train_losses["loss_supervised_mean"] += supervised_mean.detach().float() * batch_size_float
+                    train_losses["loss_supervised_worst"] += supervised_worst.detach().float() * batch_size_float
+                    train_losses["loss_supervised_worst_soft"] += supervised_worst_soft.detach().float() * batch_size_float
                     train_losses["loss_prediction_consistency"] += pred_consistency.detach().float() * batch_size_float
                     train_losses["secondary_inverse_density_fraction"] += torch.tensor(
                         secondary_inverse_density_fraction, device=device, dtype=torch.float32
@@ -1189,12 +1370,19 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     train_losses["secondary_inverse_density_beta"] += torch.tensor(
                         float(secondary_inverse_density_beta), device=device, dtype=torch.float32
                     ) * batch_size_float
-                    if current_task_weights is not None:
+                    if gradnorm_info is not None:
                         train_losses["gradnorm_weight_primary"] += current_task_weights[0].detach().float() * batch_size_float
                         train_losses["gradnorm_weight_secondary"] += current_task_weights[1].detach().float() * batch_size_float
                         train_losses["gradnorm_weight_prediction_consistency"] += current_task_weights[2].detach().float() * batch_size_float
                     if gradnorm_info is not None:
                         train_losses["gradnorm_loss"] += gradnorm_info["gradnorm_loss"].detach().float() * batch_size_float
+                    if uncertainty_info is not None:
+                        train_losses["learned_weight_supervised_mean"] += current_task_weights[0].detach().float() * batch_size_float
+                        train_losses["learned_weight_supervised_worst"] += current_task_weights[1].detach().float() * batch_size_float
+                        train_losses["learned_weight_prediction_consistency"] += current_task_weights[2].detach().float() * batch_size_float
+                        train_losses["learned_logit_supervised_mean"] += uncertainty_info["logits"][0].detach().float() * batch_size_float
+                        train_losses["learned_logit_supervised_worst"] += uncertainty_info["logits"][1].detach().float() * batch_size_float
+                        train_losses["learned_logit_prediction_consistency"] += uncertainty_info["logits"][2].detach().float() * batch_size_float
 
                     if use_surface_supervision:
                         pred_surf_primary = y1_surf_teacher * std_surf + mean_surf
@@ -1220,6 +1408,8 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             volume_loss.item(),
                             supervised_primary.item(),
                             supervised_secondary.item(),
+                            supervised_mean.item(),
+                            supervised_worst_soft.item(),
                             pred_consistency.item(),
                             secondary_inverse_density_fraction,
                             float(secondary_inverse_density_beta),
@@ -1233,16 +1423,18 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             "train/batch_rel_l2_vol": log_scalars[3],
                             "train/batch_supervised_primary": log_scalars[4],
                             "train/batch_supervised_secondary": log_scalars[5],
-                            "train/batch_prediction_consistency": log_scalars[6],
-                            "train/batch_secondary_inverse_density_fraction": log_scalars[7],
-                            "train/batch_secondary_inverse_density_beta": log_scalars[8],
+                            "train/batch_supervised_mean": log_scalars[6],
+                            "train/batch_supervised_worst_soft": log_scalars[7],
+                            "train/batch_prediction_consistency": log_scalars[8],
+                            "train/batch_secondary_inverse_density_fraction": log_scalars[9],
+                            "train/batch_secondary_inverse_density_beta": log_scalars[10],
                             "train/prediction_consistency_weight": pred_consistency_weight,
                             "lr": scheduler.get_last_lr()[0],
                             "epoch": ep,
                         },
                         step=global_step,
                     )
-                    if current_task_weights is not None:
+                    if gradnorm_info is not None:
                         gradnorm_weight_log_scalars = distributed_average_scalars(
                             [
                                 float(current_task_weights[0].item()),
@@ -1267,6 +1459,28 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                         wandb.log(
                             {
                                 "train/batch_gradnorm_loss": gradnorm_log_scalars[0],
+                            },
+                            step=global_step,
+                        )
+                    if uncertainty_info is not None:
+                        uncertainty_log_scalars = distributed_average_scalars(
+                            [
+                                float(current_task_weights[0].item()),
+                                float(current_task_weights[1].item()),
+                                float(current_task_weights[2].item()),
+                                float(uncertainty_info["logits"][0].item()),
+                                float(uncertainty_info["logits"][1].item()),
+                                float(uncertainty_info["logits"][2].item()),
+                            ]
+                        )
+                        wandb.log(
+                            {
+                                "train/batch_learned_weight_supervised_mean": uncertainty_log_scalars[0],
+                                "train/batch_learned_weight_supervised_worst": uncertainty_log_scalars[1],
+                                "train/batch_learned_weight_prediction_consistency": uncertainty_log_scalars[2],
+                                "train/batch_learned_logit_supervised_mean": uncertainty_log_scalars[3],
+                                "train/batch_learned_logit_supervised_worst": uncertainty_log_scalars[4],
+                                "train/batch_learned_logit_prediction_consistency": uncertainty_log_scalars[5],
                             },
                             step=global_step,
                         )
@@ -1359,6 +1573,8 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                         "gradnorm_optimizer_state_dict": gradnorm_optimizer.state_dict(),
                     }
                 )
+            if uncertainty_balancer is not None:
+                checkpoint_extra_metrics["task_weighting_state_dict"] = uncertainty_balancer.state_dict()
 
             if robust_rel_l2 < best_robust_rel_l2 and is_main_process():
                 best_robust_rel_l2 = robust_rel_l2
@@ -1445,6 +1661,8 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             if gradnorm_balancer is not None and gradnorm_optimizer is not None:
                 emergency_state["gradnorm_balancer_state_dict"] = gradnorm_balancer.state_dict()
                 emergency_state["gradnorm_optimizer_state_dict"] = gradnorm_optimizer.state_dict()
+            if uncertainty_balancer is not None:
+                emergency_state["task_weighting_state_dict"] = uncertainty_balancer.state_dict()
             if is_main_process():
                 torch.save(emergency_state, "checkpoints/" + model_checkpoint_name + "_last.pt")
                 print("Saved the latest checkpoint before exiting.")

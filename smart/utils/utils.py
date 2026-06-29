@@ -300,7 +300,7 @@ def exclude_params_from_weight_decay(model,
     return grouped_parameters
 
 
-def get_optimizer_scheduler_loss(model, config, train_loader, loss_dim=-2):
+def get_optimizer_scheduler_loss(model, config, train_loader, loss_dim=-2, extra_param_groups=None):
     """Returns the optimizer, scheduler, and loss for the given model and config.
     
     Args:
@@ -333,10 +333,13 @@ def get_optimizer_scheduler_loss(model, config, train_loader, loss_dim=-2):
             return {"foreach": True}
         return {}
 
+    extra_param_groups = list(extra_param_groups or [])
+
     # Get optimizer
     if config.optimizer == "adam":
         # we have to exclude the bias and weights from norms
         grouped_parameters = exclude_params_from_weight_decay(model)
+        grouped_parameters = grouped_parameters + extra_param_groups
         optimizer = torch.optim.Adam(
             grouped_parameters,
             lr=config.learning_rate,
@@ -346,6 +349,7 @@ def get_optimizer_scheduler_loss(model, config, train_loader, loss_dim=-2):
     elif config.optimizer == "adamw":
         # we have to exclude the bias and weights from norms
         grouped_parameters = exclude_params_from_weight_decay(model, exclude=["bias", "norm", "query_pos", "B"])
+        grouped_parameters = grouped_parameters + extra_param_groups
         optimizer = torch.optim.AdamW(
             grouped_parameters,
             lr=config.learning_rate,
@@ -354,6 +358,7 @@ def get_optimizer_scheduler_loss(model, config, train_loader, loss_dim=-2):
         )
     elif config.optimizer == "lion":
         grouped_parameters = exclude_params_from_weight_decay(model, exclude=["bias", "norm", "query_pos", "B"])
+        grouped_parameters = grouped_parameters + extra_param_groups
         optimizer = Lion(grouped_parameters, lr=config.learning_rate, weight_decay=1e-4)
     else:
         raise ValueError("Optimizer not supported!")

@@ -163,7 +163,14 @@ def main(cfg: DictConfig):
     model = model.to(device)
 
     resume_ckpt = str(getattr(config, "resume_ckpt", "")).strip()
+    resume_full_state = bool(getattr(config, "resume_full_state", False))
+    if resume_full_state:
+        raise ValueError(
+            "SMART_SAT train_sat.py only supports weights-only resume. "
+            "Use experiment.resume_ckpt with experiment.resume_full_state=False."
+        )
     if resume_ckpt:
+        print(f"[init] experiment.resume_ckpt is being used for partial model initialization from {resume_ckpt}")
         load_partial_state_dict(model, resume_ckpt, device)
 
     print(f"Total parameters: {count_model_params(model)}")

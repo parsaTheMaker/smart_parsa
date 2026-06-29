@@ -44,6 +44,7 @@ experiment:
   log_every_n_steps: 10
   inspect_first_sample: False
   resume_ckpt: ""
+  resume_full_state: False
 
   dataset: "DrivAerML"
   data_path: "/mnt/ssdraid/parsa/drivaerml_preprocessed"

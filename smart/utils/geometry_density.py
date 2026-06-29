@@ -54,6 +54,10 @@ def knn_edges_as_neighbor_center(points_b, k_cur):
     return nbr, center
 
 
+def _tiny_f64():
+    return torch.finfo(torch.float64).tiny
+
+
 @torch.no_grad()
 def estimate_log_sampling_density_hash(points, knn_k=8, neighbor_hops=1, eps=1e-6):
     """Spatial-hash fallback for local kNN density estimation."""
@@ -213,6 +217,77 @@ def estimate_log_sampling_density_tangent_cov(points, knn_k=8, eps=1e-6):
 
 
 @torch.no_grad()
+def estimate_log_sampling_density_kde(points, knn_k=8):
+    """Estimate local sampling density with a Gaussian KDE on the kNN graph.
+
+    For each point x_j and its k nearest neighbors N_k(j), define
+
+        rho_j = (1 / k) * sum_{l in N_k(j)} exp(-||x_j - x_l||^2 / h^2)
+
+    where h^2 is the mean squared edge length over the full local kNN graph
+    of the current point cloud. Distances and exponentials are evaluated in
+    float64 for numerical stability on dense normalized meshes.
+
+    The 1 / k normalization removes the trivial dependence of the raw kernel
+    sum on how many neighbors were requested. The returned quantity is still
+    monotone with local sampling density, but its absolute value does not shift
+    by +log(k) when knn_k changes.
+    """
+    pts = points.clamp(0.0, 1.0 - 1e-6)
+    bsz, _, _ = pts.shape
+    k_eff = max(1, int(knn_k))
+    tiny = _tiny_f64()
+
+    if torch_cluster_knn_graph is not None:
+        outputs = []
+        for b in range(bsz):
+            pts_b = pts[b]
+            n = int(pts_b.shape[0])
+            if n <= 1:
+                outputs.append(torch.zeros((n,), device=pts.device, dtype=pts.dtype))
+                continue
+
+            k_cur = min(k_eff, n - 1)
+            nbr, center = knn_edges_as_neighbor_center(pts_b, k_cur)
+            diffs64 = pts_b[nbr].to(dtype=torch.float64) - pts_b[center].to(dtype=torch.float64)
+            d2 = diffs64.square().sum(dim=-1)
+            h2 = torch.clamp(d2.mean(), min=tiny)
+            kernels = torch.exp(-d2 / h2)
+
+            density = torch.zeros((n,), device=pts.device, dtype=torch.float64)
+            density.scatter_add_(0, center, kernels)
+            density = density / float(k_cur)
+            log_density = torch.log(torch.clamp(density, min=tiny))
+            outputs.append(log_density.to(dtype=pts.dtype))
+        return torch.stack(outputs, dim=0)
+
+    if NearestNeighbors is not None:
+        outputs = []
+        for b in range(bsz):
+            pts_b = pts[b]
+            n = int(pts_b.shape[0])
+            if n <= 1:
+                outputs.append(torch.zeros((n,), device=pts.device, dtype=pts.dtype))
+                continue
+
+            k_cur = min(k_eff, n - 1)
+            pts_np = pts_b.detach().cpu().numpy().astype(np.float64, copy=False)
+            nbrs = NearestNeighbors(n_neighbors=k_cur + 1, algorithm="kd_tree", n_jobs=-1)
+            distances, _ = nbrs.fit(pts_np).kneighbors(return_distance=True)
+            d2 = np.square(distances[:, 1:], dtype=np.float64)
+            h2 = max(float(d2.mean()), np.finfo(np.float64).tiny)
+            density = np.exp(-d2 / h2, dtype=np.float64).mean(axis=1)
+            log_density = np.log(np.clip(density, np.finfo(np.float64).tiny, None))
+            outputs.append(torch.from_numpy(log_density).to(device=pts.device, dtype=pts.dtype))
+        return torch.stack(outputs, dim=0)
+
+    raise RuntimeError(
+        "KDE density estimation requires either torch_cluster.knn_graph "
+        "or sklearn.neighbors.NearestNeighbors to be available."
+    )
+
+
+@torch.no_grad()
 def estimate_log_sampling_density(points, knn_k=8, neighbor_hops=1, eps=1e-6, range_tol=1e-4, estimator="rk2"):
     """Estimate local surface sampling density from full-cloud kNN radii."""
     if points.numel() == 0:
@@ -231,8 +306,10 @@ def estimate_log_sampling_density(points, knn_k=8, neighbor_hops=1, eps=1e-6, ra
 
     if estimator == "tangent_cov":
         return estimate_log_sampling_density_tangent_cov(pts, knn_k=knn_k, eps=eps)
+    if estimator == "kde":
+        return estimate_log_sampling_density_kde(pts, knn_k=knn_k)
     if estimator != "rk2":
-        raise ValueError(f"Unknown density estimator '{estimator}'. Expected 'rk2' or 'tangent_cov'.")
+        raise ValueError(f"Unknown density estimator '{estimator}'. Expected 'rk2', 'tangent_cov', or 'kde'.")
 
     bsz, _, _ = pts.shape
     k_eff = max(1, int(knn_k))

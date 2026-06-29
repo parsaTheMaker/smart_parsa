@@ -948,14 +948,14 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             gradnorm_optimizer=gradnorm_optimizer,
             uncertainty_balancer=uncertainty_balancer,
         )
-    elif init_ckpt:
-        if is_main_process():
-            print(f"[init] Loading model weights from {init_ckpt}")
-        load_partial_state_dict(model, init_ckpt, device)
     elif resume_ckpt:
         if is_main_process():
             print(f"[init] experiment.resume_ckpt is being used for partial model initialization from {resume_ckpt}")
         load_partial_state_dict(model, resume_ckpt, device)
+    elif init_ckpt:
+        if is_main_process():
+            print(f"[init] Loading model weights from {init_ckpt}")
+        load_partial_state_dict(model, init_ckpt, device)
 
     train_model = model
     if multi_gpu_strategy == "data_parallel" and torch.cuda.is_available() and torch.cuda.device_count() > 1:

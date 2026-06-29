@@ -272,9 +272,12 @@ class AhmedMLDatasetV2(Dataset):
         run_dir.mkdir(parents=True, exist_ok=True)
         scale_tag = "scaled" if self.scale_positions else "noscale"
         dtype_tag = self.geometry_density_cache_dtype
+        estimator_tag = self.geometry_density_estimator
+        if estimator_tag == "kde":
+            estimator_tag = "kde_mean64"
         return run_dir / (
             f"geometry_log_density_{self.CACHE_VERSION}_{scale_tag}"
-            f"_{self.geometry_density_estimator}"
+            f"_{estimator_tag}"
             f"_k{self.geometry_density_knn_k}"
             f"_h{self.geometry_density_neighbor_hops}"
             f"_{dtype_tag}.npy"

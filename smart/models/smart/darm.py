@@ -77,6 +77,9 @@ class DARM(SMART):
         high_hidden_dim=64,
         prediction_query_chunk_size=16384,
         use_high_value_block=False,
+        route_confidence_floor=0.15,
+        route_entropy_mix=0.75,
+        route_margin_norm_eps=1.0e-4,
     ):
         super().__init__(
             spatial_dim=spatial_dim,
@@ -110,6 +113,9 @@ class DARM(SMART):
         self.low_branch_num_coarse_layers = max(1, int(low_branch_num_coarse_layers))
         self.prediction_query_chunk_size = max(1, int(prediction_query_chunk_size))
         self.use_high_value_block = bool(use_high_value_block)
+        self.route_confidence_floor = min(max(float(route_confidence_floor), 0.0), 0.95)
+        self.route_entropy_mix = min(max(float(route_entropy_mix), 0.0), 1.0)
+        self.route_margin_norm_eps = float(route_margin_norm_eps)
         self.type_embedding = nn.Embedding(2, int(type_embedding_dim))
 
         if self.use_intermediate_layer_mix:
@@ -142,7 +148,8 @@ class DARM(SMART):
         self.delta_gate_proj = nn.Linear(spatial_dim, 1)
         self.route_temperature_proj = nn.Linear(latent_dim, 1)
         self.score_gate_scale = nn.Parameter(torch.tensor(1.0))
-        self.distance_gate_scale = nn.Parameter(torch.tensor(0.25))
+        self.distance_gate_scale = nn.Parameter(torch.tensor(0.1))
+        self.gate_bias = nn.Parameter(torch.tensor(0.5))
         self.margin_confidence_scale = nn.Parameter(torch.tensor(1.0))
         self.support_gain_proj = nn.Sequential(
             nn.LayerNorm(latent_dim, eps=1e-6),
@@ -271,6 +278,7 @@ class DARM(SMART):
         dist = torch.matmul(query_pos_sq, anchor_metric.transpose(1, 2))
         dist = dist - 2.0 * torch.matmul(query_pos_w, metric_center.transpose(1, 2))
         dist = dist + metric_center_sq.unsqueeze(1)
+        dist = dist / (float(self.pos_scale_factor) ** 2)
         return scores - dist / anchor_scale.unsqueeze(1) + anchor_bias.unsqueeze(1)
 
     def _select_topk_route_scores(self, query_key, layer_weights, query_pos_scaled, readout_context):
@@ -332,7 +340,20 @@ class DARM(SMART):
             out_dim = self.surface_channels if query_type == 0 else self.volume_channels
             empty = query_emb_chunk.new_zeros(query_emb_chunk.shape[0], 0, out_dim)
             zero = query_emb_chunk.new_zeros(())
-            return empty, {"gate_sum": zero, "support_mass_sum": zero, "query_count": 0}
+            empty_aux = query_emb_chunk.new_zeros(query_emb_chunk.shape[0], 0, 1)
+            return empty, {
+                "gate_sum": zero,
+                "raw_gate_sum": zero,
+                "support_mass_sum": zero,
+                "route_confidence_sum": zero,
+                "route_entropy_sum": zero,
+                "query_count": 0,
+                "support_mass": empty_aux,
+                "route_confidence": empty_aux,
+                "route_entropy": empty_aux,
+                "evidence_mass": empty_aux,
+                "raw_gate": empty_aux,
+            }
 
         query_type_embed = self.type_embedding.weight[query_type].view(1, 1, -1)
         type_value = self.type_value_proj(query_type_embed).unsqueeze(2)
@@ -349,19 +370,44 @@ class DARM(SMART):
         query_temperature = self.route_temperature * (
             0.5 + torch.sigmoid(self.route_temperature_proj(query_emb_chunk))
         )
-        rho = torch.softmax(top_scores / query_temperature.clamp_min(1.0e-4), dim=-1)
         if top_scores.shape[-1] > 1:
             route_margin = top_scores[..., :1] - top_scores[..., 1:2]
+            route_scale = top_scores.std(dim=-1, keepdim=True, unbiased=False)
+            route_scale = route_scale + query_temperature.clamp_min(self.route_margin_norm_eps)
+            probe_scores = top_scores - top_scores.mean(dim=-1, keepdim=True)
+            probe_scores = probe_scores / route_scale.clamp_min(self.route_margin_norm_eps)
+            probe_rho = torch.softmax(probe_scores, dim=-1)
+            route_entropy = -(probe_rho.clamp_min(1.0e-8) * probe_rho.clamp_min(1.0e-8).log()).sum(dim=-1, keepdim=True)
+            route_entropy = route_entropy / math.log(float(top_scores.shape[-1]))
         else:
             route_margin = torch.ones_like(top_scores[..., :1])
-        route_confidence = torch.sigmoid(self.margin_confidence_scale.to(dtype=route_margin.dtype) * route_margin)
+            route_scale = torch.ones_like(route_margin)
+            route_entropy = torch.zeros_like(route_margin)
+        route_margin_norm = route_margin / route_scale.clamp_min(self.route_margin_norm_eps)
+        route_margin_conf = torch.sigmoid(
+            self.margin_confidence_scale.to(dtype=route_margin.dtype) * route_margin_norm
+        )
+        route_entropy_conf = 1.0 - route_entropy
+        route_confidence = (
+            (1.0 - self.route_entropy_mix) * route_margin_conf
+            + self.route_entropy_mix * route_entropy_conf
+        )
+        route_confidence = self.route_confidence_floor + (1.0 - self.route_confidence_floor) * route_confidence
+        adaptive_temperature = query_temperature * (1.0 + route_entropy)
+        adaptive_temperature = adaptive_temperature / route_confidence.clamp_min(self.route_confidence_floor)
+        rho = torch.softmax(top_scores / adaptive_temperature.clamp_min(1.0e-4), dim=-1)
 
         gate_sum = query_emb_chunk.new_zeros(())
+        raw_gate_sum = query_emb_chunk.new_zeros(())
         support_mass_sum = query_emb_chunk.new_zeros(())
         route_confidence_sum = query_emb_chunk.new_zeros(())
+        route_entropy_sum = query_emb_chunk.new_zeros(())
         high_out_chunks = []
         support_mass_chunks = []
         route_confidence_chunks = []
+        route_entropy_chunks = []
+        evidence_mass_chunks = []
+        raw_gate_chunks = []
         debug = None
         debug_queries_remaining = int(route_debug_max_queries)
 
@@ -376,8 +422,11 @@ class DARM(SMART):
 
             selected_centers = _batched_index_select(readout_context["anchor_centers"], top_idx_sub)
             selected_metric = _batched_index_select(readout_context["anchor_metric"], top_idx_sub)
-            delta = query_pos_sub.unsqueeze(2) - selected_centers
-            selected_dist = (selected_metric * delta.square()).sum(dim=-1)
+            delta_scaled = query_pos_sub.unsqueeze(2) - selected_centers
+            delta = delta_scaled / float(self.pos_scale_factor)
+            selected_dist = (selected_metric * delta_scaled.square()).sum(dim=-1) / (float(self.pos_scale_factor) ** 2)
+            selected_dist_feature = torch.sqrt(selected_dist.clamp_min(1.0e-8))
+            selected_dist_feature = selected_dist_feature / selected_dist_feature.detach().mean(dim=-1, keepdim=True).clamp_min(1.0e-6)
             mixed_anchor_values = self._mix_selected_anchor_values(top_idx_sub, layer_weights_sub, readout_context)
             anchor_tokens = mixed_anchor_values + self.delta_value_proj(delta) + type_value
 
@@ -385,12 +434,16 @@ class DARM(SMART):
             gate_logits = gate_logits + self.anchor_gate_proj(mixed_anchor_values).squeeze(-1)
             gate_logits = gate_logits + self.delta_gate_proj(delta).squeeze(-1)
             gate_logits = gate_logits + self.score_gate_scale.to(dtype=top_scores_sub.dtype) * top_scores_sub
-            gate_logits = gate_logits - self.distance_gate_scale.to(dtype=selected_dist.dtype) * selected_dist
+            gate_logits = gate_logits - self.distance_gate_scale.to(dtype=selected_dist_feature.dtype) * selected_dist_feature
+            gate_logits = gate_logits + self.gate_bias.to(dtype=gate_logits.dtype)
             evidence = torch.sigmoid(gate_logits)
+            raw_gate = evidence.mean(dim=-1, keepdim=True)
 
             route_confidence_sub = route_confidence[:, start:end]
-            support = rho_sub * evidence.to(dtype=rho_sub.dtype) * route_confidence_sub.to(dtype=rho_sub.dtype)
+            route_entropy_sub = route_entropy[:, start:end]
+            support = rho_sub * evidence.to(dtype=rho_sub.dtype)
             support_mass = support.sum(dim=-1, keepdim=True).clamp_min(1.0e-6)
+            evidence_mass = raw_gate * route_confidence_sub.to(dtype=raw_gate.dtype)
             support_norm = support / support_mass
 
             anchor_context = (
@@ -399,18 +452,25 @@ class DARM(SMART):
             high_hidden = self.high_context_norm(anchor_context)
             high_hidden = high_hidden * self.support_gain_proj(query_emb_sub)
             high_hidden = self.high_value_block(high_hidden)
-            high_hidden = high_hidden * support_mass.to(dtype=high_hidden.dtype)
+            support_scale = (0.5 + 0.5 * raw_gate.to(dtype=high_hidden.dtype))
+            support_scale = support_scale * (0.5 + 0.5 * route_confidence_sub.to(dtype=high_hidden.dtype))
+            high_hidden = high_hidden * support_scale
 
             if query_type == 0:
                 high_out_chunks.append(self.surface_high_head(high_hidden))
             else:
                 high_out_chunks.append(self.volume_high_head(high_hidden))
 
-            gate_sum = gate_sum + evidence.sum()
+            gate_sum = gate_sum + evidence_mass.sum()
+            raw_gate_sum = raw_gate_sum + raw_gate.sum()
             support_mass_sum = support_mass_sum + support_mass.sum()
             route_confidence_sum = route_confidence_sum + route_confidence_sub.sum()
+            route_entropy_sum = route_entropy_sum + route_entropy_sub.sum()
             support_mass_chunks.append(support_mass)
             route_confidence_chunks.append(route_confidence_sub)
+            route_entropy_chunks.append(route_entropy_sub)
+            evidence_mass_chunks.append(evidence_mass)
+            raw_gate_chunks.append(raw_gate)
 
             if return_route_debug and debug_queries_remaining > 0:
                 keep = min(debug_queries_remaining, end - start)
@@ -418,8 +478,10 @@ class DARM(SMART):
                     "top_indices": top_idx_sub[:, :keep].detach(),
                     "routing_weights": rho_sub[:, :keep].detach(),
                     "evidence_gates": evidence[:, :keep].detach(),
+                    "evidence_mass": evidence_mass[:, :keep].detach(),
                     "support_mass": support_mass[:, :keep].detach(),
                     "route_confidence": route_confidence_sub[:, :keep].detach(),
+                    "route_entropy": route_entropy_sub[:, :keep].detach(),
                     "selected_distance": selected_dist[:, :keep].detach(),
                 }
                 if debug is None:
@@ -436,11 +498,16 @@ class DARM(SMART):
 
         aux = {
             "gate_sum": gate_sum,
+            "raw_gate_sum": raw_gate_sum,
             "support_mass_sum": support_mass_sum,
             "route_confidence_sum": route_confidence_sum,
+            "route_entropy_sum": route_entropy_sum,
             "query_count": num_queries * query_emb_chunk.shape[0],
             "support_mass": torch.cat(support_mass_chunks, dim=1) if support_mass_chunks else query_emb_chunk.new_zeros(query_emb_chunk.shape[0], 0, 1),
             "route_confidence": torch.cat(route_confidence_chunks, dim=1) if route_confidence_chunks else query_emb_chunk.new_zeros(query_emb_chunk.shape[0], 0, 1),
+            "route_entropy": torch.cat(route_entropy_chunks, dim=1) if route_entropy_chunks else query_emb_chunk.new_zeros(query_emb_chunk.shape[0], 0, 1),
+            "evidence_mass": torch.cat(evidence_mass_chunks, dim=1) if evidence_mass_chunks else query_emb_chunk.new_zeros(query_emb_chunk.shape[0], 0, 1),
+            "raw_gate": torch.cat(raw_gate_chunks, dim=1) if raw_gate_chunks else query_emb_chunk.new_zeros(query_emb_chunk.shape[0], 0, 1),
         }
         if debug is not None:
             aux["debug"] = debug
@@ -460,16 +527,32 @@ class DARM(SMART):
         low_out = self._low_branch(low_query_emb, query_pos_raw, query_type)
         if only_low:
             high_out = torch.zeros_like(low_out)
-            return low_out, high_out, {"mean_support_mass": low_out.new_zeros(()), "mean_evidence_gate": low_out.new_zeros(())}
+            return low_out, high_out, {
+                "mean_support_mass": low_out.new_zeros(()),
+                "mean_evidence_gate": low_out.new_zeros(()),
+                "mean_raw_evidence_gate": low_out.new_zeros(()),
+                "mean_route_confidence": low_out.new_zeros(()),
+                "mean_route_entropy": low_out.new_zeros(()),
+                "support_mass": low_out.new_zeros(low_out.shape[0], low_out.shape[1], 1),
+                "route_confidence": low_out.new_zeros(low_out.shape[0], low_out.shape[1], 1),
+                "route_entropy": low_out.new_zeros(low_out.shape[0], low_out.shape[1], 1),
+                "evidence_mass": low_out.new_zeros(low_out.shape[0], low_out.shape[1], 1),
+                "raw_gate": low_out.new_zeros(low_out.shape[0], low_out.shape[1], 1),
+            }
 
         high_chunks = []
         gate_sum = low_out.new_zeros(())
+        raw_gate_sum = low_out.new_zeros(())
         support_mass_sum = low_out.new_zeros(())
         route_confidence_sum = low_out.new_zeros(())
+        route_entropy_sum = low_out.new_zeros(())
         query_count = 0
         route_debug = None
         support_mass_chunks = []
         route_confidence_chunks = []
+        route_entropy_chunks = []
+        evidence_mass_chunks = []
+        raw_gate_chunks = []
 
         for start in range(0, high_query_emb.shape[1], self.route_chunk_size):
             end = min(start + self.route_chunk_size, high_query_emb.shape[1])
@@ -483,11 +566,16 @@ class DARM(SMART):
             )
             high_chunks.append(high_chunk)
             gate_sum = gate_sum + chunk_aux["gate_sum"]
+            raw_gate_sum = raw_gate_sum + chunk_aux["raw_gate_sum"]
             support_mass_sum = support_mass_sum + chunk_aux["support_mass_sum"]
             route_confidence_sum = route_confidence_sum + chunk_aux["route_confidence_sum"]
+            route_entropy_sum = route_entropy_sum + chunk_aux["route_entropy_sum"]
             query_count += int(chunk_aux["query_count"])
             support_mass_chunks.append(chunk_aux["support_mass"])
             route_confidence_chunks.append(chunk_aux["route_confidence"])
+            route_entropy_chunks.append(chunk_aux["route_entropy"])
+            evidence_mass_chunks.append(chunk_aux["evidence_mass"])
+            raw_gate_chunks.append(chunk_aux["raw_gate"])
 
             if return_route_debug and route_debug is None and route_debug_max_queries > 0 and "debug" in chunk_aux:
                 keep = min(route_debug_max_queries, high_chunk.shape[1])
@@ -498,9 +586,14 @@ class DARM(SMART):
         aux = {
             "mean_support_mass": support_mass_sum / denom,
             "mean_evidence_gate": gate_sum / denom,
+            "mean_raw_evidence_gate": raw_gate_sum / denom,
             "mean_route_confidence": route_confidence_sum / denom,
+            "mean_route_entropy": route_entropy_sum / denom,
             "support_mass": torch.cat(support_mass_chunks, dim=1) if support_mass_chunks else low_out.new_zeros(low_out.shape[0], 0, 1),
             "route_confidence": torch.cat(route_confidence_chunks, dim=1) if route_confidence_chunks else low_out.new_zeros(low_out.shape[0], 0, 1),
+            "route_entropy": torch.cat(route_entropy_chunks, dim=1) if route_entropy_chunks else low_out.new_zeros(low_out.shape[0], 0, 1),
+            "evidence_mass": torch.cat(evidence_mass_chunks, dim=1) if evidence_mass_chunks else low_out.new_zeros(low_out.shape[0], 0, 1),
+            "raw_gate": torch.cat(raw_gate_chunks, dim=1) if raw_gate_chunks else low_out.new_zeros(low_out.shape[0], 0, 1),
         }
         if route_debug is not None:
             aux["route_debug"] = route_debug
@@ -538,9 +631,17 @@ class DARM(SMART):
                 "volume_support_mass": pred_vol.new_zeros(pred_vol.shape[0], 0, 1),
                 "surface_route_confidence": pred_surf.new_zeros(pred_surf.shape[0], 0, 1),
                 "volume_route_confidence": pred_vol.new_zeros(pred_vol.shape[0], 0, 1),
+                "surface_route_entropy": pred_surf.new_zeros(pred_surf.shape[0], 0, 1),
+                "volume_route_entropy": pred_vol.new_zeros(pred_vol.shape[0], 0, 1),
+                "surface_evidence_mass": pred_surf.new_zeros(pred_surf.shape[0], 0, 1),
+                "volume_evidence_mass": pred_vol.new_zeros(pred_vol.shape[0], 0, 1),
+                "surface_raw_evidence_gate": pred_surf.new_zeros(pred_surf.shape[0], 0, 1),
+                "volume_raw_evidence_gate": pred_vol.new_zeros(pred_vol.shape[0], 0, 1),
                 "mean_support_mass": pred_surf.new_zeros(()),
                 "mean_evidence_gate": pred_surf.new_zeros(()),
+                "mean_raw_evidence_gate": pred_surf.new_zeros(()),
                 "mean_route_confidence": pred_surf.new_zeros(()),
+                "mean_route_entropy": pred_surf.new_zeros(()),
             }
             return pred_surf, pred_vol, aux
 
@@ -552,18 +653,28 @@ class DARM(SMART):
         vol_high_chunks = []
         surf_support_sum = query_pos.new_zeros(())
         surf_gate_sum = query_pos.new_zeros(())
+        surf_raw_gate_sum = query_pos.new_zeros(())
         surf_conf_sum = query_pos.new_zeros(())
+        surf_entropy_sum = query_pos.new_zeros(())
         vol_support_sum = query_pos.new_zeros(())
         vol_gate_sum = query_pos.new_zeros(())
+        vol_raw_gate_sum = query_pos.new_zeros(())
         vol_conf_sum = query_pos.new_zeros(())
+        vol_entropy_sum = query_pos.new_zeros(())
         surf_query_total = 0
         vol_query_total = 0
         surf_debug = None
         vol_debug = None
         surf_support_chunks = []
         surf_conf_chunks = []
+        surf_entropy_chunks = []
+        surf_evidence_chunks = []
+        surf_raw_gate_chunks = []
         vol_support_chunks = []
         vol_conf_chunks = []
+        vol_entropy_chunks = []
+        vol_evidence_chunks = []
+        vol_raw_gate_chunks = []
 
         for start in range(0, total_count, self.prediction_query_chunk_size):
             end = min(start + self.prediction_query_chunk_size, total_count)
@@ -592,10 +703,15 @@ class DARM(SMART):
                 chunk_weight = float(max(int(query_chunk.shape[0] * surf_local_end), 1))
                 surf_support_sum = surf_support_sum + surf_aux["mean_support_mass"] * chunk_weight
                 surf_gate_sum = surf_gate_sum + surf_aux["mean_evidence_gate"] * chunk_weight
+                surf_raw_gate_sum = surf_raw_gate_sum + surf_aux["mean_raw_evidence_gate"] * chunk_weight
                 surf_conf_sum = surf_conf_sum + surf_aux["mean_route_confidence"] * chunk_weight
+                surf_entropy_sum = surf_entropy_sum + surf_aux["mean_route_entropy"] * chunk_weight
                 surf_query_total += int(query_chunk.shape[0] * surf_local_end)
                 surf_support_chunks.append(surf_aux["support_mass"])
                 surf_conf_chunks.append(surf_aux["route_confidence"])
+                surf_entropy_chunks.append(surf_aux["route_entropy"])
+                surf_evidence_chunks.append(surf_aux["evidence_mass"])
+                surf_raw_gate_chunks.append(surf_aux["raw_gate"])
                 if "route_debug" in surf_aux and surf_debug is None:
                     surf_debug = surf_aux["route_debug"]
 
@@ -616,10 +732,15 @@ class DARM(SMART):
                 chunk_weight = float(max(int(query_chunk.shape[0] * (end - start - vol_local_start)), 1))
                 vol_support_sum = vol_support_sum + vol_aux["mean_support_mass"] * chunk_weight
                 vol_gate_sum = vol_gate_sum + vol_aux["mean_evidence_gate"] * chunk_weight
+                vol_raw_gate_sum = vol_raw_gate_sum + vol_aux["mean_raw_evidence_gate"] * chunk_weight
                 vol_conf_sum = vol_conf_sum + vol_aux["mean_route_confidence"] * chunk_weight
+                vol_entropy_sum = vol_entropy_sum + vol_aux["mean_route_entropy"] * chunk_weight
                 vol_query_total += int(query_chunk.shape[0] * (end - start - vol_local_start))
                 vol_support_chunks.append(vol_aux["support_mass"])
                 vol_conf_chunks.append(vol_aux["route_confidence"])
+                vol_entropy_chunks.append(vol_aux["route_entropy"])
+                vol_evidence_chunks.append(vol_aux["evidence_mass"])
+                vol_raw_gate_chunks.append(vol_aux["raw_gate"])
                 if "route_debug" in vol_aux and vol_debug is None:
                     vol_debug = vol_aux["route_debug"]
 
@@ -646,9 +767,17 @@ class DARM(SMART):
             "volume_support_mass": torch.cat(vol_support_chunks, dim=1) if vol_support_chunks else vol_query_pos.new_zeros(vol_query_pos.shape[0], 0, 1),
             "surface_route_confidence": torch.cat(surf_conf_chunks, dim=1) if surf_conf_chunks else surf_query_pos.new_zeros(surf_query_pos.shape[0], 0, 1),
             "volume_route_confidence": torch.cat(vol_conf_chunks, dim=1) if vol_conf_chunks else vol_query_pos.new_zeros(vol_query_pos.shape[0], 0, 1),
+            "surface_route_entropy": torch.cat(surf_entropy_chunks, dim=1) if surf_entropy_chunks else surf_query_pos.new_zeros(surf_query_pos.shape[0], 0, 1),
+            "volume_route_entropy": torch.cat(vol_entropy_chunks, dim=1) if vol_entropy_chunks else vol_query_pos.new_zeros(vol_query_pos.shape[0], 0, 1),
+            "surface_evidence_mass": torch.cat(surf_evidence_chunks, dim=1) if surf_evidence_chunks else surf_query_pos.new_zeros(surf_query_pos.shape[0], 0, 1),
+            "volume_evidence_mass": torch.cat(vol_evidence_chunks, dim=1) if vol_evidence_chunks else vol_query_pos.new_zeros(vol_query_pos.shape[0], 0, 1),
+            "surface_raw_evidence_gate": torch.cat(surf_raw_gate_chunks, dim=1) if surf_raw_gate_chunks else surf_query_pos.new_zeros(surf_query_pos.shape[0], 0, 1),
+            "volume_raw_evidence_gate": torch.cat(vol_raw_gate_chunks, dim=1) if vol_raw_gate_chunks else vol_query_pos.new_zeros(vol_query_pos.shape[0], 0, 1),
             "mean_support_mass": (surf_support_sum + vol_support_sum) / total_weight,
             "mean_evidence_gate": (surf_gate_sum + vol_gate_sum) / total_weight,
+            "mean_raw_evidence_gate": (surf_raw_gate_sum + vol_raw_gate_sum) / total_weight,
             "mean_route_confidence": (surf_conf_sum + vol_conf_sum) / total_weight,
+            "mean_route_entropy": (surf_entropy_sum + vol_entropy_sum) / total_weight,
         }
         if surf_debug is not None:
             aux["surface_route_debug"] = surf_debug
@@ -712,13 +841,21 @@ class DARM(SMART):
         surf_high_subregions = []
         surf_support_subregions = []
         surf_conf_subregions = []
+        surf_entropy_subregions = []
+        surf_evidence_subregions = []
+        surf_raw_gate_subregions = []
         vol_low_subregions = []
         vol_high_subregions = []
         vol_support_subregions = []
         vol_conf_subregions = []
+        vol_entropy_subregions = []
+        vol_evidence_subregions = []
+        vol_raw_gate_subregions = []
         support_sum = 0.0
         gate_sum = 0.0
+        raw_gate_sum = 0.0
         route_conf_sum = 0.0
+        route_entropy_sum = 0.0
         route_weight_sum = 0
         debug_out = {}
 
@@ -742,10 +879,15 @@ class DARM(SMART):
                 surf_high_subregions.append(aux["surface_high"])
                 surf_support_subregions.append(aux["surface_support_mass"])
                 surf_conf_subregions.append(aux["surface_route_confidence"])
+                surf_entropy_subregions.append(aux["surface_route_entropy"])
+                surf_evidence_subregions.append(aux["surface_evidence_mass"])
+                surf_raw_gate_subregions.append(aux["surface_raw_evidence_gate"])
                 weight = max(int(surf_subregion.shape[1]), 1)
                 support_sum += float(aux["mean_support_mass"].item()) * weight
                 gate_sum += float(aux["mean_evidence_gate"].item()) * weight
+                raw_gate_sum += float(aux["mean_raw_evidence_gate"].item()) * weight
                 route_conf_sum += float(aux["mean_route_confidence"].item()) * weight
+                route_entropy_sum += float(aux["mean_route_entropy"].item()) * weight
                 route_weight_sum += weight
                 if "surface_route_debug" in aux:
                     debug_out["surface_route_debug"] = aux["surface_route_debug"]
@@ -782,10 +924,15 @@ class DARM(SMART):
                 vol_high_subregions.append(aux["volume_high"])
                 vol_support_subregions.append(aux["volume_support_mass"])
                 vol_conf_subregions.append(aux["volume_route_confidence"])
+                vol_entropy_subregions.append(aux["volume_route_entropy"])
+                vol_evidence_subregions.append(aux["volume_evidence_mass"])
+                vol_raw_gate_subregions.append(aux["volume_raw_evidence_gate"])
                 weight = max(int(vol_subregion.shape[1]), 1)
                 support_sum += float(aux["mean_support_mass"].item()) * weight
                 gate_sum += float(aux["mean_evidence_gate"].item()) * weight
+                raw_gate_sum += float(aux["mean_raw_evidence_gate"].item()) * weight
                 route_conf_sum += float(aux["mean_route_confidence"].item()) * weight
+                route_entropy_sum += float(aux["mean_route_entropy"].item()) * weight
                 route_weight_sum += weight
                 if "volume_route_debug" in aux:
                     debug_out["volume_route_debug"] = aux["volume_route_debug"]
@@ -817,9 +964,17 @@ class DARM(SMART):
             "volume_support_mass": torch.cat(vol_support_subregions, dim=1) if vol_support_subregions else pred_vol.new_zeros(pred_vol.shape[0], pred_vol.shape[1], 1),
             "surface_route_confidence": torch.cat(surf_conf_subregions, dim=1) if surf_conf_subregions else pred_surf.new_zeros(pred_surf.shape[0], pred_surf.shape[1], 1),
             "volume_route_confidence": torch.cat(vol_conf_subregions, dim=1) if vol_conf_subregions else pred_vol.new_zeros(pred_vol.shape[0], pred_vol.shape[1], 1),
+            "surface_route_entropy": torch.cat(surf_entropy_subregions, dim=1) if surf_entropy_subregions else pred_surf.new_zeros(pred_surf.shape[0], pred_surf.shape[1], 1),
+            "volume_route_entropy": torch.cat(vol_entropy_subregions, dim=1) if vol_entropy_subregions else pred_vol.new_zeros(pred_vol.shape[0], pred_vol.shape[1], 1),
+            "surface_evidence_mass": torch.cat(surf_evidence_subregions, dim=1) if surf_evidence_subregions else pred_surf.new_zeros(pred_surf.shape[0], pred_surf.shape[1], 1),
+            "volume_evidence_mass": torch.cat(vol_evidence_subregions, dim=1) if vol_evidence_subregions else pred_vol.new_zeros(pred_vol.shape[0], pred_vol.shape[1], 1),
+            "surface_raw_evidence_gate": torch.cat(surf_raw_gate_subregions, dim=1) if surf_raw_gate_subregions else pred_surf.new_zeros(pred_surf.shape[0], pred_surf.shape[1], 1),
+            "volume_raw_evidence_gate": torch.cat(vol_raw_gate_subregions, dim=1) if vol_raw_gate_subregions else pred_vol.new_zeros(pred_vol.shape[0], pred_vol.shape[1], 1),
             "mean_support_mass": pred_surf.new_tensor(support_sum / max(route_weight_sum, 1)),
             "mean_evidence_gate": pred_surf.new_tensor(gate_sum / max(route_weight_sum, 1)),
+            "mean_raw_evidence_gate": pred_surf.new_tensor(raw_gate_sum / max(route_weight_sum, 1)),
             "mean_route_confidence": pred_surf.new_tensor(route_conf_sum / max(route_weight_sum, 1)),
+            "mean_route_entropy": pred_surf.new_tensor(route_entropy_sum / max(route_weight_sum, 1)),
         }
         aux.update(debug_out)
         return pred_surf, pred_vol, aux

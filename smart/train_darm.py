@@ -116,6 +116,31 @@ def masked_group_sparsity(x, weight, eps=1.0e-8):
     return masked_mean(norms, weight)
 
 
+def relative_locality_penalty(spill_value, anchor_value, target_ratio, eps=1.0e-6):
+    target = anchor_value.detach() * float(target_ratio)
+    return F.relu(spill_value - target) / (anchor_value.detach() + eps)
+
+
+def masked_response_norm(pred, target, weight, eps=1.0e-8):
+    delta = pred.float() - target.float()
+    response = torch.sqrt(delta.pow(2).mean(dim=-1, keepdim=True) + eps)
+    return masked_mean(response, weight)
+
+
+def apply_gaussian_deformation(points, center, normal, sigma, edit_scale, ramp_power):
+    delta = points - center.unsqueeze(1)
+    dist2 = delta.float().pow(2).sum(dim=-1, keepdim=True)
+    sigma2 = sigma.float().unsqueeze(1).unsqueeze(-1).pow(2).clamp_min(1.0e-6)
+    weight = torch.exp(-0.5 * dist2 / sigma2).to(dtype=points.dtype)
+    weight = weight.pow(float(ramp_power))
+    if torch.is_tensor(edit_scale):
+        scale = edit_scale.to(device=points.device, dtype=points.dtype).unsqueeze(1).unsqueeze(-1)
+    else:
+        scale = points.new_tensor(float(edit_scale))
+    displacement = scale * weight * normal.unsqueeze(1)
+    return points + displacement
+
+
 def build_local_edit(
     geo_mesh,
     min_points,
@@ -125,38 +150,14 @@ def build_local_edit(
     changed_scale,
     unchanged_scale,
     candidate_points=8192,
-    underbody_bias=0.0,
-    underbody_candidate_points=4096,
-    underbody_low_fraction=0.25,
 ):
-    batch_size, num_points, spatial_dim = geo_mesh.shape
+    batch_size, num_points, _spatial_dim = geo_mesh.shape
     device = geo_mesh.device
     min_points = max(8, min(int(min_points), num_points))
     max_points = max(min_points, min(int(max_points), num_points))
     candidate_points = max(max_points, min(int(candidate_points), num_points))
 
     center_idx = torch.randint(0, num_points, (batch_size,), device=device, dtype=torch.long)
-    underbody_bias = float(underbody_bias)
-    if underbody_bias > 0.0:
-        underbody_candidate_points = max(32, min(int(underbody_candidate_points), num_points))
-        underbody_low_fraction = min(max(float(underbody_low_fraction), 1.0 / underbody_candidate_points), 1.0)
-        biased_mask = torch.rand(batch_size, device=device) < underbody_bias
-        if bool(biased_mask.any().item()):
-            underbody_pool_idx = torch.randint(
-                0,
-                num_points,
-                (batch_size, underbody_candidate_points),
-                device=device,
-                dtype=torch.long,
-            )
-            underbody_pool = gather_points(geo_mesh, underbody_pool_idx)
-            vertical = underbody_pool[..., -1]
-            low_count = max(1, int(round(underbody_candidate_points * underbody_low_fraction)))
-            low_rel_idx = torch.topk(-vertical, k=low_count, dim=1).indices
-            low_idx = underbody_pool_idx.gather(1, low_rel_idx)
-            pick_rel = torch.randint(0, low_count, (batch_size, 1), device=device, dtype=torch.long)
-            biased_center_idx = low_idx.gather(1, pick_rel).squeeze(1)
-            center_idx = torch.where(biased_mask, biased_center_idx, center_idx)
     center = geo_mesh[torch.arange(batch_size, device=device), center_idx]
     candidate_idx = torch.randint(0, num_points, (batch_size, candidate_points), device=device, dtype=torch.long)
     candidate_idx[:, 0] = center_idx
@@ -187,21 +188,44 @@ def build_local_edit(
     normal = eigvecs[..., 0].to(dtype=geo_mesh.dtype)
 
     signed = (centered * normal.unsqueeze(1)).sum(dim=-1)
-    projected = patch_points - float(edit_strength) * patch_weight.unsqueeze(-1) * signed.unsqueeze(-1) * normal.unsqueeze(1)
-    edited_patch = torch.where(valid.unsqueeze(-1), projected, patch_points)
+    signed_rms = torch.sqrt(
+        ((signed.float().pow(2) * patch_weight.float()).sum(dim=1) / weight_sum.squeeze(1).float()).clamp_min(1.0e-8)
+    ).to(dtype=geo_mesh.dtype)
+    edit_sigma = patch_radius.clamp_min(1.0e-6)
+    # Use a small signed normal bump/dent so the edit stays local and remains
+    # meaningful even on nearly planar patches where signed_rms is tiny.
+    amplitude_floor = 0.05 * patch_radius
+    amplitude_cap = 0.20 * patch_radius
+    amplitude = signed_rms.clamp_min(amplitude_floor)
+    amplitude = torch.minimum(amplitude, amplitude_cap)
+    direction = torch.where(
+        torch.rand(batch_size, device=device) < 0.5,
+        -torch.ones(batch_size, device=device, dtype=geo_mesh.dtype),
+        torch.ones(batch_size, device=device, dtype=geo_mesh.dtype),
+    )
+    edit_scale = direction * float(edit_strength) * amplitude
+    edited_geo = apply_gaussian_deformation(
+        geo_mesh,
+        center,
+        normal,
+        edit_sigma,
+        edit_scale=edit_scale,
+        ramp_power=ramp_power,
+    )
 
-    edited_geo = geo_mesh.clone()
-    edited_geo.scatter_(1, patch_idx.unsqueeze(-1).expand(-1, -1, spatial_dim), edited_patch)
-
-    changed_radius = patch_radius * float(changed_scale)
-    unchanged_radius = patch_radius * float(max(unchanged_scale, changed_scale + 1.0e-3))
-    return edited_geo, center, changed_radius, unchanged_radius
+    changed_radius = edit_sigma * float(changed_scale)
+    unchanged_radius = edit_sigma * float(max(unchanged_scale, changed_scale + 1.0e-3))
+    return edited_geo, center, normal, edit_sigma, edit_scale, changed_radius, unchanged_radius
 
 
 def build_query_locality_weights(query_pos, center, changed_radius, unchanged_radius):
-    dist = torch.linalg.vector_norm(query_pos - center.unsqueeze(1), dim=-1)
-    changed = (1.0 - dist / changed_radius.unsqueeze(1).clamp_min(1.0e-6)).clamp(0.0, 1.0)
-    unchanged = ((dist - changed_radius.unsqueeze(1)) / (unchanged_radius - changed_radius).unsqueeze(1).clamp_min(1.0e-6)).clamp(0.0, 1.0)
+    delta = query_pos - center.unsqueeze(1)
+    dist2 = delta.float().pow(2).sum(dim=-1)
+    changed_sigma2 = changed_radius.float().unsqueeze(1).pow(2).clamp_min(1.0e-6)
+    unchanged_sigma2 = unchanged_radius.float().unsqueeze(1).pow(2).clamp_min(1.0e-6)
+    changed = torch.exp(-0.5 * dist2 / changed_sigma2)
+    outer = torch.exp(-0.5 * dist2 / unchanged_sigma2)
+    unchanged = (outer - changed).clamp_min(0.0)
     return changed.to(dtype=query_pos.dtype), unchanged.to(dtype=query_pos.dtype)
 
 
@@ -239,12 +263,26 @@ def split_aux_batch(aux, split_index):
     return left, right
 
 
-def aux_scalar(value):
-    if not torch.is_tensor(value):
-        return float(value)
-    if value.ndim == 0:
-        return value
-    return value.float().mean()
+def aux_query_mean(aux, *keys):
+    ref = None
+    total = None
+    count = 0
+    for key in keys:
+        value = aux.get(key)
+        if not torch.is_tensor(value):
+            continue
+        ref = value if ref is None else ref
+        if value.ndim < 2 or value.shape[1] == 0:
+            continue
+        per_query = value.float().mean(dim=-1)
+        component = per_query.sum()
+        total = component if total is None else (total + component)
+        count += int(per_query.numel())
+    if ref is None:
+        return torch.tensor(0.0)
+    if count == 0:
+        return ref.new_zeros((), dtype=torch.float32)
+    return total / float(count)
 
 
 def update_ema_dict(ema_dict, value_dict, momentum):
@@ -519,13 +557,35 @@ def main(cfg: DictConfig):
         "mean_route_confidence_orig",
         "mean_route_confidence_edit",
         "mean_route_confidence",
+        "mean_route_entropy_orig",
+        "mean_route_entropy_edit",
+        "mean_route_entropy",
         "mean_evidence_gate_orig",
         "mean_evidence_gate_edit",
         "mean_evidence_gate",
+        "mean_raw_evidence_gate_orig",
+        "mean_raw_evidence_gate_edit",
+        "mean_raw_evidence_gate",
         "changed_support_mass_surface",
         "changed_support_mass_volume",
         "unchanged_support_mass_surface",
         "unchanged_support_mass_volume",
+        "changed_evidence_mass_surface",
+        "changed_evidence_mass_volume",
+        "unchanged_evidence_mass_surface",
+        "unchanged_evidence_mass_volume",
+        "changed_route_confidence_surface",
+        "changed_route_confidence_volume",
+        "unchanged_route_confidence_surface",
+        "unchanged_route_confidence_volume",
+        "changed_response_surface",
+        "changed_response_volume",
+        "unchanged_response_surface",
+        "unchanged_response_volume",
+        "changed_route_entropy_surface",
+        "changed_route_entropy_volume",
+        "unchanged_route_entropy_surface",
+        "unchanged_route_entropy_volume",
     ]
     log_every_n_steps = int(getattr(config, "log_every_n_steps", 0))
     console_log_every_n_steps = int(getattr(config, "console_log_every_n_steps", 0))
@@ -577,7 +637,8 @@ def main(cfg: DictConfig):
             high_sparsity_weight = float(getattr(config, "high_sparsity_weight", 0.0))
             supervised_weight = float(getattr(config, "supervised_weight", 1.0))
             loss_beta = float(getattr(config, "stability_smooth_l1_beta", getattr(config, "prediction_consistency_smooth_l1_beta", 0.05)))
-            stability_target_blend = float(getattr(config, "stability_target_blend", 0.5))
+            ghost_target_ratio = float(getattr(config, "ghost_target_ratio", 0.35))
+            ghost_absolute_weight = float(getattr(config, "ghost_absolute_weight", 0.1))
 
             for batch_idx, batch in enumerate(train_pbar):
                 batch_t0 = default_timer()
@@ -597,18 +658,32 @@ def main(cfg: DictConfig):
                 optimizer.zero_grad(set_to_none=True)
 
                 with torch.no_grad():
-                    edited_geo, edit_center, changed_radius, unchanged_radius = build_local_edit(
+                    edit_ramp_power = float(getattr(config, "edit_ramp_power", 1.5))
+                    edited_geo, edit_center, edit_normal, edit_sigma, edit_scale, changed_radius, unchanged_radius = build_local_edit(
                         geo_mesh,
                         min_points=int(getattr(config, "edit_patch_min_points", 256)),
                         max_points=int(getattr(config, "edit_patch_max_points", 1024)),
                         edit_strength=float(getattr(config, "edit_strength", 0.75)),
-                        ramp_power=float(getattr(config, "edit_ramp_power", 1.5)),
+                        ramp_power=edit_ramp_power,
                         changed_scale=float(getattr(config, "edit_changed_radius_scale", 1.2)),
                         unchanged_scale=float(getattr(config, "edit_unchanged_radius_scale", 2.5)),
                         candidate_points=int(getattr(config, "edit_candidate_points", 2048)),
-                        underbody_bias=float(getattr(config, "edit_underbody_bias", 0.0)),
-                        underbody_candidate_points=int(getattr(config, "edit_underbody_candidate_points", 4096)),
-                        underbody_low_fraction=float(getattr(config, "edit_underbody_low_fraction", 0.25)),
+                    )
+                    edited_surf_mesh = apply_gaussian_deformation(
+                        surf_mesh,
+                        edit_center,
+                        edit_normal,
+                        edit_sigma,
+                        edit_scale=edit_scale,
+                        ramp_power=edit_ramp_power,
+                    )
+                    edited_vol_mesh = apply_gaussian_deformation(
+                        vol_mesh,
+                        edit_center,
+                        edit_normal,
+                        edit_sigma,
+                        edit_scale=edit_scale,
+                        ramp_power=edit_ramp_power,
                     )
                     surf_changed_w, surf_unchanged_w = build_query_locality_weights(
                         surf_mesh, edit_center, changed_radius, unchanged_radius
@@ -620,8 +695,8 @@ def main(cfg: DictConfig):
 
                 with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=amp):
                     geo_pair = torch.cat([geo_mesh, edited_geo], dim=0)
-                    surf_pair = duplicate_batch(surf_mesh)
-                    vol_pair = duplicate_batch(vol_mesh)
+                    surf_pair = torch.cat([surf_mesh, edited_surf_mesh], dim=0)
+                    vol_pair = torch.cat([vol_mesh, edited_vol_mesh], dim=0)
                     params_pair = duplicate_batch(params)
 
                     y_pair_surf, y_pair_vol, aux_pair = train_model(
@@ -654,27 +729,61 @@ def main(cfg: DictConfig):
                     if use_surface_supervision:
                         stability_surface = masked_smooth_l1(
                             y_edit_surf_f,
-                            stability_target_blend * surf_data + (1.0 - stability_target_blend) * y_orig_surf_f.detach(),
+                            y_orig_surf_f.detach(),
                             surf_unchanged_w,
                             beta=loss_beta,
                         )
                         stability_loss = stability_loss + stability_surface
                     stability_volume = masked_smooth_l1(
                         y_edit_vol_f,
-                        stability_target_blend * vol_data + (1.0 - stability_target_blend) * y_orig_vol_f.detach(),
+                        y_orig_vol_f.detach(),
                         vol_unchanged_w,
                         beta=loss_beta,
                     )
                     stability_loss = stability_loss + stability_volume
 
+                    changed_support_mass_surface = (
+                        masked_mean(aux_edit["surface_support_mass"].float(), surf_changed_w)
+                        if use_surface_supervision else y_orig_vol_f.new_zeros(())
+                    )
+                    changed_support_mass_volume = masked_mean(aux_edit["volume_support_mass"].float(), vol_changed_w)
+                    unchanged_support_mass_surface = (
+                        masked_mean(aux_edit["surface_support_mass"].float(), surf_unchanged_w)
+                        if use_surface_supervision else y_orig_vol_f.new_zeros(())
+                    )
+                    unchanged_support_mass_volume = masked_mean(aux_edit["volume_support_mass"].float(), vol_unchanged_w)
+                    changed_response_surface = (
+                        masked_response_norm(y_edit_surf_f, y_orig_surf_f.detach(), surf_changed_w)
+                        if use_surface_supervision else y_orig_vol_f.new_zeros(())
+                    )
+                    changed_response_volume = masked_response_norm(y_edit_vol_f, y_orig_vol_f.detach(), vol_changed_w)
+                    unchanged_response_surface = (
+                        masked_response_norm(y_edit_surf_f, y_orig_surf_f.detach(), surf_unchanged_w)
+                        if use_surface_supervision else y_orig_vol_f.new_zeros(())
+                    )
+                    unchanged_response_volume = masked_response_norm(y_edit_vol_f, y_orig_vol_f.detach(), vol_unchanged_w)
+
                     ghost_loss = y_orig_vol_f.new_zeros(())
                     ghost_surface = y_orig_vol_f.new_zeros(())
                     ghost_volume = y_orig_vol_f.new_zeros(())
                     if ghost_weight > 0.0:
+                        # Penalize prediction-change spillover outside the edited locality.
                         if use_surface_supervision:
-                            ghost_surface = masked_mean(aux_edit["surface_support_mass"].float(), surf_changed_w)
+                            ghost_surface = relative_locality_penalty(
+                                unchanged_response_surface,
+                                changed_response_surface,
+                                target_ratio=ghost_target_ratio,
+                            )
+                            if ghost_absolute_weight > 0.0:
+                                ghost_surface = ghost_surface + ghost_absolute_weight * unchanged_response_surface
                             ghost_loss = ghost_loss + ghost_surface
-                        ghost_volume = masked_mean(aux_edit["volume_support_mass"].float(), vol_changed_w)
+                        ghost_volume = relative_locality_penalty(
+                            unchanged_response_volume,
+                            changed_response_volume,
+                            target_ratio=ghost_target_ratio,
+                        )
+                        if ghost_absolute_weight > 0.0:
+                            ghost_volume = ghost_volume + ghost_absolute_weight * unchanged_response_volume
                         ghost_loss = ghost_loss + ghost_volume
 
                     high_sparsity_loss = y_orig_vol_f.new_zeros(())
@@ -688,6 +797,40 @@ def main(cfg: DictConfig):
                             masked_group_sparsity(aux_orig["volume_high"], None)
                             + masked_group_sparsity(aux_edit["volume_high"], None)
                         )
+
+                    with torch.no_grad():
+                        changed_evidence_mass_surface = (
+                            masked_mean(aux_edit["surface_evidence_mass"].float(), surf_changed_w)
+                            if use_surface_supervision else y_orig_vol_f.new_zeros(())
+                        )
+                        changed_evidence_mass_volume = masked_mean(aux_edit["volume_evidence_mass"].float(), vol_changed_w)
+                        unchanged_evidence_mass_surface = (
+                            masked_mean(aux_edit["surface_evidence_mass"].float(), surf_unchanged_w)
+                            if use_surface_supervision else y_orig_vol_f.new_zeros(())
+                        )
+                        unchanged_evidence_mass_volume = masked_mean(aux_edit["volume_evidence_mass"].float(), vol_unchanged_w)
+
+                        changed_route_confidence_surface = (
+                            masked_mean(aux_edit["surface_route_confidence"].float(), surf_changed_w)
+                            if use_surface_supervision else y_orig_vol_f.new_zeros(())
+                        )
+                        changed_route_confidence_volume = masked_mean(aux_edit["volume_route_confidence"].float(), vol_changed_w)
+                        unchanged_route_confidence_surface = (
+                            masked_mean(aux_edit["surface_route_confidence"].float(), surf_unchanged_w)
+                            if use_surface_supervision else y_orig_vol_f.new_zeros(())
+                        )
+                        unchanged_route_confidence_volume = masked_mean(aux_edit["volume_route_confidence"].float(), vol_unchanged_w)
+
+                        changed_route_entropy_surface = (
+                            masked_mean(aux_edit["surface_route_entropy"].float(), surf_changed_w)
+                            if use_surface_supervision else y_orig_vol_f.new_zeros(())
+                        )
+                        changed_route_entropy_volume = masked_mean(aux_edit["volume_route_entropy"].float(), vol_changed_w)
+                        unchanged_route_entropy_surface = (
+                            masked_mean(aux_edit["surface_route_entropy"].float(), surf_unchanged_w)
+                            if use_surface_supervision else y_orig_vol_f.new_zeros(())
+                        )
+                        unchanged_route_entropy_volume = masked_mean(aux_edit["volume_route_entropy"].float(), vol_unchanged_w)
 
                     forward_t1 = default_timer()
 
@@ -767,38 +910,56 @@ def main(cfg: DictConfig):
                 train_losses["loss_stability_volume"] += stability_volume.detach().float() * batch_size_float
                 train_losses["loss_ghost_surface"] += ghost_surface.detach().float() * batch_size_float
                 train_losses["loss_ghost_volume"] += ghost_volume.detach().float() * batch_size_float
-                mean_support_mass = aux_scalar(aux_pair["mean_support_mass"]).detach().float()
-                mean_support_mass_orig = aux_scalar(aux_orig["mean_support_mass"]).detach().float()
-                mean_support_mass_edit = aux_scalar(aux_edit["mean_support_mass"]).detach().float()
-                mean_route_confidence = aux_scalar(aux_pair["mean_route_confidence"]).detach().float()
-                mean_route_confidence_orig = aux_scalar(aux_orig["mean_route_confidence"]).detach().float()
-                mean_route_confidence_edit = aux_scalar(aux_edit["mean_route_confidence"]).detach().float()
-                mean_evidence_gate = aux_scalar(aux_pair["mean_evidence_gate"]).detach().float()
-                mean_evidence_gate_orig = aux_scalar(aux_orig["mean_evidence_gate"]).detach().float()
-                mean_evidence_gate_edit = aux_scalar(aux_edit["mean_evidence_gate"]).detach().float()
-                changed_support_mass_surface = (
-                    masked_mean(aux_edit["surface_support_mass"].float(), surf_changed_w).detach().float()
-                    if use_surface_supervision else y_orig_vol_f.new_zeros(())
-                )
-                changed_support_mass_volume = masked_mean(aux_edit["volume_support_mass"].float(), vol_changed_w).detach().float()
-                unchanged_support_mass_surface = (
-                    masked_mean(aux_edit["surface_support_mass"].float(), surf_unchanged_w).detach().float()
-                    if use_surface_supervision else y_orig_vol_f.new_zeros(())
-                )
-                unchanged_support_mass_volume = masked_mean(aux_edit["volume_support_mass"].float(), vol_unchanged_w).detach().float()
+                mean_support_mass = aux_query_mean(aux_pair, "surface_support_mass", "volume_support_mass").detach().float()
+                mean_support_mass_orig = aux_query_mean(aux_orig, "surface_support_mass", "volume_support_mass").detach().float()
+                mean_support_mass_edit = aux_query_mean(aux_edit, "surface_support_mass", "volume_support_mass").detach().float()
+                mean_route_confidence = aux_query_mean(aux_pair, "surface_route_confidence", "volume_route_confidence").detach().float()
+                mean_route_confidence_orig = aux_query_mean(aux_orig, "surface_route_confidence", "volume_route_confidence").detach().float()
+                mean_route_confidence_edit = aux_query_mean(aux_edit, "surface_route_confidence", "volume_route_confidence").detach().float()
+                mean_route_entropy = aux_query_mean(aux_pair, "surface_route_entropy", "volume_route_entropy").detach().float()
+                mean_route_entropy_orig = aux_query_mean(aux_orig, "surface_route_entropy", "volume_route_entropy").detach().float()
+                mean_route_entropy_edit = aux_query_mean(aux_edit, "surface_route_entropy", "volume_route_entropy").detach().float()
+                mean_evidence_gate = aux_query_mean(aux_pair, "surface_evidence_mass", "volume_evidence_mass").detach().float()
+                mean_evidence_gate_orig = aux_query_mean(aux_orig, "surface_evidence_mass", "volume_evidence_mass").detach().float()
+                mean_evidence_gate_edit = aux_query_mean(aux_edit, "surface_evidence_mass", "volume_evidence_mass").detach().float()
+                mean_raw_evidence_gate = aux_query_mean(aux_pair, "surface_raw_evidence_gate", "volume_raw_evidence_gate").detach().float()
+                mean_raw_evidence_gate_orig = aux_query_mean(aux_orig, "surface_raw_evidence_gate", "volume_raw_evidence_gate").detach().float()
+                mean_raw_evidence_gate_edit = aux_query_mean(aux_edit, "surface_raw_evidence_gate", "volume_raw_evidence_gate").detach().float()
                 train_losses["mean_support_mass_orig"] += mean_support_mass_orig * batch_size_float
                 train_losses["mean_support_mass_edit"] += mean_support_mass_edit * batch_size_float
                 train_losses["mean_support_mass"] += mean_support_mass * batch_size_float
                 train_losses["mean_route_confidence_orig"] += mean_route_confidence_orig * batch_size_float
                 train_losses["mean_route_confidence_edit"] += mean_route_confidence_edit * batch_size_float
                 train_losses["mean_route_confidence"] += mean_route_confidence * batch_size_float
+                train_losses["mean_route_entropy_orig"] += mean_route_entropy_orig * batch_size_float
+                train_losses["mean_route_entropy_edit"] += mean_route_entropy_edit * batch_size_float
+                train_losses["mean_route_entropy"] += mean_route_entropy * batch_size_float
                 train_losses["mean_evidence_gate_orig"] += mean_evidence_gate_orig * batch_size_float
                 train_losses["mean_evidence_gate_edit"] += mean_evidence_gate_edit * batch_size_float
                 train_losses["mean_evidence_gate"] += mean_evidence_gate * batch_size_float
-                train_losses["changed_support_mass_surface"] += changed_support_mass_surface * batch_size_float
-                train_losses["changed_support_mass_volume"] += changed_support_mass_volume * batch_size_float
-                train_losses["unchanged_support_mass_surface"] += unchanged_support_mass_surface * batch_size_float
-                train_losses["unchanged_support_mass_volume"] += unchanged_support_mass_volume * batch_size_float
+                train_losses["mean_raw_evidence_gate_orig"] += mean_raw_evidence_gate_orig * batch_size_float
+                train_losses["mean_raw_evidence_gate_edit"] += mean_raw_evidence_gate_edit * batch_size_float
+                train_losses["mean_raw_evidence_gate"] += mean_raw_evidence_gate * batch_size_float
+                train_losses["changed_support_mass_surface"] += changed_support_mass_surface.detach().float() * batch_size_float
+                train_losses["changed_support_mass_volume"] += changed_support_mass_volume.detach().float() * batch_size_float
+                train_losses["unchanged_support_mass_surface"] += unchanged_support_mass_surface.detach().float() * batch_size_float
+                train_losses["unchanged_support_mass_volume"] += unchanged_support_mass_volume.detach().float() * batch_size_float
+                train_losses["changed_response_surface"] += changed_response_surface.detach().float() * batch_size_float
+                train_losses["changed_response_volume"] += changed_response_volume.detach().float() * batch_size_float
+                train_losses["unchanged_response_surface"] += unchanged_response_surface.detach().float() * batch_size_float
+                train_losses["unchanged_response_volume"] += unchanged_response_volume.detach().float() * batch_size_float
+                train_losses["changed_evidence_mass_surface"] += changed_evidence_mass_surface.detach().float() * batch_size_float
+                train_losses["changed_evidence_mass_volume"] += changed_evidence_mass_volume.detach().float() * batch_size_float
+                train_losses["unchanged_evidence_mass_surface"] += unchanged_evidence_mass_surface.detach().float() * batch_size_float
+                train_losses["unchanged_evidence_mass_volume"] += unchanged_evidence_mass_volume.detach().float() * batch_size_float
+                train_losses["changed_route_confidence_surface"] += changed_route_confidence_surface.detach().float() * batch_size_float
+                train_losses["changed_route_confidence_volume"] += changed_route_confidence_volume.detach().float() * batch_size_float
+                train_losses["unchanged_route_confidence_surface"] += unchanged_route_confidence_surface.detach().float() * batch_size_float
+                train_losses["unchanged_route_confidence_volume"] += unchanged_route_confidence_volume.detach().float() * batch_size_float
+                train_losses["changed_route_entropy_surface"] += changed_route_entropy_surface.detach().float() * batch_size_float
+                train_losses["changed_route_entropy_volume"] += changed_route_entropy_volume.detach().float() * batch_size_float
+                train_losses["unchanged_route_entropy_surface"] += unchanged_route_entropy_surface.detach().float() * batch_size_float
+                train_losses["unchanged_route_entropy_volume"] += unchanged_route_entropy_volume.detach().float() * batch_size_float
 
                 with torch.no_grad():
                     surface_loss = rel_l2_loss_fn(y_orig_surf_f, surf_data) if use_surface_supervision else torch.tensor(0.0, device=device)
@@ -846,13 +1007,35 @@ def main(cfg: DictConfig):
                             "train/batch_mean_route_confidence_orig": float(mean_route_confidence_orig.item()),
                             "train/batch_mean_route_confidence_edit": float(mean_route_confidence_edit.item()),
                             "train/batch_mean_route_confidence": float(mean_route_confidence.item()),
+                            "train/batch_mean_route_entropy_orig": float(mean_route_entropy_orig.item()),
+                            "train/batch_mean_route_entropy_edit": float(mean_route_entropy_edit.item()),
+                            "train/batch_mean_route_entropy": float(mean_route_entropy.item()),
                             "train/batch_mean_evidence_gate_orig": float(mean_evidence_gate_orig.item()),
                             "train/batch_mean_evidence_gate_edit": float(mean_evidence_gate_edit.item()),
                             "train/batch_mean_evidence_gate": float(mean_evidence_gate.item()),
+                            "train/batch_mean_raw_evidence_gate_orig": float(mean_raw_evidence_gate_orig.item()),
+                            "train/batch_mean_raw_evidence_gate_edit": float(mean_raw_evidence_gate_edit.item()),
+                            "train/batch_mean_raw_evidence_gate": float(mean_raw_evidence_gate.item()),
                             "train/batch_changed_support_mass_surface": float(changed_support_mass_surface.item()),
                             "train/batch_changed_support_mass_volume": float(changed_support_mass_volume.item()),
                             "train/batch_unchanged_support_mass_surface": float(unchanged_support_mass_surface.item()),
                             "train/batch_unchanged_support_mass_volume": float(unchanged_support_mass_volume.item()),
+                            "train/batch_changed_response_surface": float(changed_response_surface.item()),
+                            "train/batch_changed_response_volume": float(changed_response_volume.item()),
+                            "train/batch_unchanged_response_surface": float(unchanged_response_surface.item()),
+                            "train/batch_unchanged_response_volume": float(unchanged_response_volume.item()),
+                            "train/batch_changed_evidence_mass_surface": float(changed_evidence_mass_surface.item()),
+                            "train/batch_changed_evidence_mass_volume": float(changed_evidence_mass_volume.item()),
+                            "train/batch_unchanged_evidence_mass_surface": float(unchanged_evidence_mass_surface.item()),
+                            "train/batch_unchanged_evidence_mass_volume": float(unchanged_evidence_mass_volume.item()),
+                            "train/batch_changed_route_confidence_surface": float(changed_route_confidence_surface.item()),
+                            "train/batch_changed_route_confidence_volume": float(changed_route_confidence_volume.item()),
+                            "train/batch_unchanged_route_confidence_surface": float(unchanged_route_confidence_surface.item()),
+                            "train/batch_unchanged_route_confidence_volume": float(unchanged_route_confidence_volume.item()),
+                            "train/batch_changed_route_entropy_surface": float(changed_route_entropy_surface.item()),
+                            "train/batch_changed_route_entropy_volume": float(changed_route_entropy_volume.item()),
+                            "train/batch_unchanged_route_entropy_surface": float(unchanged_route_entropy_surface.item()),
+                            "train/batch_unchanged_route_entropy_volume": float(unchanged_route_entropy_volume.item()),
                             "train/stability_weight": stability_weight,
                             "train/ghost_weight": ghost_weight,
                             "lr": scheduler.get_last_lr()[0],
@@ -948,7 +1131,8 @@ def main(cfg: DictConfig):
                     "lr": scheduler.get_last_lr()[0],
                     "train/stability_weight": stability_weight,
                     "train/ghost_weight": ghost_weight,
-                    "train/stability_target_blend": stability_target_blend,
+                    "train/ghost_target_ratio": ghost_target_ratio,
+                    "train/ghost_absolute_weight": ghost_absolute_weight,
                 }
                 train_log_values = train_losses_log if track_train_channel_metrics else {
                     key: value
@@ -972,13 +1156,35 @@ def main(cfg: DictConfig):
                         "mean_route_confidence_orig",
                         "mean_route_confidence_edit",
                         "mean_route_confidence",
+                        "mean_route_entropy_orig",
+                        "mean_route_entropy_edit",
+                        "mean_route_entropy",
                         "mean_evidence_gate_orig",
                         "mean_evidence_gate_edit",
                         "mean_evidence_gate",
+                        "mean_raw_evidence_gate_orig",
+                        "mean_raw_evidence_gate_edit",
+                        "mean_raw_evidence_gate",
                         "changed_support_mass_surface",
                         "changed_support_mass_volume",
                         "unchanged_support_mass_surface",
                         "unchanged_support_mass_volume",
+                        "changed_response_surface",
+                        "changed_response_volume",
+                        "unchanged_response_surface",
+                        "unchanged_response_volume",
+                        "changed_evidence_mass_surface",
+                        "changed_evidence_mass_volume",
+                        "unchanged_evidence_mass_surface",
+                        "unchanged_evidence_mass_volume",
+                        "changed_route_confidence_surface",
+                        "changed_route_confidence_volume",
+                        "unchanged_route_confidence_surface",
+                        "unchanged_route_confidence_volume",
+                        "changed_route_entropy_surface",
+                        "changed_route_entropy_volume",
+                        "unchanged_route_entropy_surface",
+                        "unchanged_route_entropy_volume",
                     }
                 }
                 wandb_dict.update({f"train/{key}": value for key, value in train_log_values.items()})

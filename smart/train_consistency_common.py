@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from timeit import default_timer
 
 import numpy as np
@@ -372,8 +373,7 @@ def sample_uniform_beta(beta_min, beta_max, generator):
     return float(torch.empty((), dtype=torch.float32).uniform_(beta_min, beta_max, generator=generator).item())
 
 
-def _sample_single_view_indices(log_density_row, num_points, mode, inverse_density_beta, mixed_inverse_density_prob, generator):
-    n_points = int(log_density_row.shape[0])
+def _sample_single_view_indices(log_density_row, n_points, num_points, mode, inverse_density_beta, mixed_inverse_density_prob, generator):
     resolved_mode = _resolve_sampling_mode(mode, mixed_inverse_density_prob, generator)
 
     if num_points <= 0:
@@ -388,6 +388,10 @@ def _sample_single_view_indices(log_density_row, num_points, mode, inverse_densi
         return torch.randint(0, n_points, (num_points,), generator=generator, dtype=torch.long), resolved_mode
 
     if resolved_mode in {"inverse_density_wor", "inverse_density_wr"}:
+        if log_density_row is None:
+            raise RuntimeError(
+                f"Sampling mode {resolved_mode!r} requires geometry log density, but none was provided."
+            )
         replacement = resolved_mode.endswith("_wr")
         if not replacement and num_points >= n_points:
             return torch.arange(n_points, dtype=torch.long), resolved_mode
@@ -404,16 +408,19 @@ def _sample_single_view_indices(log_density_row, num_points, mode, inverse_densi
 
 
 def sample_geometry_view(geo_mesh, geo_log_density, num_points, mode, inverse_density_beta, mixed_inverse_density_prob, seed):
-    if geo_log_density is None:
-        raise RuntimeError("Consistency training requires geometry log density for view sampling.")
+    if geo_log_density is None and _sampling_mode_requires_density(mode):
+        raise RuntimeError(f"Sampling mode {mode!r} requires geometry log density for view sampling.")
 
     idx_rows = []
     resolved_modes = []
     batch_size = int(geo_mesh.shape[0])
+    n_points = int(geo_mesh.shape[1])
     for batch_idx in range(batch_size):
         generator = _cpu_generator(seed + 1009 * batch_idx)
+        log_density_row = None if geo_log_density is None else geo_log_density[batch_idx]
         idx_row, resolved_mode = _sample_single_view_indices(
-            geo_log_density[batch_idx],
+            log_density_row,
+            n_points=n_points,
             num_points=num_points,
             mode=mode,
             inverse_density_beta=inverse_density_beta,
@@ -424,7 +431,8 @@ def sample_geometry_view(geo_mesh, geo_log_density, num_points, mode, inverse_de
         resolved_modes.append(resolved_mode)
 
     idx = torch.stack(idx_rows, dim=0)
-    return gather_points(geo_mesh, idx), gather_scalar(geo_log_density, idx), resolved_modes
+    sampled_density = None if geo_log_density is None else gather_scalar(geo_log_density, idx)
+    return gather_points(geo_mesh, idx), sampled_density, resolved_modes
 
 
 class GradNormBalancer(torch.nn.Module):
@@ -654,6 +662,101 @@ def duplicate_batch_tensor(x):
     return torch.cat([x, x], dim=0)
 
 
+def _optional_positive_int(value):
+    if value is None:
+        return None
+    value = int(value)
+    return value if value > 0 else None
+
+
+def _sampling_mode_requires_density(mode):
+    mode = str(mode)
+    return mode == "mixed" or mode.startswith("inverse_density")
+
+
+@contextmanager
+def temporary_model_attr(model, attr_name, value):
+    value = _optional_positive_int(value)
+    if value is None:
+        yield
+        return
+
+    base_model = unwrap_model(model)
+    if not hasattr(base_model, attr_name):
+        yield
+        return
+
+    old_value = getattr(base_model, attr_name)
+    setattr(base_model, attr_name, value)
+    try:
+        yield
+    finally:
+        setattr(base_model, attr_name, old_value)
+
+
+def forward_model_view(
+    model,
+    geo,
+    surf_mesh,
+    vol_mesh,
+    params,
+    *,
+    model_requires_density,
+    geo_log_density=None,
+    return_latent=False,
+    subsampled_geometry_points=None,
+):
+    with temporary_model_attr(model, "subsampled_geometry_points", subsampled_geometry_points):
+        if model_requires_density:
+            if return_latent:
+                return model(
+                    geo,
+                    surf_mesh,
+                    vol_mesh,
+                    params,
+                    geo_log_density=geo_log_density,
+                    return_latent=True,
+                )
+            return model(
+                geo,
+                surf_mesh,
+                vol_mesh,
+                params,
+                geo_log_density=geo_log_density,
+            )
+        if return_latent:
+            return model(
+                geo,
+                surf_mesh,
+                vol_mesh,
+                params,
+                return_latent=True,
+            )
+        return model(
+            geo,
+            surf_mesh,
+            vol_mesh,
+            params,
+        )
+
+
+def inference_model_view(
+    model,
+    geo,
+    surf_mesh,
+    vol_mesh,
+    params,
+    *,
+    model_requires_density,
+    geo_log_density=None,
+    subsampled_geometry_points=None,
+):
+    with temporary_model_attr(model, "subsampled_geometry_points", subsampled_geometry_points):
+        if model_requires_density:
+            return model.inference(geo, surf_mesh, vol_mesh, params, geo_log_density=geo_log_density)
+        return model.inference(geo, surf_mesh, vol_mesh, params)
+
+
 def evaluate_loader(
     model,
     loader,
@@ -673,6 +776,7 @@ def evaluate_loader(
     use_surface_supervision,
     mode_name,
     num_view_points,
+    eval_subsampled_geometry_points,
     fixed_seed_offset,
     model_requires_density,
 ):
@@ -701,13 +805,20 @@ def evaluate_loader(
             vol_mesh = vol_mesh.to(device, non_blocking=True)
             vol_data = vol_data.to(device, non_blocking=True)
             view_geo = view_geo.to(device, non_blocking=True)
-            view_log_density = view_log_density.to(device, non_blocking=True)
+            if model_requires_density:
+                view_log_density = view_log_density.to(device, non_blocking=True)
 
             with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=amp):
-                if model_requires_density:
-                    y_hat_surf, y_hat_vol = model.inference(view_geo, surf_mesh, vol_mesh, params, geo_log_density=view_log_density)
-                else:
-                    y_hat_surf, y_hat_vol = model.inference(view_geo, surf_mesh, vol_mesh, params)
+                y_hat_surf, y_hat_vol = inference_model_view(
+                    model,
+                    view_geo,
+                    surf_mesh,
+                    vol_mesh,
+                    params,
+                    model_requires_density=model_requires_density,
+                    geo_log_density=view_log_density if model_requires_density else None,
+                    subsampled_geometry_points=eval_subsampled_geometry_points,
+                )
 
             if use_surface_supervision:
                 pred_surf = y_hat_surf * std_surf + mean_surf
@@ -930,6 +1041,27 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
     start_epoch = 0
     log_every_n_steps = getattr(config, "log_every_n_steps", 10)
 
+    primary_view_points = int(getattr(config, "primary_view_geometry_points", getattr(config, "view_geometry_points", 0)))
+    secondary_view_points = int(getattr(config, "secondary_view_geometry_points", getattr(config, "view_geometry_points", 0)))
+    eval_aligned_view_points = int(
+        getattr(config, "eval_aligned_view_geometry_points", getattr(config, "eval_view_geometry_points", primary_view_points))
+    )
+    eval_shifted_view_points = int(
+        getattr(config, "eval_shifted_view_geometry_points", getattr(config, "eval_view_geometry_points", secondary_view_points))
+    )
+    primary_view_subsampled_geometry_points = _optional_positive_int(
+        getattr(config, "primary_view_subsampled_geometry_points", 0)
+    )
+    secondary_view_subsampled_geometry_points = _optional_positive_int(
+        getattr(config, "secondary_view_subsampled_geometry_points", 0)
+    )
+    eval_aligned_subsampled_geometry_points = _optional_positive_int(
+        getattr(config, "eval_aligned_subsampled_geometry_points", primary_view_subsampled_geometry_points or 0)
+    )
+    eval_shifted_subsampled_geometry_points = _optional_positive_int(
+        getattr(config, "eval_shifted_subsampled_geometry_points", secondary_view_subsampled_geometry_points or 0)
+    )
+
     init_ckpt = str(getattr(config, "init_ckpt", "")).strip()
     resume_ckpt = str(getattr(config, "resume_ckpt", "")).strip()
     resume_full_state = bool(getattr(config, "resume_full_state", False))
@@ -1009,6 +1141,18 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
         "learned_logit_prediction_consistency",
     ]
 
+    fuse_consistency_views = bool(getattr(config, "fuse_consistency_views", False))
+    if (
+        primary_view_points != secondary_view_points
+        or primary_view_subsampled_geometry_points != secondary_view_subsampled_geometry_points
+    ):
+        if fuse_consistency_views and is_main_process():
+            print(
+                "[consistency] Disabling fused consistency views because primary and secondary "
+                "geometry budgets differ."
+            )
+        fuse_consistency_views = False
+
     try:
         for ep in tqdm(range(start_epoch, config.epochs), desc="Epochs", dynamic_ncols=True):
             t1 = default_timer()
@@ -1037,17 +1181,23 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
 
             for batch_idx, batch in enumerate(train_pbar):
                 geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, geo_log_density = unpack_batch(batch, params_dim)
-                if geo_log_density is None:
+                primary_sampling_mode = str(getattr(config, "train_primary_sampling_mode", "uniform_wor"))
+                secondary_sampling_mode = str(getattr(config, "train_secondary_sampling_mode", "mixed"))
+                if geo_log_density is None and (
+                    _sampling_mode_requires_density(primary_sampling_mode)
+                    or _sampling_mode_requires_density(secondary_sampling_mode)
+                ):
                     raise RuntimeError(
-                        f"{config.model_name} consistency training requires geometry log density from the dataset "
-                        "for geometry-view resampling."
+                        f"{config.model_name} requested density-based geometry-view resampling "
+                        f"(primary={primary_sampling_mode!r}, secondary={secondary_sampling_mode!r}) "
+                        "but the dataset did not return geometry log density."
                     )
 
                 primary_view_geo, primary_view_density, _ = sample_geometry_view(
                     geo_mesh,
                     geo_log_density,
-                    num_points=int(getattr(config, "view_geometry_points", 0)),
-                    mode=str(getattr(config, "train_primary_sampling_mode", "uniform_wor")),
+                    num_points=primary_view_points,
+                    mode=primary_sampling_mode,
                     inverse_density_beta=float(getattr(config, "inverse_density_beta", 1.0)),
                     mixed_inverse_density_prob=float(getattr(config, "mixed_inverse_density_prob", 0.5)),
                     seed=int(config.random_seed + ep * 1000003 + batch_idx * 10007 + 11),
@@ -1064,8 +1214,8 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                 secondary_view_geo, secondary_view_density, secondary_modes = sample_geometry_view(
                     geo_mesh,
                     geo_log_density,
-                    num_points=int(getattr(config, "view_geometry_points", 0)),
-                    mode=str(getattr(config, "train_secondary_sampling_mode", "mixed")),
+                    num_points=secondary_view_points,
+                    mode=secondary_sampling_mode,
                     inverse_density_beta=secondary_inverse_density_beta,
                     mixed_inverse_density_prob=float(getattr(config, "mixed_inverse_density_prob", 0.5)),
                     seed=int(config.random_seed + ep * 1000003 + batch_idx * 10007 + 29),
@@ -1088,48 +1238,27 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                 if model_requires_density:
                     secondary_view_density = secondary_view_density.to(device, non_blocking=True)
 
-                fuse_consistency_views = bool(getattr(config, "fuse_consistency_views", False))
                 with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=amp):
                     if fuse_consistency_views:
                         fused_geo = torch.cat([primary_view_geo, secondary_view_geo], dim=0)
                         fused_surf_mesh = duplicate_batch_tensor(surf_mesh)
                         fused_vol_mesh = duplicate_batch_tensor(vol_mesh)
                         fused_params = duplicate_batch_tensor(params)
-                        if model_requires_density:
-                            fused_density = torch.cat([primary_view_density, secondary_view_density], dim=0)
-                            if use_latent_consistency:
-                                fused_out = train_model(
-                                    fused_geo,
-                                    fused_surf_mesh,
-                                    fused_vol_mesh,
-                                    fused_params,
-                                    geo_log_density=fused_density,
-                                    return_latent=True,
-                                )
-                            else:
-                                fused_out = train_model(
-                                    fused_geo,
-                                    fused_surf_mesh,
-                                    fused_vol_mesh,
-                                    fused_params,
-                                    geo_log_density=fused_density,
-                                )
-                        else:
-                            if use_latent_consistency:
-                                fused_out = train_model(
-                                    fused_geo,
-                                    fused_surf_mesh,
-                                    fused_vol_mesh,
-                                    fused_params,
-                                    return_latent=True,
-                                )
-                            else:
-                                fused_out = train_model(
-                                    fused_geo,
-                                    fused_surf_mesh,
-                                    fused_vol_mesh,
-                                    fused_params,
-                                )
+                        fused_density = (
+                            torch.cat([primary_view_density, secondary_view_density], dim=0)
+                            if model_requires_density else None
+                        )
+                        fused_out = forward_model_view(
+                            train_model,
+                            fused_geo,
+                            fused_surf_mesh,
+                            fused_vol_mesh,
+                            fused_params,
+                            model_requires_density=model_requires_density,
+                            geo_log_density=fused_density,
+                            return_latent=use_latent_consistency,
+                            subsampled_geometry_points=primary_view_subsampled_geometry_points,
+                        )
                         if use_latent_consistency:
                             fused_surf, fused_vol, fused_latent = fused_out
                             y1_surf, y2_surf = fused_surf.chunk(2, dim=0)
@@ -1142,79 +1271,33 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             latent1 = None
                             latent2 = None
                     else:
-                        if model_requires_density:
-                            if use_latent_consistency:
-                                primary_out = train_model(
-                                    primary_view_geo,
-                                    surf_mesh,
-                                    vol_mesh,
-                                    params,
-                                    geo_log_density=primary_view_density,
-                                    return_latent=True,
-                                )
-                            else:
-                                primary_out = train_model(
-                                    primary_view_geo,
-                                    surf_mesh,
-                                    vol_mesh,
-                                    params,
-                                    geo_log_density=primary_view_density,
-                                )
-                        else:
-                            if use_latent_consistency:
-                                primary_out = train_model(
-                                    primary_view_geo,
-                                    surf_mesh,
-                                    vol_mesh,
-                                    params,
-                                    return_latent=True,
-                                )
-                            else:
-                                primary_out = train_model(
-                                    primary_view_geo,
-                                    surf_mesh,
-                                    vol_mesh,
-                                    params,
-                                )
+                        primary_out = forward_model_view(
+                            train_model,
+                            primary_view_geo,
+                            surf_mesh,
+                            vol_mesh,
+                            params,
+                            model_requires_density=model_requires_density,
+                            geo_log_density=primary_view_density if model_requires_density else None,
+                            return_latent=use_latent_consistency,
+                            subsampled_geometry_points=primary_view_subsampled_geometry_points,
+                        )
                         if use_latent_consistency:
                             y1_surf, y1_vol, latent1 = primary_out
                         else:
                             y1_surf, y1_vol = primary_out
                             latent1 = None
-                        if model_requires_density:
-                            if use_latent_consistency:
-                                secondary_out = train_model(
-                                    secondary_view_geo,
-                                    surf_mesh,
-                                    vol_mesh,
-                                    params,
-                                    geo_log_density=secondary_view_density,
-                                    return_latent=True,
-                                )
-                            else:
-                                secondary_out = train_model(
-                                    secondary_view_geo,
-                                    surf_mesh,
-                                    vol_mesh,
-                                    params,
-                                    geo_log_density=secondary_view_density,
-                                )
-                        else:
-                            if use_latent_consistency:
-                                secondary_out = train_model(
-                                    secondary_view_geo,
-                                    surf_mesh,
-                                    vol_mesh,
-                                    params,
-                                    return_latent=True,
-                                )
-                            else:
-                                secondary_out = train_model(
-                                    secondary_view_geo,
-                                    surf_mesh,
-                                    vol_mesh,
-                                    params,
-                                )
+                        secondary_out = forward_model_view(
+                            train_model,
+                            secondary_view_geo,
+                            surf_mesh,
+                            vol_mesh,
+                            params,
+                            model_requires_density=model_requires_density,
+                            geo_log_density=secondary_view_density if model_requires_density else None,
+                            return_latent=use_latent_consistency,
+                            subsampled_geometry_points=secondary_view_subsampled_geometry_points,
+                        )
                         if use_latent_consistency:
                             y2_surf, y2_vol, latent2 = secondary_out
                         else:
@@ -1509,7 +1592,8 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     loss_fn=loss_fn,
                     use_surface_supervision=use_surface_supervision,
                     mode_name=str(getattr(config, "eval_aligned_sampling_mode", "uniform_wor")),
-                    num_view_points=int(getattr(config, "eval_view_geometry_points", getattr(config, "view_geometry_points", 0))),
+                    num_view_points=eval_aligned_view_points,
+                    eval_subsampled_geometry_points=eval_aligned_subsampled_geometry_points,
                     fixed_seed_offset=50000011,
                     model_requires_density=model_requires_density,
                 )
@@ -1531,7 +1615,8 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     loss_fn=loss_fn,
                     use_surface_supervision=use_surface_supervision,
                     mode_name=str(getattr(config, "eval_shifted_sampling_mode", "inverse_density_wor")),
-                    num_view_points=int(getattr(config, "eval_view_geometry_points", getattr(config, "view_geometry_points", 0))),
+                    num_view_points=eval_shifted_view_points,
+                    eval_subsampled_geometry_points=eval_shifted_subsampled_geometry_points,
                     fixed_seed_offset=70000029,
                     model_requires_density=model_requires_density,
                 )

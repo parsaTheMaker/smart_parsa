@@ -45,6 +45,9 @@ experiment:
     high_hidden_dim: 64
     prediction_query_chunk_size: 32768
     use_high_value_block: False
+    route_confidence_floor: 0.15
+    route_entropy_mix: 0.75
+    route_margin_norm_eps: 1.e-4
 
   optimizer: "adamw"
   loss_fn: "rel_l2"
@@ -69,9 +72,10 @@ experiment:
   supervised_weight: 1.0
   stability_weight: 0.5
   ghost_suppression_weight: 0.25
-  high_sparsity_weight: 5.e-4
+  ghost_target_ratio: 0.35
+  ghost_absolute_weight: 0.1
+  high_sparsity_weight: 0.0
   stability_smooth_l1_beta: 0.05
-  stability_target_blend: 0.5
   edit_warmup_epochs: 10
   loss_balance_enabled: True
   loss_balance_reference: "supervised"
@@ -83,9 +87,6 @@ experiment:
   edit_patch_min_points: 256
   edit_patch_max_points: 1024
   edit_candidate_points: 2048
-  edit_underbody_bias: 0.7
-  edit_underbody_candidate_points: 4096
-  edit_underbody_low_fraction: 0.25
   edit_strength: 0.75
   edit_ramp_power: 1.5
   edit_changed_radius_scale: 1.2

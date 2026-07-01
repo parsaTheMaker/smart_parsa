@@ -64,6 +64,8 @@ def get_dataset(config):
         if dataset == "DrivAerML":
             dataset_kwargs["require_preprocessed"] = True
             dataset_kwargs["geometry_epoch_seeded_sampling"] = bool(getattr(config, "geometry_epoch_seeded_sampling", False))
+            dataset_kwargs["return_sample_info"] = getattr(config, "model_name", "") == "DARM"
+            dataset_kwargs["return_half_precision"] = getattr(config, "model_name", "") == "DARM" and getattr(config, "precision", "") == "float16"
             model_name = getattr(config, "model_name", "")
             if _uses_drivaerml_geometry_density(model_name):
                 arch = getattr(config, "architecture", {})

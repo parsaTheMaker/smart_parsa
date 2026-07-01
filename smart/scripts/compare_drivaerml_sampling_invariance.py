@@ -36,6 +36,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 import torch
 from omegaconf import OmegaConf
@@ -140,6 +141,7 @@ MODEL_COLORS = {
     "POINTNET": "#6C6F7D",
     "POINTNET_SATLOSS3": "#4C78A8",
 }
+DRAG_RANK_MODELS = ["SMART", "SMART_SATLOSS3", "SMART_SATLOSS5"]
 FAMILY_GROUPS = OrderedDict(
     [
         ("smart_family", ["SMART", "SMART_SAT", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5"]),
@@ -407,7 +409,9 @@ def build_model(config, ckpt_path: str, device: torch.device, batched_query_subr
     model.load_state_dict(state, strict=True)
     model.eval()
     if hasattr(model, "subregion_size"):
-        model.subregion_size = min(int(model.subregion_size), int(batched_query_subregion_size))
+        # Do not silently shrink the model's native query chunking.
+        # Larger chunks improve throughput when they fit comfortably in VRAM.
+        model.subregion_size = max(int(model.subregion_size), max(1, int(batched_query_subregion_size)))
     return model
 
 
@@ -560,10 +564,12 @@ def save_density_histogram(path: Path, log_density_values: np.ndarray, title: st
     finite_density = density_vals[finite_mask]
     if finite_density.size == 0:
         finite_density = np.array([1.0], dtype=np.float64)
-    lo_density = float(np.percentile(finite_density, 5.0))
-    hi_density = float(np.percentile(finite_density, 95.0))
+    lo_density = float(np.percentile(finite_density, 2.0))
+    hi_density = float(np.percentile(finite_density, 98.0))
     lo_density = max(lo_density, 1e-24)
     hi_density = max(hi_density, lo_density * 1.0001)
+    display_lo = max(lo_density / 1.5, 1e-24)
+    display_hi = hi_density * 1.5
     window_density = finite_density[(finite_density >= lo_density) & (finite_density <= hi_density)]
     if window_density.size == 0:
         window_density = finite_density
@@ -571,6 +577,10 @@ def save_density_histogram(path: Path, log_density_values: np.ndarray, title: st
     fig, ax = plt.subplots(figsize=(8.0, 5.0), constrained_layout=True)
     ax.hist(window_density, bins=bins, color="#4C78A8", alpha=0.9, edgecolor="white", linewidth=0.3)
     ax.set_xscale("log")
+    ax.xaxis.set_major_locator(mticker.LogLocator(base=10.0, numticks=12))
+    ax.xaxis.set_major_formatter(mticker.LogFormatterMathtext(base=10.0))
+    ax.xaxis.set_minor_locator(mticker.LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1, numticks=100))
+    ax.xaxis.set_minor_formatter(mticker.NullFormatter())
     ax.set_xlabel("Density")
     ax.set_ylabel("Count")
     ax.set_yscale("log")
@@ -582,7 +592,7 @@ def save_density_histogram(path: Path, log_density_values: np.ndarray, title: st
         [],
         [],
         color="none",
-        label=f"std={std_val:.3g}\nN={window_density.size}\np5={lo_density:.3g}, p95={hi_density:.3g}",
+        label=f"std={std_val:.3g}\nN={window_density.size}\np2={lo_density:.3g}, p98={hi_density:.3g}",
     )
     ax.legend(
         handles=[mean_handle, stats_handle],
@@ -595,17 +605,7 @@ def save_density_histogram(path: Path, log_density_values: np.ndarray, title: st
         handlelength=2.0,
         handletextpad=0.8,
     )
-    ax.set_xlim(lo_density, hi_density)
-    ax.text(
-        0.98,
-        0.95,
-        "trimmed to p5-p95",
-        transform=ax.transAxes,
-        ha="right",
-        va="top",
-        fontsize=10,
-        bbox={"facecolor": "white", "alpha": 0.75, "edgecolor": "#CCCCCC"},
-    )
+    ax.set_xlim(display_lo, display_hi)
     fig.savefig(path, dpi=220)
     plt.close(fig)
 
@@ -1184,6 +1184,59 @@ def plot_numeric_mode_curve_with_band(
     plt.close(fig)
 
 
+def plot_ranked_curve_with_band(
+    rows: List[Dict[str, object]],
+    mode_name: str,
+    value_key: str,
+    sort_key: str,
+    out_path: Path,
+    title: str,
+    model_order: Sequence[str],
+    x_label: str = "Run rank sorted by full-surface ground-truth drag",
+    y_label: str = "Full-surface drag force x",
+) -> None:
+    mode_rows = [r for r in rows if r["sampling_mode"] == mode_name and r["model_name"] in model_order]
+    if not mode_rows:
+        return
+
+    ref_model = next((m for m in model_order if any(r["model_name"] == m for r in mode_rows)), None)
+    if ref_model is None:
+        return
+    ref_rows = [r for r in mode_rows if r["model_name"] == ref_model]
+    run_order_pairs = sorted(
+        ((int(r["run_id"]), float(r[sort_key])) for r in ref_rows),
+        key=lambda item: item[1],
+    )
+    run_order = [run_id for run_id, _ in run_order_pairs]
+    if not run_order:
+        return
+
+    x = np.arange(len(run_order), dtype=np.float64)
+    fig, ax = plt.subplots(figsize=(9.5, 5.8), constrained_layout=True)
+
+    ref_map = {int(r["run_id"]): r for r in ref_rows}
+    gt_y = np.array([float(ref_map[run_id][sort_key]) for run_id in run_order], dtype=np.float64)
+    ax.plot(x, gt_y, color="black", linestyle="--", linewidth=1.6, label="GT")
+
+    for model_name in model_order:
+        model_rows = {int(r["run_id"]): r for r in mode_rows if r["model_name"] == model_name}
+        if not model_rows:
+            continue
+        ys = np.array([float(model_rows[run_id][value_key]) for run_id in run_order], dtype=np.float64)
+        yerr_key = f"{value_key}_std"
+        yerr = np.array([float(model_rows[run_id].get(yerr_key, 0.0)) for run_id in run_order], dtype=np.float64)
+        color = MODEL_COLORS[model_name]
+        ax.plot(x, ys, marker="o", linewidth=2, color=color, label=MODEL_LABELS[model_name])
+        ax.fill_between(x, ys - yerr, ys + yerr, color=color, alpha=0.16)
+
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.set_title(title)
+    ax.legend()
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
 def plot_delta_bars(run_delta_rows: List[Dict[str, object]], metric_key: str, out_path: Path, title: str) -> None:
     means = []
     stds = []
@@ -1390,7 +1443,7 @@ def main():
     max_pos = dataset.max_pos
 
     models = {
-        model_name: build_model(spec["config"], spec["checkpoint"], device, batched_query_subregion_size=args.batched_query_subregion_size)
+        model_name: build_model(spec["config"], spec["checkpoint"], device, batched_query_subregion_size=args.batched_query_subregion_size).to(device)
         for model_name, spec in model_specs.items()
     }
     model_internal_density_specs: Dict[str, Dict[str, object]] = {}
@@ -1515,8 +1568,17 @@ def main():
     out_root.mkdir(parents=True, exist_ok=True)
 
     per_view_rows: List[Dict[str, object]] = []
-    view_batch_size = max(1, int(args.view_batch_size))
+    drag_rank_view_rows: List[Dict[str, object]] = []
     views_per_mode = max(1, int(args.views_per_mode))
+    view_batch_size = max(1, int(args.view_batch_size))
+    if view_batch_size == 1 and views_per_mode > 1:
+        boosted_view_batch_size = min(views_per_mode, 2)
+        if boosted_view_batch_size > view_batch_size:
+            print(
+                f"[info] Bumping view batch size from {view_batch_size} to {boosted_view_batch_size} "
+                "to improve GPU utilization without changing the comparison."
+            )
+            view_batch_size = boosted_view_batch_size
 
     for run_id in tqdm(run_ids, desc="Runs", dynamic_ncols=True):
         run_dir = Path(smart_cfg.data_path) / f"run_{run_id}"
@@ -1528,6 +1590,7 @@ def main():
         surf_wz = np.load(run_dir / "surface_wallShearStressMeanTrim_z.npy").astype(np.float32, copy=False).reshape(-1, 1)
         surf_area_full = np.load(run_dir / "surface_areas.npy").astype(np.float32, copy=False)
         surf_gt_full = np.concatenate([surf_p, surf_n, surf_wx, surf_wy, surf_wz], axis=1)
+        full_drag_force_gt = compute_surface_drag_force_x(surf_gt_full, surf_area_full)
 
         vol_coords_full = np.load(run_dir / "volume_coords.npy").astype(np.float32, copy=False)
         vol_p = np.load(run_dir / "volume_pMeanTrim.npy").astype(np.float32, copy=False).reshape(-1, 1)
@@ -1565,7 +1628,6 @@ def main():
 
         for mode_name, mode_info in mode_defs.items():
             for model_name, model in models.items():
-                model = model.to(device)
                 model.eval()
                 model_input_points = int(per_model_input_budgets[model_name])
                 idx_list: List[np.ndarray] = []
@@ -1636,6 +1698,23 @@ def main():
                         base_seed=int(args.seed + 100000 * mode_info["id"] + 1000 * run_id + batch_start * 17),
                         repeats=args.model_repeats,
                     )
+                    full_pred_surf_batch = None
+                    if model_name in DRAG_RANK_MODELS and mode_info["kind"] in {"inverse_density_wor", "sinusoidal_axis_mixture_wor"}:
+                        full_pred_surf_batch, _ = predict_view_batch(
+                            model_name=model_name,
+                            model=model,
+                            geo_views_norm=geo_views_norm,
+                            surf_query_norm=full_surf_query_norm,
+                            vol_query_norm=vol_query_norm,
+                            geo_log_density_views=geo_density_views,
+                            mean_s=mean_s,
+                            std_s=std_s,
+                            mean_v=mean_v,
+                            std_v=std_v,
+                            device=device,
+                            base_seed=int(args.seed + 100000 * mode_info["id"] + 1000 * run_id + batch_start * 17),
+                            repeats=args.model_repeats,
+                        )
 
                     for local_idx, global_view_idx in enumerate(range(batch_start, batch_stop)):
                         metrics = compute_metrics(surf_gt, pred_surf_batch[local_idx], vol_gt, pred_vol_batch[local_idx])
@@ -1645,6 +1724,12 @@ def main():
                             np.array([surf_drag_force_gt], dtype=np.float64),
                             np.array([surf_drag_force_pred], dtype=np.float64),
                         )
+                        full_drag_force_pred = None
+                        if full_pred_surf_batch is not None:
+                            full_drag_force_pred = compute_surface_drag_force_x(
+                                full_pred_surf_batch[local_idx],
+                                surf_area_full,
+                            )
                         density_stats = subset_density_stats[global_view_idx]
                         per_view_rows.append(
                             {
@@ -1662,17 +1747,30 @@ def main():
                                 "full_log_density_mean": float(np.mean(full_geo_log_density_np)),
                                 "surface_drag_force_x_gt": float(surf_drag_force_gt),
                                 "surface_drag_force_x_pred": float(surf_drag_force_pred),
+                                "surface_drag_force_x_full_gt": float(full_drag_force_gt),
+                                "surface_drag_force_x_full_pred": float(full_drag_force_pred) if full_drag_force_pred is not None else float("nan"),
                                 **density_stats,
                                 **metrics,
                             }
                         )
+                        if full_drag_force_pred is not None:
+                            drag_rank_view_rows.append(
+                                {
+                                    "run_id": int(run_id),
+                                    "view_id": int(global_view_idx),
+                                    "model_name": model_name,
+                                    "sampling_mode": mode_name,
+                                    "sampling_kind": mode_info["kind"],
+                                    "shift_beta": float(mode_info["beta"]),
+                                    "sampling_mode_id": int(mode_info["id"]),
+                                    "surface_drag_force_x_full_gt": float(full_drag_force_gt),
+                                    "surface_drag_force_x_full_pred": float(full_drag_force_pred),
+                                }
+                            )
 
                     del geo_views_norm, pred_surf_batch, pred_vol_batch
                     if geo_density_views is not None:
                         del geo_density_views
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
-                model = model.to("cpu")
                 models[model_name] = model
                 gc.collect()
 
@@ -1692,6 +1790,8 @@ def main():
         "full_log_density_mean",
         "surface_drag_force_x_gt",
         "surface_drag_force_x_pred",
+        "surface_drag_force_x_full_gt",
+        "surface_drag_force_x_full_pred",
         "subset_log_density_mean",
         "subset_log_density_std",
         "subset_log_density_p05",
@@ -1729,6 +1829,17 @@ def main():
         ["model_name", "sampling_mode", "sampling_kind", "shift_beta", "sampling_mode_id", "num_records"]
         + [item for k in metric_keys for item in (k, f"{k}_std")],
     )
+
+    drag_rank_per_run_mode_rows = []
+    if drag_rank_view_rows:
+        drag_rank_per_run_mode_rows = aggregate_rows_by_keys(
+            drag_rank_view_rows,
+            ["run_id", "model_name", "sampling_mode", "sampling_kind", "sampling_mode_id"],
+            ["surface_drag_force_x_full_gt", "surface_drag_force_x_full_pred"],
+        )
+        for row in drag_rank_per_run_mode_rows:
+            row["shift_beta"] = float(mode_defs[str(row["sampling_mode"])]["beta"])
+        drag_rank_per_run_mode_rows.sort(key=lambda x: (x["run_id"], MODEL_ORDER.index(x["model_name"]), int(x["sampling_mode_id"])))
 
     beta_shift_mode_names = [mode_name for mode_name, mode_info in mode_defs.items() if mode_info["kind"] == "inverse_density_wor"]
     strongest_mode = max(beta_shift_mode_names, key=lambda mode_name: float(mode_defs[mode_name]["beta"]))
@@ -1897,32 +2008,6 @@ def main():
                     ),
                 ),
                 (
-                    plot_numeric_mode_curve_with_band,
-                    (
-                        family_aggregate_rows,
-                        "surface_drag_force_x_rel_l2",
-                        out_root / f"{family_key}_surface_drag_force_x_beta_curve.png",
-                        f"{family_title}: inverse-density beta severity curve (surface drag force x)",
-                        family_models,
-                        beta_mode_order,
-                        beta_mode_xs,
-                        "Inverse-density beta",
-                    ),
-                ),
-                (
-                    plot_numeric_mode_curve_with_band,
-                    (
-                        family_aggregate_rows,
-                        "surface_drag_force_x_rel_l2",
-                        out_root / f"{family_key}_surface_drag_force_x_sine_y_curve.png",
-                        f"{family_title}: sinusoidal-y severity curve (surface drag force x)",
-                        family_models,
-                        sine_mode_order,
-                        sine_mode_xs,
-                        "Sinusoidal-y intensity",
-                    ),
-                ),
-                (
                     plot_delta_bars,
                     (
                         family_run_delta_rows,
@@ -1952,6 +2037,43 @@ def main():
                 ),
             ]
         )
+
+    drag_rank_models = [m for m in DRAG_RANK_MODELS if m in model_specs]
+    if drag_rank_models and drag_rank_per_run_mode_rows:
+        drag_beta_mode_order = [mode_name for mode_name in beta_mode_order if mode_defs[mode_name]["kind"] == "inverse_density_wor"]
+        drag_sine_mode_order = [mode_name for mode_name in sine_mode_order if mode_defs[mode_name]["kind"] == "sinusoidal_axis_mixture_wor"]
+        for mode_name in drag_beta_mode_order:
+            mode_beta = float(mode_defs[mode_name]["beta"])
+            plot_jobs.append(
+                (
+                    plot_ranked_curve_with_band,
+                    (
+                        drag_rank_per_run_mode_rows,
+                        mode_name,
+                        "surface_drag_force_x_full_pred",
+                        "surface_drag_force_x_full_gt",
+                        out_root / f"smart_family_surface_drag_force_x_ranked_beta_{mode_beta:.2f}.png",
+                        f"SMART family: full-surface drag ranked by GT drag (beta={mode_beta:.2f})",
+                        drag_rank_models,
+                    ),
+                )
+            )
+        for mode_name in drag_sine_mode_order:
+            mix_fraction = float(mode_defs[mode_name]["mix_fraction"])
+            plot_jobs.append(
+                (
+                    plot_ranked_curve_with_band,
+                    (
+                        drag_rank_per_run_mode_rows,
+                        mode_name,
+                        "surface_drag_force_x_full_pred",
+                        "surface_drag_force_x_full_gt",
+                        out_root / f"smart_family_surface_drag_force_x_ranked_sine_{mix_fraction:.2f}.png",
+                        f"SMART family: full-surface drag ranked by GT drag (sine mix={mix_fraction:.2f})",
+                        drag_rank_models,
+                    ),
+                )
+            )
     with ProcessPoolExecutor(max_workers=max(1, int(args.plot_workers))) as pool:
         futures = [pool.submit(func, *func_args) for func, func_args in plot_jobs]
         for future in tqdm(futures, desc="CPU plot tasks", leave=False, dynamic_ncols=True):
@@ -1993,7 +2115,6 @@ def main():
     audi_vtk_skipped_models: List[str] = []
     n_surface_points = int(rep_surf_gt_full.shape[0])
     for model_name, model in tqdm(representative_models.items(), desc="Representative full-surface predictions", dynamic_ncols=True):
-        model = model.to(device)
         model.eval()
         prefix = MODEL_LABELS[model_name].lower()
         try:
@@ -2037,7 +2158,6 @@ def main():
             surface_point_data[f"{prefix}_pressure_pred"] = np.full((n_surface_points,), np.nan, dtype=np.float32)
         if device.type == "cuda":
             torch.cuda.empty_cache()
-        model = model.to("cpu")
         models[model_name] = model
 
     vtk_path = out_root / "audi_surface_pressure_predictions.vtk"
@@ -2157,7 +2277,7 @@ def main():
         "- Internal model behavior is not overridden beyond safe batched-query chunking. In particular, each model keeps its own trained latent-anchor logic and encoder-block 16k subsampling behavior.",
         "- In-family fairness is strongest when all compared checkpoints in that family were trained with the same encoder input budget and the evaluation uses that same budget.",
         "- Cross-family fairness is weaker when families were trained with different encoder input budgets; the script records those mismatches explicitly in `results.json`.",
-        "- Surface-integral drag is computed as the signed x-force `∫(-p n_x + τ_x) dA` using the stored `surface_areas.npy` weights on the fixed benchmark surface query subset.",
+        "- Surface-integral drag for the SMART-family drag ranking plots is computed on the full surface point cloud as the signed x-force `∫(-p n_x + τ_x) dA` using the stored `surface_areas.npy` weights.",
         f"- Views per run/mode: `{views_per_mode}`",
         f"- Repeated stochastic forwards per view batch: `{int(args.model_repeats)}`",
         "",
@@ -2192,10 +2312,12 @@ def main():
             "## Outputs",
             "- `per_view_metrics.csv`: metrics for every run/view/model/mode.",
             "- `per_run_mode_metrics.csv`: per-run averages across views with standard deviations.",
-            "- `aggregate_metrics.csv`: across-run means/stds for every model and sampling mode.",
-            "- `robustness_summary.csv`: strongest-shift robustness summary.",
+        "- `aggregate_metrics.csv`: across-run means/stds for every model and sampling mode.",
+        "- `robustness_summary.csv`: strongest-shift robustness summary.",
         "- `audi_surface_pressure_predictions.vtk`: full Audi surface pressure ground truth plus selected model pressure predictions.",
         "- `results.json`: machine-readable summary including any representative-VTK model skips.",
+        "- `smart_family_surface_drag_force_x_ranked_beta_*.png`: full-surface drag curves for SMART, SMART-SATLOSS3, and SMART-SATLOSS5, sorted by ground-truth drag within each beta mode.",
+        "- `smart_family_surface_drag_force_x_ranked_sine_*.png`: full-surface drag curves for SMART, SMART-SATLOSS3, and SMART-SATLOSS5, sorted by ground-truth drag within each sine-y mode.",
         f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_*.vtk`: sampled `{sampling_budget}` input points for each inverse-density beta from one evaluated DrivAerML test run.",
         f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_*_density_hist.png`: density-distribution histogram for each sampled input-point VTK.",
         f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_ood_sine_y_mix_*_y_hist.png`: y-coordinate distribution histogram for each OOD sine-y sampled input-point VTK.",
@@ -2216,6 +2338,7 @@ def main():
         f"- OOD sampling modes: progressive uniform-to-sinusoidal mixtures along `y` only, with severities `{sine_mix_levels}`",
         f"- Fixed benchmark query subsets per run: `{surface_query_points}` surface + `{volume_query_points}` volume",
         f"- ABUPT-family query override: `{int(args.abupt_surface_query_points) if int(args.abupt_surface_query_points) > 0 else surface_query_points}` surface + `{int(args.abupt_volume_query_points) if int(args.abupt_volume_query_points) > 0 else volume_query_points}` volume",
+        "- SMART-family drag plots are sorted by full-surface ground-truth drag instead of severity to reduce visual noise.",
         f"- Representative VTK surface query source: `{vtk_surface_query_dir}`",
         "",
         "## Robustness Summary",

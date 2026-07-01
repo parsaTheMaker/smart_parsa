@@ -46,6 +46,8 @@ class AhmedMLDatasetV2(Dataset):
         geometry_density_estimator="rk2",
         geometry_density_cache_dtype="float16",
         geometry_epoch_seeded_sampling=False,
+        return_sample_info=False,
+        return_half_precision=False,
     ):
         geo_label = "all" if int(geometry_points) == 0 else str(int(geometry_points))
         surf_label = "all" if int(surface_points) == 0 else str(int(surface_points))
@@ -74,11 +76,15 @@ class AhmedMLDatasetV2(Dataset):
         self.geometry_density_estimator = str(geometry_density_estimator)
         self.geometry_density_cache_dtype = str(geometry_density_cache_dtype)
         self.geometry_epoch_seeded_sampling = bool(geometry_epoch_seeded_sampling)
+        self.return_sample_info = bool(return_sample_info)
+        self.return_half_precision = bool(return_half_precision)
         self._shared_epoch = mp.Value("i", 0, lock=False)
         self._geometry_density_ram_cache = OrderedDict()
+        self._preprocessed_memmap_cache = OrderedDict()
         # Keep a materially larger in-memory cache so repeated epochs do not
         # keep reloading density tensors from disk for the same runs.
         self._geometry_density_ram_cache_max_entries = 512
+        self._preprocessed_memmap_cache_max_entries = 16
         if self.require_preprocessed and not self.preprocessed_mode:
             raise FileNotFoundError(
                 "DrivAerML is configured to use preprocessed-only mode, but "
@@ -308,6 +314,31 @@ class AhmedMLDatasetV2(Dataset):
         if geo_mesh.shape[0] == 0:
             raise ValueError(f"Run {run_id} has empty geometry after finite filtering.")
         return self._normalize_pos(geo_mesh, self.min_pos, self.max_pos)
+
+    def _get_preprocessed_arrays(self, run_id):
+        cache_key = int(run_id)
+        cached = self._preprocessed_memmap_cache.get(cache_key)
+        if cached is not None:
+            self._preprocessed_memmap_cache.move_to_end(cache_key)
+            return cached
+
+        run_dir = self._run_dir(run_id)
+        arrays = {
+            "surf_coords": np.load(run_dir / "surface_coords.npy", mmap_mode="r"),
+            "surf_p": np.load(run_dir / "surface_pMeanTrim.npy", mmap_mode="r"),
+            "surf_n": np.load(run_dir / "surface_normals.npy", mmap_mode="r"),
+            "surf_wx": np.load(run_dir / "surface_wallShearStressMeanTrim_x.npy", mmap_mode="r"),
+            "surf_wy": np.load(run_dir / "surface_wallShearStressMeanTrim_y.npy", mmap_mode="r"),
+            "surf_wz": np.load(run_dir / "surface_wallShearStressMeanTrim_z.npy", mmap_mode="r"),
+            "vol_coords": np.load(run_dir / "volume_coords.npy", mmap_mode="r"),
+            "vol_u": np.load(run_dir / "volume_UMeanTrim.npy", mmap_mode="r"),
+            "vol_p": np.load(run_dir / "volume_pMeanTrim.npy", mmap_mode="r"),
+        }
+        self._preprocessed_memmap_cache[cache_key] = arrays
+        self._preprocessed_memmap_cache.move_to_end(cache_key)
+        while len(self._preprocessed_memmap_cache) > self._preprocessed_memmap_cache_max_entries:
+            self._preprocessed_memmap_cache.popitem(last=False)
+        return arrays
 
     def _load_or_compute_full_geometry_density(self, run_id, expected_n=None):
         cache_path = self._geometry_density_cache_path(run_id)
@@ -887,77 +918,126 @@ class AhmedMLDatasetV2(Dataset):
         vol_data = torch.from_numpy(u)
 
         sample_info = {
-            "geo_idx": None,
-            "surf_idx": None,
-            "vol_idx": None,
-            "source_ns": ns,
-            "source_nv": nv,
+            "run_id": torch.tensor(int(run_id), dtype=torch.long),
+            "source_ns": torch.tensor(int(ns), dtype=torch.long),
+            "source_nv": torch.tensor(int(nv), dtype=torch.long),
         }
-        if return_sample_info:
+        if return_sample_info or self.return_sample_info:
+            sample_info.update(
+                {
+                    "geo_idx": None,
+                    "surf_idx": None,
+                    "vol_idx": None,
+                }
+            )
             return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, sample_info
         return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data
 
     def _load_case_from_preprocessed(self, run_id, return_sample_info=False):
-        run_dir = self._run_dir(run_id)
-        surf_coords = np.load(run_dir / "surface_coords.npy", mmap_mode="r")
-        surf_p = np.load(run_dir / "surface_pMeanTrim.npy", mmap_mode="r")
-        surf_n = np.load(run_dir / "surface_normals.npy", mmap_mode="r")
-        surf_wx = np.load(run_dir / "surface_wallShearStressMeanTrim_x.npy", mmap_mode="r")
-        surf_wy = np.load(run_dir / "surface_wallShearStressMeanTrim_y.npy", mmap_mode="r")
-        surf_wz = np.load(run_dir / "surface_wallShearStressMeanTrim_z.npy", mmap_mode="r")
-        vol_coords = np.load(run_dir / "volume_coords.npy", mmap_mode="r")
-        vol_u = np.load(run_dir / "volume_UMeanTrim.npy", mmap_mode="r")
-        vol_p = np.load(run_dir / "volume_pMeanTrim.npy", mmap_mode="r")
+        arrays = self._get_preprocessed_arrays(run_id)
+        surf_coords = arrays["surf_coords"]
+        surf_p = arrays["surf_p"]
+        surf_n = arrays["surf_n"]
+        surf_wx = arrays["surf_wx"]
+        surf_wy = arrays["surf_wy"]
+        surf_wz = arrays["surf_wz"]
+        vol_coords = arrays["vol_coords"]
+        vol_u = arrays["vol_u"]
+        vol_p = arrays["vol_p"]
 
         ns = int(surf_coords.shape[0])
         nv = int(vol_coords.shape[0])
         geo_rng = None
         if self.geometry_epoch_seeded_sampling and 0 < self.geometry_points < ns:
             geo_rng = self._make_epoch_rng(run_id, stream_id=0)
+        use_full_geo = self.geometry_points <= 0 or self.geometry_points >= ns
+        use_full_surf = self.surface_points <= 0 or self.surface_points >= ns
+        use_full_vol = self.volume_points <= 0 or self.volume_points >= nv
+
         geo_idx_t = self._sample_idx(ns, self.geometry_points, rng=geo_rng, replace=False if geo_rng is not None else None)
         surf_idx_t = self._sample_idx(ns, self.surface_points)
         vol_idx_t = self._sample_idx(nv, self.volume_points)
-        geo_idx = geo_idx_t.numpy().astype(np.int64, copy=False)
-        surf_idx = surf_idx_t.numpy().astype(np.int64, copy=False)
-        vol_idx = vol_idx_t.numpy().astype(np.int64, copy=False)
 
-        geo_mesh = torch.from_numpy(np.asarray(surf_coords[geo_idx], dtype=np.float32))
-        surf_mesh = torch.from_numpy(np.asarray(surf_coords[surf_idx], dtype=np.float32))
-        surf_data = torch.from_numpy(
-            np.concatenate(
-                [
-                    np.asarray(surf_p[surf_idx], dtype=np.float32).reshape(-1, 1),
-                    np.asarray(surf_n[surf_idx], dtype=np.float32),
-                    np.asarray(surf_wx[surf_idx], dtype=np.float32).reshape(-1, 1),
-                    np.asarray(surf_wy[surf_idx], dtype=np.float32).reshape(-1, 1),
-                    np.asarray(surf_wz[surf_idx], dtype=np.float32).reshape(-1, 1),
-                ],
-                axis=1,
+        if use_full_geo:
+            geo_mesh = torch.from_numpy(np.asarray(surf_coords, dtype=np.float32))
+        else:
+            geo_idx = geo_idx_t.numpy().astype(np.int64, copy=False)
+            geo_mesh = torch.from_numpy(np.asarray(surf_coords[geo_idx], dtype=np.float32))
+
+        if use_full_surf:
+            surf_mesh = torch.from_numpy(np.asarray(surf_coords, dtype=np.float32))
+            surf_data = torch.from_numpy(
+                np.concatenate(
+                    [
+                        np.asarray(surf_p, dtype=np.float32).reshape(-1, 1),
+                        np.asarray(surf_n, dtype=np.float32),
+                        np.asarray(surf_wx, dtype=np.float32).reshape(-1, 1),
+                        np.asarray(surf_wy, dtype=np.float32).reshape(-1, 1),
+                        np.asarray(surf_wz, dtype=np.float32).reshape(-1, 1),
+                    ],
+                    axis=1,
+                )
             )
-        )
-        vol_mesh = torch.from_numpy(np.asarray(vol_coords[vol_idx], dtype=np.float32))
-        vol_data = torch.from_numpy(
-            np.concatenate(
-                [
-                    np.asarray(vol_p[vol_idx], dtype=np.float32).reshape(-1, 1),
-                    np.asarray(vol_u[vol_idx], dtype=np.float32),
-                ],
-                axis=1,
+        else:
+            surf_idx = surf_idx_t.numpy().astype(np.int64, copy=False)
+            surf_mesh = torch.from_numpy(np.asarray(surf_coords[surf_idx], dtype=np.float32))
+            surf_data = torch.from_numpy(
+                np.concatenate(
+                    [
+                        np.asarray(surf_p[surf_idx], dtype=np.float32).reshape(-1, 1),
+                        np.asarray(surf_n[surf_idx], dtype=np.float32),
+                        np.asarray(surf_wx[surf_idx], dtype=np.float32).reshape(-1, 1),
+                        np.asarray(surf_wy[surf_idx], dtype=np.float32).reshape(-1, 1),
+                        np.asarray(surf_wz[surf_idx], dtype=np.float32).reshape(-1, 1),
+                    ],
+                    axis=1,
+                )
             )
-        )
+
+        if use_full_vol:
+            vol_mesh = torch.from_numpy(np.asarray(vol_coords, dtype=np.float32))
+            vol_data = torch.from_numpy(
+                np.concatenate(
+                    [
+                        np.asarray(vol_p, dtype=np.float32).reshape(-1, 1),
+                        np.asarray(vol_u, dtype=np.float32),
+                    ],
+                    axis=1,
+                )
+            )
+        else:
+            vol_idx = vol_idx_t.numpy().astype(np.int64, copy=False)
+            vol_mesh = torch.from_numpy(np.asarray(vol_coords[vol_idx], dtype=np.float32))
+            vol_data = torch.from_numpy(
+                np.concatenate(
+                    [
+                        np.asarray(vol_p[vol_idx], dtype=np.float32).reshape(-1, 1),
+                        np.asarray(vol_u[vol_idx], dtype=np.float32),
+                    ],
+                    axis=1,
+                )
+            )
 
         sample_info = {
-            "geo_idx": geo_idx_t.to(dtype=torch.long),
-            "surf_idx": surf_idx_t.to(dtype=torch.long),
+            "run_id": torch.tensor(int(run_id), dtype=torch.long),
+            "source_ns": torch.tensor(int(ns), dtype=torch.long),
+            "source_nv": torch.tensor(int(nv), dtype=torch.long),
         }
         if return_sample_info:
+            sample_info.update(
+                {
+                    "geo_idx": geo_idx_t.to(dtype=torch.long),
+                    "surf_idx": surf_idx_t.to(dtype=torch.long),
+                }
+            )
+        if return_sample_info or self.return_sample_info:
             return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, sample_info
         return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data
 
     def __getitem__(self, idx):
         run_id = self.data[idx]
         ns, _ = self._get_point_counts(run_id)
-        need_sample_info = self.return_surface_density or (self.return_geometry_density and self.geometry_points > 0)
+        need_sample_info = self.return_sample_info or self.return_surface_density or (self.return_geometry_density and self.geometry_points > 0)
         if self.preprocessed_mode:
             loaded = self._load_case_from_preprocessed(run_id, return_sample_info=need_sample_info)
         else:
@@ -1006,6 +1086,13 @@ class AhmedMLDatasetV2(Dataset):
 
         surf_data = (surf_data - self.mean_surf_data) / torch.clamp(self.std_surf_data, min=1e-12)
         vol_data = (vol_data - self.mean_vol_data) / torch.clamp(self.std_vol_data, min=1e-12)
+
+        if self.return_half_precision:
+            geo_mesh = geo_mesh.to(dtype=torch.float16)
+            surf_mesh = surf_mesh.to(dtype=torch.float16)
+            surf_data = surf_data.to(dtype=torch.float16)
+            vol_mesh = vol_mesh.to(dtype=torch.float16)
+            vol_data = vol_data.to(dtype=torch.float16)
 
         if geo_log_density is not None and surf_log_density is not None:
             return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, geo_log_density, surf_log_density

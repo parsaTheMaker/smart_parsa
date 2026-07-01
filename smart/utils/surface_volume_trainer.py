@@ -66,7 +66,10 @@ def load_partial_state_dict(model, checkpoint_path, device):
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     source = checkpoint.get("model_state_dict", checkpoint)
-    target = model.state_dict()
+    target_model = model.module if hasattr(model, "module") else model
+    target = target_model.state_dict()
+    if any(key.startswith("module.") for key in source.keys()):
+        source = {key.removeprefix("module."): value for key, value in source.items()}
     filtered = {}
     matched = 0
     skipped = 0
@@ -77,7 +80,7 @@ def load_partial_state_dict(model, checkpoint_path, device):
         else:
             skipped += 1
     target.update(filtered)
-    model.load_state_dict(target, strict=False)
+    target_model.load_state_dict(target, strict=False)
     print(f"[resume] Loaded {matched} tensors from {checkpoint_path}; skipped {skipped} incompatible tensors.")
     return matched, skipped
 

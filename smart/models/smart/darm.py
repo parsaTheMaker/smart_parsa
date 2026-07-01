@@ -1,0 +1,825 @@
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .smart import SMART, ModulatedPositionalEmbedding
+
+
+def _batched_index_select(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    if x.ndim not in (2, 3):
+        raise ValueError(f"Expected rank-2 or rank-3 tensor, got shape {tuple(x.shape)}")
+
+    batch_size, num_items = x.shape[:2]
+    flat_offset = torch.arange(batch_size, device=x.device, dtype=idx.dtype).view(batch_size, 1, 1) * num_items
+    flat_idx = (idx + flat_offset).reshape(-1)
+
+    if x.ndim == 2:
+        flat_x = x.reshape(batch_size * num_items)
+        gathered = flat_x.index_select(0, flat_idx)
+        return gathered.reshape(batch_size, *idx.shape[1:])
+
+    channels = x.shape[-1]
+    flat_x = x.reshape(batch_size * num_items, channels)
+    gathered = flat_x.index_select(0, flat_idx)
+    return gathered.reshape(batch_size, *idx.shape[1:], channels)
+
+
+class FeedForwardBlock(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.net(self.norm(x))
+
+
+class DARM(SMART):
+    """SMART with a light dynamic anchor-routed residual readout."""
+
+    def __init__(
+        self,
+        spatial_dim=3,
+        surface_channels=1,
+        volume_channels=3,
+        parameter_channels=2,
+        latent_dim=256,
+        latent_geometry_points=4096,
+        subsampled_geometry_points=16384,
+        num_encoder_decoder_blocks=8,
+        num_heads=8,
+        pos_scale_factor=1000,
+        dropout=0.0,
+        subregion_size=262144,
+        subsampled_geometry_with_replacement=False,
+        route_top_r=8,
+        route_dim=64,
+        route_temperature=1.0,
+        route_chunk_size=2048,
+        route_anchor_chunk_size=1024,
+        high_compute_chunk_size=512,
+        anchor_shift_scale=0.5,
+        anchor_metric_eps=1.0e-4,
+        anchor_scale_eps=1.0e-4,
+        anchor_dropout=0.0,
+        use_intermediate_layer_mix=False,
+        type_embedding_dim=8,
+        low_pos_dim=32,
+        low_hidden_dim=64,
+        low_pos_scale_factor=25.0,
+        low_branch_num_coarse_layers=1,
+        high_hidden_dim=64,
+        prediction_query_chunk_size=16384,
+        use_high_value_block=False,
+    ):
+        super().__init__(
+            spatial_dim=spatial_dim,
+            surface_channels=surface_channels,
+            volume_channels=volume_channels,
+            parameter_channels=parameter_channels,
+            latent_dim=latent_dim,
+            latent_geometry_points=latent_geometry_points,
+            subsampled_geometry_points=subsampled_geometry_points,
+            num_encoder_decoder_blocks=num_encoder_decoder_blocks,
+            num_heads=num_heads,
+            pos_scale_factor=pos_scale_factor,
+            dropout=dropout,
+            subregion_size=subregion_size,
+            subsampled_geometry_with_replacement=subsampled_geometry_with_replacement,
+        )
+
+        self.mlp = None
+        self.spatial_dim = int(spatial_dim)
+        self.route_top_r = max(1, int(route_top_r))
+        self.route_dim = int(route_dim)
+        self.route_temperature = max(float(route_temperature), 1.0e-4)
+        self.route_chunk_size = max(1, int(route_chunk_size))
+        self.route_anchor_chunk_size = max(self.route_top_r, int(route_anchor_chunk_size))
+        self.high_compute_chunk_size = max(1, int(high_compute_chunk_size))
+        self.anchor_shift_scale = float(anchor_shift_scale)
+        self.anchor_metric_eps = float(anchor_metric_eps)
+        self.anchor_scale_eps = float(anchor_scale_eps)
+        self.anchor_dropout = float(anchor_dropout)
+        self.use_intermediate_layer_mix = bool(use_intermediate_layer_mix)
+        self.low_branch_num_coarse_layers = max(1, int(low_branch_num_coarse_layers))
+        self.prediction_query_chunk_size = max(1, int(prediction_query_chunk_size))
+        self.use_high_value_block = bool(use_high_value_block)
+        self.type_embedding = nn.Embedding(2, int(type_embedding_dim))
+
+        if self.use_intermediate_layer_mix:
+            self.layer_router = nn.Sequential(
+                nn.LayerNorm(latent_dim, eps=1e-6),
+                nn.Linear(latent_dim, len(self.encoder_blocks)),
+            )
+        else:
+            self.layer_router = None
+
+        self.anchor_context_norm = nn.LayerNorm(latent_dim, eps=1e-6)
+        self.route_query_norm = nn.LayerNorm(latent_dim, eps=1e-6)
+        self.route_anchor_norm = nn.LayerNorm(latent_dim, eps=1e-6)
+        self.route_query_proj = nn.Linear(latent_dim, self.route_dim)
+        self.route_anchor_proj = nn.Linear(latent_dim, self.route_dim)
+
+        self.anchor_shift_proj = nn.Linear(latent_dim, spatial_dim)
+        self.anchor_metric_proj = nn.Linear(latent_dim, spatial_dim)
+        self.anchor_scale_proj = nn.Linear(latent_dim, 1)
+        self.anchor_bias_proj = nn.Linear(latent_dim, 1)
+
+        self.anchor_value_proj = nn.Linear(latent_dim, high_hidden_dim)
+        self.delta_value_proj = nn.Sequential(
+            nn.Linear(spatial_dim, high_hidden_dim),
+            nn.GELU(),
+        )
+        self.type_value_proj = nn.Linear(type_embedding_dim, high_hidden_dim)
+        self.query_gate_proj = nn.Linear(latent_dim, 1)
+        self.anchor_gate_proj = nn.Linear(high_hidden_dim, 1)
+        self.delta_gate_proj = nn.Linear(spatial_dim, 1)
+        self.route_temperature_proj = nn.Linear(latent_dim, 1)
+        self.score_gate_scale = nn.Parameter(torch.tensor(1.0))
+        self.distance_gate_scale = nn.Parameter(torch.tensor(0.25))
+        self.margin_confidence_scale = nn.Parameter(torch.tensor(1.0))
+        self.support_gain_proj = nn.Sequential(
+            nn.LayerNorm(latent_dim, eps=1e-6),
+            nn.Linear(latent_dim, high_hidden_dim),
+            nn.Sigmoid(),
+        )
+        self.high_context_norm = nn.LayerNorm(high_hidden_dim, eps=1e-6)
+        self.high_value_block = FeedForwardBlock(high_hidden_dim, high_hidden_dim * 2) if self.use_high_value_block else nn.Identity()
+
+        self.low_pos_scale_factor = float(low_pos_scale_factor)
+        self.low_pos_encoder = ModulatedPositionalEmbedding(int(low_pos_dim), spatial_dim=spatial_dim)
+        self.low_query_proj = nn.Sequential(
+            nn.LayerNorm(latent_dim, eps=1e-6),
+            nn.Linear(latent_dim, low_hidden_dim),
+            nn.GELU(),
+        )
+        self.low_pos_proj = nn.Linear(int(low_pos_dim), low_hidden_dim)
+        self.low_type_proj = nn.Linear(type_embedding_dim, low_hidden_dim)
+        self.low_block = FeedForwardBlock(low_hidden_dim, low_hidden_dim * 2)
+
+        self.surface_low_head = nn.Linear(low_hidden_dim, surface_channels)
+        self.volume_low_head = nn.Linear(low_hidden_dim, volume_channels)
+        self.surface_high_head = nn.Linear(high_hidden_dim, surface_channels)
+        self.volume_high_head = nn.Linear(high_hidden_dim, volume_channels)
+
+    def _decode_feature_summary(self, intermediate_latent_geometries, latent_geo_pos, params, query_pos):
+        query_pos_scaled = query_pos * self.pos_scale_factor
+        query_emb = self.pos_encoder(query_pos_scaled)
+        low_query_sum = None
+        coarse_remaining = min(self.low_branch_num_coarse_layers, len(self.decoder_blocks))
+        for e_ca, block in zip(intermediate_latent_geometries, self.decoder_blocks):
+            query_emb = block(query_emb, e_ca, params, queries_pos=query_pos_scaled, latent_geometry_pos=latent_geo_pos)
+            if coarse_remaining > 0:
+                low_query_sum = query_emb if low_query_sum is None else (low_query_sum + query_emb)
+                coarse_remaining -= 1
+        if low_query_sum is None:
+            raise RuntimeError("DARM requires at least one decoder block.")
+        num_coarse = self.low_branch_num_coarse_layers - coarse_remaining
+        return low_query_sum / float(num_coarse), query_emb
+
+    def _prepare_readout_context(self, intermediate_latent_geometries, latent_geo_pos, final_latent_geo):
+        anchor_context = self.anchor_context_norm(final_latent_geo)
+        anchor_centers = latent_geo_pos + self.anchor_shift_scale * torch.tanh(self.anchor_shift_proj(anchor_context))
+        anchor_metric = F.softplus(self.anchor_metric_proj(anchor_context)) + self.anchor_metric_eps
+        anchor_scale = F.softplus(self.anchor_scale_proj(anchor_context)).squeeze(-1) + self.anchor_scale_eps
+        anchor_bias = self.anchor_bias_proj(anchor_context).squeeze(-1)
+
+        source_latents = intermediate_latent_geometries if self.use_intermediate_layer_mix else [final_latent_geo]
+        route_anchor_keys = []
+        route_anchor_values = []
+        for latent in source_latents:
+            latent_norm = self.route_anchor_norm(latent)
+            route_anchor_keys.append(self.route_anchor_proj(latent_norm))
+            route_anchor_values.append(self.anchor_value_proj(latent_norm))
+
+        return {
+            "anchor_centers": anchor_centers,
+            "anchor_metric": anchor_metric,
+            "anchor_scale": anchor_scale,
+            "anchor_bias": anchor_bias,
+            "route_anchor_keys": route_anchor_keys,
+            "route_anchor_values": route_anchor_values,
+            "num_layers": len(route_anchor_keys),
+        }
+
+    def _low_branch(self, query_emb, query_pos_raw, query_type):
+        if query_emb.shape[1] == 0:
+            out_dim = self.surface_channels if query_type == 0 else self.volume_channels
+            return query_emb.new_zeros(query_emb.shape[0], 0, out_dim)
+
+        low_pos = self.low_pos_encoder(query_pos_raw * self.low_pos_scale_factor)
+        type_embed = self.type_embedding.weight[query_type].view(1, 1, -1)
+        low_hidden = (
+            self.low_query_proj(query_emb)
+            + self.low_pos_proj(low_pos)
+            + self.low_type_proj(type_embed).expand(query_emb.shape[0], query_emb.shape[1], -1)
+        )
+        low_hidden = self.low_block(low_hidden)
+        return self.surface_low_head(low_hidden) if query_type == 0 else self.volume_low_head(low_hidden)
+
+    def _apply_anchor_dropout(self, top_scores: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.anchor_dropout <= 0.0 or top_scores.shape[-1] <= 1:
+            return top_scores
+        keep_mask = torch.rand_like(top_scores) > self.anchor_dropout
+        keep_mask[..., 0] = True
+        return top_scores.masked_fill(~keep_mask, torch.finfo(top_scores.dtype).min)
+
+    def _compute_route_scores_block(
+        self,
+        query_key,
+        layer_weights,
+        query_pos_scaled,
+        readout_context,
+        anchor_start,
+        anchor_end,
+    ):
+        batch_size, num_queries = query_key.shape[:2]
+        work_dtype = query_key.dtype if query_key.dtype in (torch.float16, torch.bfloat16) else torch.float32
+        query_key_w = query_key.to(dtype=work_dtype)
+        layer_weights_w = None if layer_weights is None else layer_weights.to(dtype=work_dtype)
+        block_size = anchor_end - anchor_start
+        scores = query_key_w.new_zeros(batch_size, num_queries, block_size)
+
+        route_anchor_keys = readout_context["route_anchor_keys"]
+        if len(route_anchor_keys) == 1:
+            anchor_keys_block = route_anchor_keys[0][:, anchor_start:anchor_end].to(dtype=work_dtype)
+            scores = torch.matmul(query_key_w, anchor_keys_block.transpose(1, 2))
+        else:
+            for layer_idx, anchor_keys in enumerate(route_anchor_keys):
+                anchor_keys_block = anchor_keys[:, anchor_start:anchor_end].to(dtype=work_dtype)
+                layer_scores = torch.matmul(query_key_w, anchor_keys_block.transpose(1, 2))
+                scores = scores + layer_weights_w[..., layer_idx:layer_idx + 1] * layer_scores
+
+        scores = scores / math.sqrt(float(self.route_dim))
+
+        anchor_centers = readout_context["anchor_centers"][:, anchor_start:anchor_end].to(dtype=work_dtype)
+        anchor_metric = readout_context["anchor_metric"][:, anchor_start:anchor_end].to(dtype=work_dtype)
+        anchor_scale = readout_context["anchor_scale"][:, anchor_start:anchor_end].to(dtype=work_dtype)
+        anchor_bias = readout_context["anchor_bias"][:, anchor_start:anchor_end].to(dtype=work_dtype)
+
+        query_pos_w = query_pos_scaled.to(dtype=work_dtype)
+        query_pos_sq = query_pos_w.square()
+        metric_center = anchor_metric * anchor_centers
+        metric_center_sq = (metric_center * anchor_centers).sum(dim=-1)
+
+        dist = torch.matmul(query_pos_sq, anchor_metric.transpose(1, 2))
+        dist = dist - 2.0 * torch.matmul(query_pos_w, metric_center.transpose(1, 2))
+        dist = dist + metric_center_sq.unsqueeze(1)
+        return scores - dist / anchor_scale.unsqueeze(1) + anchor_bias.unsqueeze(1)
+
+    def _select_topk_route_scores(self, query_key, layer_weights, query_pos_scaled, readout_context):
+        num_anchors = readout_context["anchor_centers"].shape[1]
+        top_r = min(self.route_top_r, num_anchors)
+
+        best_scores = None
+        best_indices = None
+        for anchor_start in range(0, num_anchors, self.route_anchor_chunk_size):
+            anchor_end = min(anchor_start + self.route_anchor_chunk_size, num_anchors)
+            block_scores = self._compute_route_scores_block(
+                query_key,
+                layer_weights,
+                query_pos_scaled,
+                readout_context,
+                anchor_start,
+                anchor_end,
+            )
+            block_top_scores, block_top_idx = torch.topk(block_scores, k=min(top_r, anchor_end - anchor_start), dim=-1)
+            block_top_idx = block_top_idx + anchor_start
+
+            if best_scores is None:
+                best_scores = block_top_scores
+                best_indices = block_top_idx
+                continue
+
+            merged_scores = torch.cat([best_scores, block_top_scores], dim=-1)
+            merged_idx = torch.cat([best_indices, block_top_idx], dim=-1)
+            keep_idx = torch.topk(merged_scores, k=top_r, dim=-1).indices
+            best_scores = torch.gather(merged_scores, -1, keep_idx)
+            best_indices = torch.gather(merged_idx, -1, keep_idx)
+
+        return best_scores, best_indices
+
+    def _mix_selected_anchor_values(self, top_idx, layer_weights, readout_context):
+        route_anchor_values = readout_context["route_anchor_values"]
+        if len(route_anchor_values) == 1:
+            return _batched_index_select(route_anchor_values[0], top_idx)
+
+        mixed_values = None
+        for layer_idx, anchor_values in enumerate(route_anchor_values):
+            selected = _batched_index_select(anchor_values, top_idx)
+            weight = layer_weights[..., layer_idx:layer_idx + 1].unsqueeze(-1)
+            contrib = weight * selected
+            mixed_values = contrib if mixed_values is None else (mixed_values + contrib)
+        return mixed_values
+
+    def _high_branch_chunk(
+        self,
+        query_emb_chunk,
+        query_pos_chunk_raw,
+        query_type,
+        readout_context,
+        return_route_debug=False,
+        route_debug_max_queries=0,
+    ):
+        num_queries = int(query_emb_chunk.shape[1])
+        if num_queries == 0:
+            out_dim = self.surface_channels if query_type == 0 else self.volume_channels
+            empty = query_emb_chunk.new_zeros(query_emb_chunk.shape[0], 0, out_dim)
+            zero = query_emb_chunk.new_zeros(())
+            return empty, {"gate_sum": zero, "support_mass_sum": zero, "query_count": 0}
+
+        query_type_embed = self.type_embedding.weight[query_type].view(1, 1, -1)
+        type_value = self.type_value_proj(query_type_embed).unsqueeze(2)
+        query_pos_scaled = query_pos_chunk_raw * self.pos_scale_factor
+
+        if readout_context["num_layers"] == 1 or self.layer_router is None:
+            layer_weights = None
+        else:
+            layer_weights = torch.softmax(self.layer_router(query_emb_chunk), dim=-1)
+
+        query_key = self.route_query_proj(self.route_query_norm(query_emb_chunk))
+        top_scores, top_idx = self._select_topk_route_scores(query_key, layer_weights, query_pos_scaled, readout_context)
+        top_scores = self._apply_anchor_dropout(top_scores)
+        query_temperature = self.route_temperature * (
+            0.5 + torch.sigmoid(self.route_temperature_proj(query_emb_chunk))
+        )
+        rho = torch.softmax(top_scores / query_temperature.clamp_min(1.0e-4), dim=-1)
+        if top_scores.shape[-1] > 1:
+            route_margin = top_scores[..., :1] - top_scores[..., 1:2]
+        else:
+            route_margin = torch.ones_like(top_scores[..., :1])
+        route_confidence = torch.sigmoid(self.margin_confidence_scale.to(dtype=route_margin.dtype) * route_margin)
+
+        gate_sum = query_emb_chunk.new_zeros(())
+        support_mass_sum = query_emb_chunk.new_zeros(())
+        route_confidence_sum = query_emb_chunk.new_zeros(())
+        high_out_chunks = []
+        support_mass_chunks = []
+        route_confidence_chunks = []
+        debug = None
+        debug_queries_remaining = int(route_debug_max_queries)
+
+        for start in range(0, num_queries, self.high_compute_chunk_size):
+            end = min(start + self.high_compute_chunk_size, num_queries)
+            top_idx_sub = top_idx[:, start:end]
+            top_scores_sub = top_scores[:, start:end]
+            rho_sub = rho[:, start:end]
+            query_emb_sub = query_emb_chunk[:, start:end]
+            query_pos_sub = query_pos_scaled[:, start:end]
+            layer_weights_sub = None if layer_weights is None else layer_weights[:, start:end]
+
+            selected_centers = _batched_index_select(readout_context["anchor_centers"], top_idx_sub)
+            selected_metric = _batched_index_select(readout_context["anchor_metric"], top_idx_sub)
+            delta = query_pos_sub.unsqueeze(2) - selected_centers
+            selected_dist = (selected_metric * delta.square()).sum(dim=-1)
+            mixed_anchor_values = self._mix_selected_anchor_values(top_idx_sub, layer_weights_sub, readout_context)
+            anchor_tokens = mixed_anchor_values + self.delta_value_proj(delta) + type_value
+
+            gate_logits = self.query_gate_proj(query_emb_sub).squeeze(-1).unsqueeze(-1)
+            gate_logits = gate_logits + self.anchor_gate_proj(mixed_anchor_values).squeeze(-1)
+            gate_logits = gate_logits + self.delta_gate_proj(delta).squeeze(-1)
+            gate_logits = gate_logits + self.score_gate_scale.to(dtype=top_scores_sub.dtype) * top_scores_sub
+            gate_logits = gate_logits - self.distance_gate_scale.to(dtype=selected_dist.dtype) * selected_dist
+            evidence = torch.sigmoid(gate_logits)
+
+            route_confidence_sub = route_confidence[:, start:end]
+            support = rho_sub * evidence.to(dtype=rho_sub.dtype) * route_confidence_sub.to(dtype=rho_sub.dtype)
+            support_mass = support.sum(dim=-1, keepdim=True).clamp_min(1.0e-6)
+            support_norm = support / support_mass
+
+            anchor_context = (
+                support_norm.unsqueeze(-1).to(dtype=anchor_tokens.dtype) * anchor_tokens
+            ).sum(dim=2)
+            high_hidden = self.high_context_norm(anchor_context)
+            high_hidden = high_hidden * self.support_gain_proj(query_emb_sub)
+            high_hidden = self.high_value_block(high_hidden)
+            high_hidden = high_hidden * support_mass.to(dtype=high_hidden.dtype)
+
+            if query_type == 0:
+                high_out_chunks.append(self.surface_high_head(high_hidden))
+            else:
+                high_out_chunks.append(self.volume_high_head(high_hidden))
+
+            gate_sum = gate_sum + evidence.sum()
+            support_mass_sum = support_mass_sum + support_mass.sum()
+            route_confidence_sum = route_confidence_sum + route_confidence_sub.sum()
+            support_mass_chunks.append(support_mass)
+            route_confidence_chunks.append(route_confidence_sub)
+
+            if return_route_debug and debug_queries_remaining > 0:
+                keep = min(debug_queries_remaining, end - start)
+                debug_piece = {
+                    "top_indices": top_idx_sub[:, :keep].detach(),
+                    "routing_weights": rho_sub[:, :keep].detach(),
+                    "evidence_gates": evidence[:, :keep].detach(),
+                    "support_mass": support_mass[:, :keep].detach(),
+                    "route_confidence": route_confidence_sub[:, :keep].detach(),
+                    "selected_distance": selected_dist[:, :keep].detach(),
+                }
+                if debug is None:
+                    debug = debug_piece
+                else:
+                    debug = {key: torch.cat([debug[key], value], dim=1) for key, value in debug_piece.items()}
+                debug_queries_remaining -= keep
+
+        high_out = torch.cat(high_out_chunks, dim=1) if high_out_chunks else query_emb_chunk.new_zeros(
+            query_emb_chunk.shape[0],
+            0,
+            self.surface_channels if query_type == 0 else self.volume_channels,
+        )
+
+        aux = {
+            "gate_sum": gate_sum,
+            "support_mass_sum": support_mass_sum,
+            "route_confidence_sum": route_confidence_sum,
+            "query_count": num_queries * query_emb_chunk.shape[0],
+            "support_mass": torch.cat(support_mass_chunks, dim=1) if support_mass_chunks else query_emb_chunk.new_zeros(query_emb_chunk.shape[0], 0, 1),
+            "route_confidence": torch.cat(route_confidence_chunks, dim=1) if route_confidence_chunks else query_emb_chunk.new_zeros(query_emb_chunk.shape[0], 0, 1),
+        }
+        if debug is not None:
+            aux["debug"] = debug
+        return high_out, aux
+
+    def _readout_branch(
+        self,
+        low_query_emb,
+        high_query_emb,
+        query_pos_raw,
+        query_type,
+        readout_context,
+        only_low=False,
+        return_route_debug=False,
+        route_debug_max_queries=0,
+    ):
+        low_out = self._low_branch(low_query_emb, query_pos_raw, query_type)
+        if only_low:
+            high_out = torch.zeros_like(low_out)
+            return low_out, high_out, {"mean_support_mass": low_out.new_zeros(()), "mean_evidence_gate": low_out.new_zeros(())}
+
+        high_chunks = []
+        gate_sum = low_out.new_zeros(())
+        support_mass_sum = low_out.new_zeros(())
+        route_confidence_sum = low_out.new_zeros(())
+        query_count = 0
+        route_debug = None
+        support_mass_chunks = []
+        route_confidence_chunks = []
+
+        for start in range(0, high_query_emb.shape[1], self.route_chunk_size):
+            end = min(start + self.route_chunk_size, high_query_emb.shape[1])
+            high_chunk, chunk_aux = self._high_branch_chunk(
+                high_query_emb[:, start:end],
+                query_pos_raw[:, start:end],
+                query_type,
+                readout_context,
+                return_route_debug=return_route_debug and route_debug is None and route_debug_max_queries > 0,
+                route_debug_max_queries=route_debug_max_queries,
+            )
+            high_chunks.append(high_chunk)
+            gate_sum = gate_sum + chunk_aux["gate_sum"]
+            support_mass_sum = support_mass_sum + chunk_aux["support_mass_sum"]
+            route_confidence_sum = route_confidence_sum + chunk_aux["route_confidence_sum"]
+            query_count += int(chunk_aux["query_count"])
+            support_mass_chunks.append(chunk_aux["support_mass"])
+            route_confidence_chunks.append(chunk_aux["route_confidence"])
+
+            if return_route_debug and route_debug is None and route_debug_max_queries > 0 and "debug" in chunk_aux:
+                keep = min(route_debug_max_queries, high_chunk.shape[1])
+                route_debug = {key: value[:, :keep].cpu() for key, value in chunk_aux["debug"].items()}
+
+        high_out = torch.cat(high_chunks, dim=1) if high_chunks else torch.zeros_like(low_out)
+        denom = float(max(query_count, 1))
+        aux = {
+            "mean_support_mass": support_mass_sum / denom,
+            "mean_evidence_gate": gate_sum / denom,
+            "mean_route_confidence": route_confidence_sum / denom,
+            "support_mass": torch.cat(support_mass_chunks, dim=1) if support_mass_chunks else low_out.new_zeros(low_out.shape[0], 0, 1),
+            "route_confidence": torch.cat(route_confidence_chunks, dim=1) if route_confidence_chunks else low_out.new_zeros(low_out.shape[0], 0, 1),
+        }
+        if route_debug is not None:
+            aux["route_debug"] = route_debug
+        return low_out, high_out, aux
+
+    def predict_from_encoded(
+        self,
+        intermediate_latent_geometries,
+        latent_geo_pos,
+        final_latent_geo,
+        surf_query_pos,
+        vol_query_pos,
+        params,
+        return_aux=False,
+        return_route_debug=False,
+        route_debug_max_queries=0,
+        only_low=False,
+    ):
+        readout_context = self._prepare_readout_context(intermediate_latent_geometries, latent_geo_pos, final_latent_geo)
+        surf_count = int(surf_query_pos.shape[1])
+        vol_count = int(vol_query_pos.shape[1])
+        total_count = surf_count + vol_count
+
+        if total_count == 0:
+            pred_surf = surf_query_pos.new_zeros(surf_query_pos.shape[0], 0, self.surface_channels)
+            pred_vol = vol_query_pos.new_zeros(vol_query_pos.shape[0], 0, self.volume_channels)
+            if not return_aux:
+                return pred_surf, pred_vol
+            aux = {
+                "surface_low": pred_surf,
+                "surface_high": pred_surf,
+                "volume_low": pred_vol,
+                "volume_high": pred_vol,
+                "surface_support_mass": pred_surf.new_zeros(pred_surf.shape[0], 0, 1),
+                "volume_support_mass": pred_vol.new_zeros(pred_vol.shape[0], 0, 1),
+                "surface_route_confidence": pred_surf.new_zeros(pred_surf.shape[0], 0, 1),
+                "volume_route_confidence": pred_vol.new_zeros(pred_vol.shape[0], 0, 1),
+                "mean_support_mass": pred_surf.new_zeros(()),
+                "mean_evidence_gate": pred_surf.new_zeros(()),
+                "mean_route_confidence": pred_surf.new_zeros(()),
+            }
+            return pred_surf, pred_vol, aux
+
+        query_pos = torch.cat([surf_query_pos, vol_query_pos], dim=1)
+
+        surf_low_chunks = []
+        surf_high_chunks = []
+        vol_low_chunks = []
+        vol_high_chunks = []
+        surf_support_sum = query_pos.new_zeros(())
+        surf_gate_sum = query_pos.new_zeros(())
+        surf_conf_sum = query_pos.new_zeros(())
+        vol_support_sum = query_pos.new_zeros(())
+        vol_gate_sum = query_pos.new_zeros(())
+        vol_conf_sum = query_pos.new_zeros(())
+        surf_query_total = 0
+        vol_query_total = 0
+        surf_debug = None
+        vol_debug = None
+        surf_support_chunks = []
+        surf_conf_chunks = []
+        vol_support_chunks = []
+        vol_conf_chunks = []
+
+        for start in range(0, total_count, self.prediction_query_chunk_size):
+            end = min(start + self.prediction_query_chunk_size, total_count)
+            query_chunk = query_pos[:, start:end]
+            low_query_emb, high_query_emb = self._decode_feature_summary(
+                intermediate_latent_geometries,
+                latent_geo_pos,
+                params,
+                query_chunk,
+            )
+
+            surf_local_end = max(0, min(end, surf_count) - start)
+            if surf_local_end > 0:
+                surf_low_chunk, surf_high_chunk, surf_aux = self._readout_branch(
+                    low_query_emb[:, :surf_local_end],
+                    high_query_emb[:, :surf_local_end],
+                    query_chunk[:, :surf_local_end],
+                    query_type=0,
+                    readout_context=readout_context,
+                    only_low=only_low,
+                    return_route_debug=return_route_debug and surf_debug is None,
+                    route_debug_max_queries=route_debug_max_queries,
+                )
+                surf_low_chunks.append(surf_low_chunk)
+                surf_high_chunks.append(surf_high_chunk)
+                chunk_weight = float(max(int(query_chunk.shape[0] * surf_local_end), 1))
+                surf_support_sum = surf_support_sum + surf_aux["mean_support_mass"] * chunk_weight
+                surf_gate_sum = surf_gate_sum + surf_aux["mean_evidence_gate"] * chunk_weight
+                surf_conf_sum = surf_conf_sum + surf_aux["mean_route_confidence"] * chunk_weight
+                surf_query_total += int(query_chunk.shape[0] * surf_local_end)
+                surf_support_chunks.append(surf_aux["support_mass"])
+                surf_conf_chunks.append(surf_aux["route_confidence"])
+                if "route_debug" in surf_aux and surf_debug is None:
+                    surf_debug = surf_aux["route_debug"]
+
+            vol_local_start = max(0, surf_count - start)
+            if vol_local_start < (end - start):
+                vol_low_chunk, vol_high_chunk, vol_aux = self._readout_branch(
+                    low_query_emb[:, vol_local_start:],
+                    high_query_emb[:, vol_local_start:],
+                    query_chunk[:, vol_local_start:],
+                    query_type=1,
+                    readout_context=readout_context,
+                    only_low=only_low,
+                    return_route_debug=return_route_debug and vol_debug is None,
+                    route_debug_max_queries=route_debug_max_queries,
+                )
+                vol_low_chunks.append(vol_low_chunk)
+                vol_high_chunks.append(vol_high_chunk)
+                chunk_weight = float(max(int(query_chunk.shape[0] * (end - start - vol_local_start)), 1))
+                vol_support_sum = vol_support_sum + vol_aux["mean_support_mass"] * chunk_weight
+                vol_gate_sum = vol_gate_sum + vol_aux["mean_evidence_gate"] * chunk_weight
+                vol_conf_sum = vol_conf_sum + vol_aux["mean_route_confidence"] * chunk_weight
+                vol_query_total += int(query_chunk.shape[0] * (end - start - vol_local_start))
+                vol_support_chunks.append(vol_aux["support_mass"])
+                vol_conf_chunks.append(vol_aux["route_confidence"])
+                if "route_debug" in vol_aux and vol_debug is None:
+                    vol_debug = vol_aux["route_debug"]
+
+        surf_low = torch.cat(surf_low_chunks, dim=1) if surf_low_chunks else surf_query_pos.new_zeros(surf_query_pos.shape[0], 0, self.surface_channels)
+        surf_high = torch.cat(surf_high_chunks, dim=1) if surf_high_chunks else surf_low.new_zeros(surf_low.shape)
+        vol_low = torch.cat(vol_low_chunks, dim=1) if vol_low_chunks else vol_query_pos.new_zeros(vol_query_pos.shape[0], 0, self.volume_channels)
+        vol_high = torch.cat(vol_high_chunks, dim=1) if vol_high_chunks else vol_low.new_zeros(vol_low.shape)
+
+        pred_surf = surf_low + surf_high
+        pred_vol = vol_low + vol_high
+
+        if not return_aux:
+            return pred_surf, pred_vol
+
+        surf_weight = max(surf_query_total, 0)
+        vol_weight = max(vol_query_total, 0)
+        total_weight = float(max(surf_weight + vol_weight, 1))
+        aux = {
+            "surface_low": surf_low,
+            "surface_high": surf_high,
+            "volume_low": vol_low,
+            "volume_high": vol_high,
+            "surface_support_mass": torch.cat(surf_support_chunks, dim=1) if surf_support_chunks else surf_query_pos.new_zeros(surf_query_pos.shape[0], 0, 1),
+            "volume_support_mass": torch.cat(vol_support_chunks, dim=1) if vol_support_chunks else vol_query_pos.new_zeros(vol_query_pos.shape[0], 0, 1),
+            "surface_route_confidence": torch.cat(surf_conf_chunks, dim=1) if surf_conf_chunks else surf_query_pos.new_zeros(surf_query_pos.shape[0], 0, 1),
+            "volume_route_confidence": torch.cat(vol_conf_chunks, dim=1) if vol_conf_chunks else vol_query_pos.new_zeros(vol_query_pos.shape[0], 0, 1),
+            "mean_support_mass": (surf_support_sum + vol_support_sum) / total_weight,
+            "mean_evidence_gate": (surf_gate_sum + vol_gate_sum) / total_weight,
+            "mean_route_confidence": (surf_conf_sum + vol_conf_sum) / total_weight,
+        }
+        if surf_debug is not None:
+            aux["surface_route_debug"] = surf_debug
+        if vol_debug is not None:
+            aux["volume_route_debug"] = vol_debug
+        return pred_surf, pred_vol, aux
+
+    def forward(
+        self,
+        geo,
+        surf_query_pos,
+        vol_query_pos,
+        params,
+        return_aux=False,
+        return_latent=False,
+        return_route_debug=False,
+        route_debug_max_queries=0,
+        only_low=False,
+        **_unused_kwargs,
+    ):
+        intermediate_latent_geometries, latent_geo_pos, final_latent_geo = self.encode(geo, params, return_final=True)
+        outputs = self.predict_from_encoded(
+            intermediate_latent_geometries,
+            latent_geo_pos,
+            final_latent_geo,
+            surf_query_pos,
+            vol_query_pos,
+            params,
+            return_aux=return_aux,
+            return_route_debug=return_route_debug,
+            route_debug_max_queries=route_debug_max_queries,
+            only_low=only_low,
+        )
+
+        if return_aux and return_latent:
+            pred_surf, pred_vol, aux = outputs
+            return pred_surf, pred_vol, aux, final_latent_geo
+        if return_latent:
+            pred_surf, pred_vol = outputs
+            return pred_surf, pred_vol, final_latent_geo
+        return outputs
+
+    @torch.inference_mode()
+    def inference(
+        self,
+        geo,
+        surf_query_pos,
+        vol_query_pos,
+        params,
+        return_aux=False,
+        return_route_debug=False,
+        route_debug_max_queries=0,
+        only_low=False,
+        **_unused_kwargs,
+    ):
+        intermediate_latent_geometries, latent_geo_pos, final_latent_geo = self.encode(geo, params, return_final=True)
+
+        y_hat_surf_subregions = []
+        y_hat_vol_subregions = []
+        surf_low_subregions = []
+        surf_high_subregions = []
+        surf_support_subregions = []
+        surf_conf_subregions = []
+        vol_low_subregions = []
+        vol_high_subregions = []
+        vol_support_subregions = []
+        vol_conf_subregions = []
+        support_sum = 0.0
+        gate_sum = 0.0
+        route_conf_sum = 0.0
+        route_weight_sum = 0
+        debug_out = {}
+
+        for i in range(0, surf_query_pos.shape[1], self.subregion_size):
+            surf_subregion = surf_query_pos[:, i:i + self.subregion_size]
+            if return_aux:
+                y_surf, _, aux = self.predict_from_encoded(
+                    intermediate_latent_geometries,
+                    latent_geo_pos,
+                    final_latent_geo,
+                    surf_subregion,
+                    vol_query_pos[:, :0],
+                    params,
+                    return_aux=True,
+                    return_route_debug=return_route_debug and "surface_route_debug" not in debug_out,
+                    route_debug_max_queries=route_debug_max_queries,
+                    only_low=only_low,
+                )
+                y_hat_surf_subregions.append(y_surf)
+                surf_low_subregions.append(aux["surface_low"])
+                surf_high_subregions.append(aux["surface_high"])
+                surf_support_subregions.append(aux["surface_support_mass"])
+                surf_conf_subregions.append(aux["surface_route_confidence"])
+                weight = max(int(surf_subregion.shape[1]), 1)
+                support_sum += float(aux["mean_support_mass"].item()) * weight
+                gate_sum += float(aux["mean_evidence_gate"].item()) * weight
+                route_conf_sum += float(aux["mean_route_confidence"].item()) * weight
+                route_weight_sum += weight
+                if "surface_route_debug" in aux:
+                    debug_out["surface_route_debug"] = aux["surface_route_debug"]
+            else:
+                y_surf, _ = self.predict_from_encoded(
+                    intermediate_latent_geometries,
+                    latent_geo_pos,
+                    final_latent_geo,
+                    surf_subregion,
+                    vol_query_pos[:, :0],
+                    params,
+                    return_aux=False,
+                    only_low=only_low,
+                )
+                y_hat_surf_subregions.append(y_surf)
+
+        for i in range(0, vol_query_pos.shape[1], self.subregion_size):
+            vol_subregion = vol_query_pos[:, i:i + self.subregion_size]
+            if return_aux:
+                _, y_vol, aux = self.predict_from_encoded(
+                    intermediate_latent_geometries,
+                    latent_geo_pos,
+                    final_latent_geo,
+                    surf_query_pos[:, :0],
+                    vol_subregion,
+                    params,
+                    return_aux=True,
+                    return_route_debug=return_route_debug and "volume_route_debug" not in debug_out,
+                    route_debug_max_queries=route_debug_max_queries,
+                    only_low=only_low,
+                )
+                y_hat_vol_subregions.append(y_vol)
+                vol_low_subregions.append(aux["volume_low"])
+                vol_high_subregions.append(aux["volume_high"])
+                vol_support_subregions.append(aux["volume_support_mass"])
+                vol_conf_subregions.append(aux["volume_route_confidence"])
+                weight = max(int(vol_subregion.shape[1]), 1)
+                support_sum += float(aux["mean_support_mass"].item()) * weight
+                gate_sum += float(aux["mean_evidence_gate"].item()) * weight
+                route_conf_sum += float(aux["mean_route_confidence"].item()) * weight
+                route_weight_sum += weight
+                if "volume_route_debug" in aux:
+                    debug_out["volume_route_debug"] = aux["volume_route_debug"]
+            else:
+                _, y_vol = self.predict_from_encoded(
+                    intermediate_latent_geometries,
+                    latent_geo_pos,
+                    final_latent_geo,
+                    surf_query_pos[:, :0],
+                    vol_subregion,
+                    params,
+                    return_aux=False,
+                    only_low=only_low,
+                )
+                y_hat_vol_subregions.append(y_vol)
+
+        pred_surf = torch.cat(y_hat_surf_subregions, dim=1) if y_hat_surf_subregions else geo.new_zeros(geo.shape[0], 0, self.surface_channels)
+        pred_vol = torch.cat(y_hat_vol_subregions, dim=1) if y_hat_vol_subregions else geo.new_zeros(geo.shape[0], 0, self.volume_channels)
+
+        if not return_aux:
+            return pred_surf, pred_vol
+
+        aux = {
+            "surface_low": torch.cat(surf_low_subregions, dim=1) if surf_low_subregions else pred_surf.new_zeros(pred_surf.shape),
+            "surface_high": torch.cat(surf_high_subregions, dim=1) if surf_high_subregions else pred_surf.new_zeros(pred_surf.shape),
+            "volume_low": torch.cat(vol_low_subregions, dim=1) if vol_low_subregions else pred_vol.new_zeros(pred_vol.shape),
+            "volume_high": torch.cat(vol_high_subregions, dim=1) if vol_high_subregions else pred_vol.new_zeros(pred_vol.shape),
+            "surface_support_mass": torch.cat(surf_support_subregions, dim=1) if surf_support_subregions else pred_surf.new_zeros(pred_surf.shape[0], pred_surf.shape[1], 1),
+            "volume_support_mass": torch.cat(vol_support_subregions, dim=1) if vol_support_subregions else pred_vol.new_zeros(pred_vol.shape[0], pred_vol.shape[1], 1),
+            "surface_route_confidence": torch.cat(surf_conf_subregions, dim=1) if surf_conf_subregions else pred_surf.new_zeros(pred_surf.shape[0], pred_surf.shape[1], 1),
+            "volume_route_confidence": torch.cat(vol_conf_subregions, dim=1) if vol_conf_subregions else pred_vol.new_zeros(pred_vol.shape[0], pred_vol.shape[1], 1),
+            "mean_support_mass": pred_surf.new_tensor(support_sum / max(route_weight_sum, 1)),
+            "mean_evidence_gate": pred_surf.new_tensor(gate_sum / max(route_weight_sum, 1)),
+            "mean_route_confidence": pred_surf.new_tensor(route_conf_sum / max(route_weight_sum, 1)),
+        }
+        aux.update(debug_out)
+        return pred_surf, pred_vol, aux

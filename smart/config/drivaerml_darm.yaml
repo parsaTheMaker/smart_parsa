@@ -1,0 +1,104 @@
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+
+wandb:
+  project: "smart"
+  entity: "parsa-vatani99-technical-university-of-munich"
+
+experiment:
+  name: "DrivAerML_DARM"
+  model_name: "DARM"
+  model_tag: ""
+  random_seed: 42
+  manifest_variant: "full"
+
+  architecture:
+    latent_dim: 256
+    latent_geometry_points: 2048
+    subsampled_geometry_points: 8192
+    subsampled_geometry_with_replacement: True
+    num_encoder_decoder_blocks: 6
+    pos_scale_factor: 100
+    route_top_r: 8
+    route_dim: 64
+    route_temperature: 1.0
+    route_chunk_size: 2048
+    route_anchor_chunk_size: 1024
+    high_compute_chunk_size: 1024
+    anchor_shift_scale: 0.5
+    anchor_metric_eps: 1.e-4
+    anchor_scale_eps: 1.e-4
+    anchor_dropout: 0.0
+    use_intermediate_layer_mix: False
+    type_embedding_dim: 8
+    low_pos_dim: 32
+    low_hidden_dim: 64
+    low_pos_scale_factor: 25.0
+    low_branch_num_coarse_layers: 1
+    high_hidden_dim: 64
+    prediction_query_chunk_size: 32768
+    use_high_value_block: False
+
+  optimizer: "adamw"
+  loss_fn: "rel_l2"
+  scheduler: "cosine"
+  scheduler_warumup_fraction: 0.2
+  batch_size: 2
+  epochs: 300
+  learning_rate: 2.e-4
+  gradient_norm: 1.0
+  amp: True
+  precision: "float16"
+  multi_gpu_strategy: "data_parallel"
+  log_every_n_steps: 50
+  console_log_every_n_steps: 0
+  show_first_batch_timing: False
+  inspect_first_sample: False
+  init_ckpt: "/home/parsa/smart_parsa/checkpoints/smart-smart-drivaerml-131k16kwr-drivaerml-s42_best.pt"
+  resume_ckpt: ""
+  resume_full_state: False
+  wandb_watch_model: False
+
+  supervised_weight: 1.0
+  stability_weight: 0.5
+  ghost_suppression_weight: 0.25
+  high_sparsity_weight: 5.e-4
+  stability_smooth_l1_beta: 0.05
+  stability_target_blend: 0.5
+  edit_warmup_epochs: 10
+  loss_balance_enabled: True
+  loss_balance_reference: "supervised"
+  loss_balance_min_scale: 0.1
+  loss_balance_max_scale: 10.0
+  loss_balance_steps: 16
+  loss_balance_ema_momentum: 0.8
+
+  edit_patch_min_points: 256
+  edit_patch_max_points: 1024
+  edit_candidate_points: 2048
+  edit_underbody_bias: 0.7
+  edit_underbody_candidate_points: 4096
+  edit_underbody_low_fraction: 0.25
+  edit_strength: 0.75
+  edit_ramp_power: 1.5
+  edit_changed_radius_scale: 1.2
+  edit_unchanged_radius_scale: 2.5
+  track_train_channel_metrics: False
+
+  dataset: "DrivAerML"
+  data_path: "/mnt/ssdraid/parsa/drivaerml_preprocessed"
+  num_workers: 12
+  prefetch_factor: 4
+  pin_memory: True
+  geometry_epoch_seeded_sampling: True
+  num_body_points: 131072
+  num_surface_points: 65536
+  num_volume_points: 65536
+  scale_positions: False

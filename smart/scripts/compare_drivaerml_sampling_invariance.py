@@ -95,6 +95,7 @@ HEADLINE_METRIC_KEYS = [
 
 MODEL_ORDER = [
     "SMART",
+    "SMART_AUGMENTED",
     "SMART_SAT",
     "SMART_SATLOSS3",
     "SMART_SATLOSS4",
@@ -111,6 +112,7 @@ MODEL_ORDER = [
 ]
 MODEL_LABELS = {
     "SMART": "SMART",
+    "SMART_AUGMENTED": "SMART-AUGMENTED",
     "SMART_SAT": "SMART-SAT",
     "SMART_SATLOSS3": "SMART-SATLOSS3",
     "SMART_SATLOSS4": "SMART-SATLOSS4",
@@ -127,6 +129,7 @@ MODEL_LABELS = {
 }
 MODEL_COLORS = {
     "SMART": "#6C6F7D",
+    "SMART_AUGMENTED": "#B279A2",
     "SMART_SAT": "#4C78A8",
     "SMART_SATLOSS3": "#F58518",
     "SMART_SATLOSS4": "#72B7B2",
@@ -141,10 +144,10 @@ MODEL_COLORS = {
     "POINTNET": "#6C6F7D",
     "POINTNET_SATLOSS3": "#4C78A8",
 }
-DRAG_RANK_MODELS = ["SMART", "SMART_SATLOSS3", "SMART_SATLOSS5"]
+DRAG_RANK_MODELS = ["SMART", "SMART_AUGMENTED", "SMART_SATLOSS3", "SMART_SATLOSS5"]
 FAMILY_GROUPS = OrderedDict(
     [
-        ("smart_family", ["SMART", "SMART_SAT", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5"]),
+        ("smart_family", ["SMART", "SMART_AUGMENTED", "SMART_SAT", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5"]),
         ("transolverpp_family", ["TRANSOLVERPP", "TRANSOLVERPP_SAT", "TRANSOLVERPP_SATLOSS3"]),
         ("ginot_family", ["GINOT", "GINOT_SATLOSS3"]),
         ("abupt_family", ["ABUPT", "ABUPT_SATLOSS3"]),
@@ -152,7 +155,7 @@ FAMILY_GROUPS = OrderedDict(
     ]
 )
 FAMILY_TITLES = {
-    "smart_family": "SMART vs SMART-SAT vs SMART-SATLOSS3 vs SMART-SATLOSS4 vs SMART-SATLOSS5",
+    "smart_family": "SMART vs SMART-AUGMENTED vs SMART-SAT vs SMART-SATLOSS3 vs SMART-SATLOSS4 vs SMART-SATLOSS5",
     "transolverpp_family": "TransolverPP vs TransolverPP-SAT vs TransolverPP-SATLOSS3",
     "ginot_family": "GINOT vs GINOT-SATLOSS3",
     "abupt_family": "ABUPT vs ABUPT-SATLOSS3",
@@ -160,6 +163,7 @@ FAMILY_TITLES = {
 }
 VTK_PRESSURE_MODELS = [
     "SMART",
+    "SMART_AUGMENTED",
     "SMART_SAT",
     "SMART_SATLOSS3",
     "SMART_SATLOSS4",
@@ -176,6 +180,7 @@ VTK_PRESSURE_MODELS = [
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fair DrivAerML sampling-invariance comparison across SMART, TransolverPP, GINOT, ABUPT, and PointNet families.")
     p.add_argument("--smart-config", default="drivaerml")
+    p.add_argument("--smart-augmented-config", default="drivaerml_smart_augmented")
     p.add_argument("--smart-sat-config", default="drivaerml_sat")
     p.add_argument("--smart-satloss3-config", default="drivaerml_satloss3")
     p.add_argument("--smart-satloss4-config", default="drivaerml_satloss4")
@@ -190,6 +195,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pointnet-config", default="drivaerml_pointnet")
     p.add_argument("--pointnet-satloss3-config", default="drivaerml_pointnet_satloss3")
     p.add_argument("--smart-checkpoint", default=None)
+    p.add_argument("--smart-augmented-checkpoint", default=None)
     p.add_argument("--smart-sat-checkpoint", default=None)
     p.add_argument("--smart-satloss3-checkpoint", default=None)
     p.add_argument("--smart-satloss4-checkpoint", default=None)
@@ -324,6 +330,7 @@ def choose_ckpt(config, explicit: str | None) -> str:
     model_slug = str(config.model_name).lower().replace("_", "-")
     prefix_map = {
         "SMART": "smart-smart-",
+        "SMART_AUGMENTED": "smart-augmented-",
         "SMART_SAT": "smart-sat-",
         "SMART_SATLOSS3": "smart-satloss3-",
         "SMART_SATLOSS4": "smart-satloss4-",
@@ -378,7 +385,7 @@ def build_model(config, ckpt_path: str, device: torch.device, batched_query_subr
         "volume_channels": len(VOLUME_FIELDS),
         "parameter_channels": 0,
     }
-    if model_name in {"SMART", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5"}:
+    if model_name in {"SMART", "SMART_AUGMENTED", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5"}:
         model = SMART(**base_kwargs, **arch)
     elif model_name == "SMART_SAT":
         model = SMARTSAT(**base_kwargs, **arch)
@@ -862,7 +869,7 @@ def predict_audi_surface_pressure(
         return pred_surf
 
     def _build_surface_decoder():
-        if model_name in {"SMART", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5"}:
+        if model_name in {"SMART", "SMART_AUGMENTED", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5"}:
             intermediate_latent_geometries, latent_geo_pos = model.encode(geo_b, None)
 
             def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
@@ -1311,6 +1318,7 @@ def main():
     config_name_map = OrderedDict(
         [
             ("SMART", args.smart_config),
+            ("SMART_AUGMENTED", args.smart_augmented_config),
             ("SMART_SAT", args.smart_sat_config),
             ("SMART_SATLOSS3", args.smart_satloss3_config),
             ("SMART_SATLOSS4", args.smart_satloss4_config),
@@ -1365,6 +1373,7 @@ def main():
 
     checkpoint_arg_map = {
         "SMART": args.smart_checkpoint,
+        "SMART_AUGMENTED": args.smart_augmented_checkpoint,
         "SMART_SAT": args.smart_sat_checkpoint,
         "SMART_SATLOSS3": args.smart_satloss3_checkpoint,
         "SMART_SATLOSS4": args.smart_satloss4_checkpoint,

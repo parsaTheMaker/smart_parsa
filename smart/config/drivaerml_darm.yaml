@@ -48,12 +48,13 @@ experiment:
     route_confidence_floor: 0.15
     route_entropy_mix: 0.75
     route_margin_norm_eps: 1.e-4
+    evidence_gate_floor: 0.02
 
   optimizer: "adamw"
   loss_fn: "rel_l2"
   scheduler: "cosine"
   scheduler_warumup_fraction: 0.2
-  batch_size: 2
+  batch_size: 1
   epochs: 300
   learning_rate: 2.e-4
   gradient_norm: 1.0
@@ -75,6 +76,12 @@ experiment:
   ghost_target_ratio: 0.35
   ghost_absolute_weight: 0.1
   high_sparsity_weight: 0.0
+  collapse_support_weight: 0.1
+  collapse_support_target: 0.1
+  collapse_evidence_weight: 0.1
+  collapse_evidence_target: 0.05
+  collapse_entropy_weight: 0.02
+  collapse_entropy_target: 0.998
   stability_smooth_l1_beta: 0.05
   edit_warmup_epochs: 10
   loss_balance_enabled: True

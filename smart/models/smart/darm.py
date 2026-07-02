@@ -3,8 +3,9 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
-from .smart import SMART, ModulatedPositionalEmbedding
+from .smart import SMART
 
 
 def _batched_index_select(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
@@ -38,6 +39,58 @@ class FeedForwardBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.net(self.norm(x))
+
+
+class DARMModulatedPositionalEmbedding(nn.Module):
+    def __init__(self, dim, spatial_dim=3, max_seq_length=10000):
+        super().__init__()
+        self.dim = dim
+        self.spatial_dim = spatial_dim
+
+        max_dim_per_spatial_dim = dim // spatial_dim
+        dim_per_spatial_dim = max_dim_per_spatial_dim & ~1
+        self.dim_per_spatial_dim = dim_per_spatial_dim
+
+        self.total_padding = dim - (dim_per_spatial_dim * spatial_dim)
+        self.register_buffer("padding", torch.zeros(1, 1, self.total_padding))
+
+        div_term = torch.exp(torch.arange(0, dim_per_spatial_dim, 2) * (-math.log(max_seq_length) / dim_per_spatial_dim))
+        self.register_buffer("div_term", div_term)
+
+        self.mlp = nn.Sequential(nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim_per_spatial_dim * spatial_dim * 2))
+
+    def compute_embedding(self, pos, shift_sin=None, scale_sin=None, shift_cos=None, scale_cos=None):
+        with torch.autocast(device_type=str(pos.device).split(":")[0], enabled=False):
+            pos = pos.float()
+            sin_cos_arg = pos[..., None] @ self.div_term[None, ...]
+
+            embedding = torch.zeros((*sin_cos_arg.shape[:-1], self.dim_per_spatial_dim), device=sin_cos_arg.device, dtype=sin_cos_arg.dtype)
+            if shift_sin is not None and scale_sin is not None and shift_cos is not None and scale_cos is not None:
+                embedding[..., 0::2] = scale_sin * torch.sin(sin_cos_arg + shift_sin)
+                embedding[..., 1::2] = scale_cos * torch.cos(sin_cos_arg + shift_cos)
+            else:
+                embedding[..., 0::2] = torch.sin(sin_cos_arg)
+                embedding[..., 1::2] = torch.cos(sin_cos_arg)
+
+        embedding = rearrange(embedding, "b n spatial_dim d -> b n (spatial_dim d)")
+        if self.total_padding > 0:
+            embedding = torch.concat([embedding, self.padding.expand(*embedding.shape[:-1], -1)], dim=-1)
+        return embedding
+
+    def forward(self, pos):
+        initial_embedding = self.compute_embedding(pos)
+        with torch.autocast(device_type=str(pos.device).split(":")[0], enabled=False):
+            shift_scale = self.mlp(initial_embedding.float()).clamp_(-8.0, 8.0)
+        shift_sin, scale_sin, shift_cos, scale_cos = torch.unbind(
+            rearrange(
+                shift_scale,
+                "b n (d shift_scale spatial_dim) -> b n spatial_dim d shift_scale",
+                shift_scale=4,
+                spatial_dim=self.spatial_dim,
+            ),
+            -1,
+        )
+        return self.compute_embedding(pos, shift_sin=shift_sin, scale_sin=scale_sin, shift_cos=shift_cos, scale_cos=scale_cos)
 
 
 class DARM(SMART):
@@ -80,6 +133,7 @@ class DARM(SMART):
         route_confidence_floor=0.15,
         route_entropy_mix=0.75,
         route_margin_norm_eps=1.0e-4,
+        evidence_gate_floor=0.02,
     ):
         super().__init__(
             spatial_dim=spatial_dim,
@@ -96,6 +150,10 @@ class DARM(SMART):
             subregion_size=subregion_size,
             subsampled_geometry_with_replacement=subsampled_geometry_with_replacement,
         )
+
+        # Keep DARM-specific numerical stabilization local to DARM rather than
+        # modifying the shared SMART implementation.
+        self.pos_encoder = DARMModulatedPositionalEmbedding(latent_dim, spatial_dim=spatial_dim)
 
         self.mlp = None
         self.spatial_dim = int(spatial_dim)
@@ -116,6 +174,7 @@ class DARM(SMART):
         self.route_confidence_floor = min(max(float(route_confidence_floor), 0.0), 0.95)
         self.route_entropy_mix = min(max(float(route_entropy_mix), 0.0), 1.0)
         self.route_margin_norm_eps = float(route_margin_norm_eps)
+        self.evidence_gate_floor = min(max(float(evidence_gate_floor), 0.0), 0.25)
         self.type_embedding = nn.Embedding(2, int(type_embedding_dim))
 
         if self.use_intermediate_layer_mix:
@@ -160,7 +219,7 @@ class DARM(SMART):
         self.high_value_block = FeedForwardBlock(high_hidden_dim, high_hidden_dim * 2) if self.use_high_value_block else nn.Identity()
 
         self.low_pos_scale_factor = float(low_pos_scale_factor)
-        self.low_pos_encoder = ModulatedPositionalEmbedding(int(low_pos_dim), spatial_dim=spatial_dim)
+        self.low_pos_encoder = DARMModulatedPositionalEmbedding(int(low_pos_dim), spatial_dim=spatial_dim)
         self.low_query_proj = nn.Sequential(
             nn.LayerNorm(latent_dim, eps=1e-6),
             nn.Linear(latent_dim, low_hidden_dim),
@@ -220,15 +279,17 @@ class DARM(SMART):
             out_dim = self.surface_channels if query_type == 0 else self.volume_channels
             return query_emb.new_zeros(query_emb.shape[0], 0, out_dim)
 
-        low_pos = self.low_pos_encoder(query_pos_raw * self.low_pos_scale_factor)
-        type_embed = self.type_embedding.weight[query_type].view(1, 1, -1)
-        low_hidden = (
-            self.low_query_proj(query_emb)
-            + self.low_pos_proj(low_pos)
-            + self.low_type_proj(type_embed).expand(query_emb.shape[0], query_emb.shape[1], -1)
-        )
-        low_hidden = self.low_block(low_hidden)
-        return self.surface_low_head(low_hidden) if query_type == 0 else self.volume_low_head(low_hidden)
+        with torch.autocast(device_type=str(query_emb.device).split(":")[0], enabled=False):
+            query_emb = query_emb.float()
+            low_pos = self.low_pos_encoder(query_pos_raw * self.low_pos_scale_factor).float()
+            type_embed = self.type_embedding.weight[query_type].view(1, 1, -1).float()
+            low_hidden = (
+                self.low_query_proj(query_emb)
+                + self.low_pos_proj(low_pos)
+                + self.low_type_proj(type_embed).expand(query_emb.shape[0], query_emb.shape[1], -1)
+            )
+            low_hidden = self.low_block(low_hidden)
+            return self.surface_low_head(low_hidden) if query_type == 0 else self.volume_low_head(low_hidden)
 
     def _apply_anchor_dropout(self, top_scores: torch.Tensor) -> torch.Tensor:
         if not self.training or self.anchor_dropout <= 0.0 or top_scores.shape[-1] <= 1:
@@ -247,7 +308,7 @@ class DARM(SMART):
         anchor_end,
     ):
         batch_size, num_queries = query_key.shape[:2]
-        work_dtype = query_key.dtype if query_key.dtype in (torch.float16, torch.bfloat16) else torch.float32
+        work_dtype = torch.float32
         query_key_w = query_key.to(dtype=work_dtype)
         layer_weights_w = None if layer_weights is None else layer_weights.to(dtype=work_dtype)
         block_size = anchor_end - anchor_start
@@ -355,47 +416,51 @@ class DARM(SMART):
                 "raw_gate": empty_aux,
             }
 
-        query_type_embed = self.type_embedding.weight[query_type].view(1, 1, -1)
-        type_value = self.type_value_proj(query_type_embed).unsqueeze(2)
-        query_pos_scaled = query_pos_chunk_raw * self.pos_scale_factor
+        with torch.autocast(device_type=str(query_emb_chunk.device).split(":")[0], enabled=False):
+            query_type_embed = self.type_embedding.weight[query_type].view(1, 1, -1).float()
+            type_value = self.type_value_proj(query_type_embed).unsqueeze(2)
+            query_pos_scaled = (query_pos_chunk_raw * self.pos_scale_factor).float()
+            query_emb_chunk = query_emb_chunk.float()
 
-        if readout_context["num_layers"] == 1 or self.layer_router is None:
-            layer_weights = None
-        else:
-            layer_weights = torch.softmax(self.layer_router(query_emb_chunk), dim=-1)
+            if readout_context["num_layers"] == 1 or self.layer_router is None:
+                layer_weights = None
+            else:
+                layer_weights = torch.softmax(self.layer_router(query_emb_chunk), dim=-1)
 
-        query_key = self.route_query_proj(self.route_query_norm(query_emb_chunk))
-        top_scores, top_idx = self._select_topk_route_scores(query_key, layer_weights, query_pos_scaled, readout_context)
-        top_scores = self._apply_anchor_dropout(top_scores)
-        query_temperature = self.route_temperature * (
-            0.5 + torch.sigmoid(self.route_temperature_proj(query_emb_chunk))
-        )
-        if top_scores.shape[-1] > 1:
-            route_margin = top_scores[..., :1] - top_scores[..., 1:2]
-            route_scale = top_scores.std(dim=-1, keepdim=True, unbiased=False)
-            route_scale = route_scale + query_temperature.clamp_min(self.route_margin_norm_eps)
-            probe_scores = top_scores - top_scores.mean(dim=-1, keepdim=True)
-            probe_scores = probe_scores / route_scale.clamp_min(self.route_margin_norm_eps)
-            probe_rho = torch.softmax(probe_scores, dim=-1)
-            route_entropy = -(probe_rho.clamp_min(1.0e-8) * probe_rho.clamp_min(1.0e-8).log()).sum(dim=-1, keepdim=True)
-            route_entropy = route_entropy / math.log(float(top_scores.shape[-1]))
-        else:
-            route_margin = torch.ones_like(top_scores[..., :1])
-            route_scale = torch.ones_like(route_margin)
-            route_entropy = torch.zeros_like(route_margin)
-        route_margin_norm = route_margin / route_scale.clamp_min(self.route_margin_norm_eps)
-        route_margin_conf = torch.sigmoid(
-            self.margin_confidence_scale.to(dtype=route_margin.dtype) * route_margin_norm
-        )
-        route_entropy_conf = 1.0 - route_entropy
-        route_confidence = (
-            (1.0 - self.route_entropy_mix) * route_margin_conf
-            + self.route_entropy_mix * route_entropy_conf
-        )
-        route_confidence = self.route_confidence_floor + (1.0 - self.route_confidence_floor) * route_confidence
-        adaptive_temperature = query_temperature * (1.0 + route_entropy)
-        adaptive_temperature = adaptive_temperature / route_confidence.clamp_min(self.route_confidence_floor)
-        rho = torch.softmax(top_scores / adaptive_temperature.clamp_min(1.0e-4), dim=-1)
+            query_key = self.route_query_proj(self.route_query_norm(query_emb_chunk))
+            top_scores, top_idx = self._select_topk_route_scores(query_key, layer_weights, query_pos_scaled, readout_context)
+            top_scores = self._apply_anchor_dropout(top_scores.float())
+            query_temperature = self.route_temperature * (
+                0.5 + torch.sigmoid(self.route_temperature_proj(query_emb_chunk))
+            )
+            if top_scores.shape[-1] > 1:
+                route_margin = top_scores[..., :1] - top_scores[..., 1:2]
+                route_scale = top_scores.std(dim=-1, keepdim=True, unbiased=False)
+                route_scale = route_scale + query_temperature.clamp_min(self.route_margin_norm_eps)
+                probe_scores = top_scores - top_scores.mean(dim=-1, keepdim=True)
+                probe_scores = probe_scores / route_scale.clamp_min(self.route_margin_norm_eps)
+                probe_rho = torch.softmax(probe_scores, dim=-1)
+                route_entropy = -(probe_rho.clamp_min(1.0e-8) * probe_rho.clamp_min(1.0e-8).log()).sum(dim=-1, keepdim=True)
+                route_entropy = route_entropy / math.log(float(top_scores.shape[-1]))
+            else:
+                route_margin = torch.ones_like(top_scores[..., :1])
+                route_scale = torch.ones_like(route_margin)
+                route_entropy = torch.zeros_like(route_margin)
+            route_margin_norm = route_margin / route_scale.clamp_min(self.route_margin_norm_eps)
+            route_margin_conf = torch.sigmoid(
+                self.margin_confidence_scale.to(dtype=route_margin.dtype) * route_margin_norm
+            )
+            route_entropy_conf = 1.0 - route_entropy
+            route_confidence = (
+                (1.0 - self.route_entropy_mix) * route_margin_conf
+                + self.route_entropy_mix * route_entropy_conf
+            )
+            route_confidence = self.route_confidence_floor + (1.0 - self.route_confidence_floor) * route_confidence
+            adaptive_temperature = query_temperature * (1.0 + route_entropy)
+            adaptive_temperature = adaptive_temperature / route_confidence.clamp_min(self.route_confidence_floor)
+            rho_logits = top_scores / adaptive_temperature.clamp_min(1.0e-4)
+            rho_logits = rho_logits - rho_logits.max(dim=-1, keepdim=True).values
+            rho = torch.softmax(rho_logits, dim=-1)
 
         gate_sum = query_emb_chunk.new_zeros(())
         raw_gate_sum = query_emb_chunk.new_zeros(())
@@ -436,7 +501,8 @@ class DARM(SMART):
             gate_logits = gate_logits + self.score_gate_scale.to(dtype=top_scores_sub.dtype) * top_scores_sub
             gate_logits = gate_logits - self.distance_gate_scale.to(dtype=selected_dist_feature.dtype) * selected_dist_feature
             gate_logits = gate_logits + self.gate_bias.to(dtype=gate_logits.dtype)
-            evidence = torch.sigmoid(gate_logits)
+            gate_logits = gate_logits.clamp(-20.0, 20.0)
+            evidence = self.evidence_gate_floor + (1.0 - self.evidence_gate_floor) * torch.sigmoid(gate_logits)
             raw_gate = evidence.mean(dim=-1, keepdim=True)
 
             route_confidence_sub = route_confidence[:, start:end]

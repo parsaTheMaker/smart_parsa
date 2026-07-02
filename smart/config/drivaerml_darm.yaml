@@ -29,9 +29,9 @@ experiment:
     route_top_r: 8
     route_dim: 64
     route_temperature: 1.0
-    route_chunk_size: 2048
-    route_anchor_chunk_size: 1024
-    high_compute_chunk_size: 1024
+    route_chunk_size: 4096
+    route_anchor_chunk_size: 2048
+    high_compute_chunk_size: 2048
     anchor_shift_scale: 0.5
     anchor_metric_eps: 1.e-4
     anchor_scale_eps: 1.e-4
@@ -44,6 +44,7 @@ experiment:
     low_branch_num_coarse_layers: 1
     high_hidden_dim: 64
     prediction_query_chunk_size: 32768
+    decoder_checkpointing: True
     use_high_value_block: False
     route_confidence_floor: 0.15
     route_entropy_mix: 0.75
@@ -53,13 +54,13 @@ experiment:
   optimizer: "adamw"
   loss_fn: "rel_l2"
   scheduler: "cosine"
-  scheduler_warumup_fraction: 0.2
-  batch_size: 1
+  scheduler_warmup_fraction: 0.0
+  batch_size: 2
   epochs: 300
-  learning_rate: 2.e-4
+  learning_rate: 2.e-5
   gradient_norm: 1.0
   amp: True
-  precision: "float16"
+  precision: "bfloat16"
   multi_gpu_strategy: "data_parallel"
   log_every_n_steps: 50
   console_log_every_n_steps: 0
@@ -69,32 +70,41 @@ experiment:
   resume_ckpt: ""
   resume_full_state: False
   wandb_watch_model: False
+  supervised_only_warmup_epochs: 0
+  freeze_backbone_epochs: 0
+  backbone_grad_scale: 0.05
 
   supervised_weight: 1.0
-  stability_weight: 0.5
-  ghost_suppression_weight: 0.25
+  stability_weight: 0.04
+  ghost_suppression_weight: 0.015
   ghost_target_ratio: 0.35
-  ghost_absolute_weight: 0.1
+  ghost_absolute_weight: 0.05
   high_sparsity_weight: 0.0
-  collapse_support_weight: 0.1
+  collapse_support_weight: 0.03
   collapse_support_target: 0.1
-  collapse_evidence_weight: 0.1
+  collapse_evidence_weight: 0.03
   collapse_evidence_target: 0.05
-  collapse_entropy_weight: 0.02
+  collapse_entropy_weight: 0.008
   collapse_entropy_target: 0.998
   stability_smooth_l1_beta: 0.05
-  edit_warmup_epochs: 10
-  loss_balance_enabled: True
+  edit_warmup_epochs: 0
+  loss_balance_enabled: False
   loss_balance_reference: "supervised"
   loss_balance_min_scale: 0.1
   loss_balance_max_scale: 10.0
   loss_balance_steps: 16
   loss_balance_ema_momentum: 0.8
+  dynamic_loss_reweight_enabled: True
+  dynamic_loss_reweight_start_steps: 64
+  dynamic_loss_reweight_epochs: [3]
+  dynamic_loss_reweight_min_scale: 0.25
+  dynamic_loss_reweight_max_scale: 4.0
+  dynamic_loss_reweight_momentum: 0.9
 
   edit_patch_min_points: 256
   edit_patch_max_points: 1024
   edit_candidate_points: 2048
-  edit_strength: 0.75
+  edit_strength: 0.2
   edit_ramp_power: 1.5
   edit_changed_radius_scale: 1.2
   edit_unchanged_radius_scale: 2.5
@@ -102,9 +112,15 @@ experiment:
 
   dataset: "DrivAerML"
   data_path: "/mnt/ssdraid/parsa/drivaerml_preprocessed"
-  num_workers: 12
-  prefetch_factor: 4
+  num_workers: 20
+  prefetch_factor: 8
   pin_memory: True
+  cuda_batch_prefetch: True
+  train_input_check_interval: 16
+  train_edit_check_interval: 16
+  train_forward_check_interval: 16
+  train_grad_check_interval: 8
+  eval_nonfinite_check_interval: 8
   geometry_epoch_seeded_sampling: True
   num_body_points: 131072
   num_surface_points: 65536

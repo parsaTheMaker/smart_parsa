@@ -364,10 +364,14 @@ def get_optimizer_scheduler_loss(model, config, train_loader, loss_dim=-2, extra
         raise ValueError("Optimizer not supported!")
     
     # Get scheduler
+    scheduler_warmup_fraction = float(
+        getattr(config, "scheduler_warmup_fraction", getattr(config, "scheduler_warumup_fraction", 0.2))
+    )
+
     if config.scheduler == "one-cycle":
         scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer,
                                                         max_lr=config.learning_rate,
-                                                        pct_start=config.scheduler_warmup_fraction,
+                                                        pct_start=scheduler_warmup_fraction,
                                                         div_factor=1e2, final_div_factor=1e3,
                                                         total_steps=config.epochs * len(train_loader))
     elif config.scheduler == "cosine":

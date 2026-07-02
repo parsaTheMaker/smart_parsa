@@ -3,6 +3,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 from einops import rearrange
 
 from .smart import SMART
@@ -128,7 +129,8 @@ class DARM(SMART):
         low_pos_scale_factor=25.0,
         low_branch_num_coarse_layers=1,
         high_hidden_dim=64,
-        prediction_query_chunk_size=16384,
+        prediction_query_chunk_size=32768,
+        decoder_checkpointing=True,
         use_high_value_block=False,
         route_confidence_floor=0.15,
         route_entropy_mix=0.75,
@@ -170,6 +172,7 @@ class DARM(SMART):
         self.use_intermediate_layer_mix = bool(use_intermediate_layer_mix)
         self.low_branch_num_coarse_layers = max(1, int(low_branch_num_coarse_layers))
         self.prediction_query_chunk_size = max(1, int(prediction_query_chunk_size))
+        self.decoder_checkpointing = bool(decoder_checkpointing)
         self.use_high_value_block = bool(use_high_value_block)
         self.route_confidence_floor = min(max(float(route_confidence_floor), 0.0), 0.95)
         self.route_entropy_mix = min(max(float(route_entropy_mix), 0.0), 1.0)
@@ -240,7 +243,26 @@ class DARM(SMART):
         low_query_sum = None
         coarse_remaining = min(self.low_branch_num_coarse_layers, len(self.decoder_blocks))
         for e_ca, block in zip(intermediate_latent_geometries, self.decoder_blocks):
-            query_emb = block(query_emb, e_ca, params, queries_pos=query_pos_scaled, latent_geometry_pos=latent_geo_pos)
+            if self.training and self.decoder_checkpointing and query_emb.requires_grad:
+                def block_forward(query_tensor, latent_tensor, query_pos_tensor, latent_pos_tensor):
+                    return block(
+                        query_tensor,
+                        latent_tensor,
+                        params,
+                        queries_pos=query_pos_tensor,
+                        latent_geometry_pos=latent_pos_tensor,
+                    )
+
+                query_emb = checkpoint(
+                    block_forward,
+                    query_emb,
+                    e_ca,
+                    query_pos_scaled,
+                    latent_geo_pos,
+                    use_reentrant=False,
+                )
+            else:
+                query_emb = block(query_emb, e_ca, params, queries_pos=query_pos_scaled, latent_geometry_pos=latent_geo_pos)
             if coarse_remaining > 0:
                 low_query_sum = query_emb if low_query_sum is None else (low_query_sum + query_emb)
                 coarse_remaining -= 1
@@ -512,9 +534,13 @@ class DARM(SMART):
             evidence_mass = raw_gate * route_confidence_sub.to(dtype=raw_gate.dtype)
             support_norm = support / support_mass
 
-            anchor_context = (
-                support_norm.unsqueeze(-1).to(dtype=anchor_tokens.dtype) * anchor_tokens
-            ).sum(dim=2)
+            flat_support = support_norm.to(dtype=anchor_tokens.dtype).reshape(-1, 1, support_norm.shape[-1])
+            flat_tokens = anchor_tokens.reshape(-1, anchor_tokens.shape[-2], anchor_tokens.shape[-1])
+            anchor_context = torch.bmm(flat_support, flat_tokens).reshape(
+                anchor_tokens.shape[0],
+                anchor_tokens.shape[1],
+                anchor_tokens.shape[-1],
+            )
             high_hidden = self.high_context_norm(anchor_context)
             high_hidden = high_hidden * self.support_gain_proj(query_emb_sub)
             high_hidden = self.high_value_block(high_hidden)
@@ -606,7 +632,7 @@ class DARM(SMART):
                 "raw_gate": low_out.new_zeros(low_out.shape[0], low_out.shape[1], 1),
             }
 
-        high_chunks = []
+        high_out = torch.zeros_like(low_out)
         gate_sum = low_out.new_zeros(())
         raw_gate_sum = low_out.new_zeros(())
         support_mass_sum = low_out.new_zeros(())
@@ -614,11 +640,11 @@ class DARM(SMART):
         route_entropy_sum = low_out.new_zeros(())
         query_count = 0
         route_debug = None
-        support_mass_chunks = []
-        route_confidence_chunks = []
-        route_entropy_chunks = []
-        evidence_mass_chunks = []
-        raw_gate_chunks = []
+        support_mass = low_out.new_zeros(low_out.shape[0], low_out.shape[1], 1)
+        route_confidence = low_out.new_zeros(low_out.shape[0], low_out.shape[1], 1)
+        route_entropy = low_out.new_zeros(low_out.shape[0], low_out.shape[1], 1)
+        evidence_mass = low_out.new_zeros(low_out.shape[0], low_out.shape[1], 1)
+        raw_gate = low_out.new_zeros(low_out.shape[0], low_out.shape[1], 1)
 
         for start in range(0, high_query_emb.shape[1], self.route_chunk_size):
             end = min(start + self.route_chunk_size, high_query_emb.shape[1])
@@ -630,24 +656,23 @@ class DARM(SMART):
                 return_route_debug=return_route_debug and route_debug is None and route_debug_max_queries > 0,
                 route_debug_max_queries=route_debug_max_queries,
             )
-            high_chunks.append(high_chunk)
+            high_out[:, start:end] = high_chunk
             gate_sum = gate_sum + chunk_aux["gate_sum"]
             raw_gate_sum = raw_gate_sum + chunk_aux["raw_gate_sum"]
             support_mass_sum = support_mass_sum + chunk_aux["support_mass_sum"]
             route_confidence_sum = route_confidence_sum + chunk_aux["route_confidence_sum"]
             route_entropy_sum = route_entropy_sum + chunk_aux["route_entropy_sum"]
             query_count += int(chunk_aux["query_count"])
-            support_mass_chunks.append(chunk_aux["support_mass"])
-            route_confidence_chunks.append(chunk_aux["route_confidence"])
-            route_entropy_chunks.append(chunk_aux["route_entropy"])
-            evidence_mass_chunks.append(chunk_aux["evidence_mass"])
-            raw_gate_chunks.append(chunk_aux["raw_gate"])
+            support_mass[:, start:end] = chunk_aux["support_mass"]
+            route_confidence[:, start:end] = chunk_aux["route_confidence"]
+            route_entropy[:, start:end] = chunk_aux["route_entropy"]
+            evidence_mass[:, start:end] = chunk_aux["evidence_mass"]
+            raw_gate[:, start:end] = chunk_aux["raw_gate"]
 
             if return_route_debug and route_debug is None and route_debug_max_queries > 0 and "debug" in chunk_aux:
                 keep = min(route_debug_max_queries, high_chunk.shape[1])
                 route_debug = {key: value[:, :keep].cpu() for key, value in chunk_aux["debug"].items()}
 
-        high_out = torch.cat(high_chunks, dim=1) if high_chunks else torch.zeros_like(low_out)
         denom = float(max(query_count, 1))
         aux = {
             "mean_support_mass": support_mass_sum / denom,
@@ -655,11 +680,11 @@ class DARM(SMART):
             "mean_raw_evidence_gate": raw_gate_sum / denom,
             "mean_route_confidence": route_confidence_sum / denom,
             "mean_route_entropy": route_entropy_sum / denom,
-            "support_mass": torch.cat(support_mass_chunks, dim=1) if support_mass_chunks else low_out.new_zeros(low_out.shape[0], 0, 1),
-            "route_confidence": torch.cat(route_confidence_chunks, dim=1) if route_confidence_chunks else low_out.new_zeros(low_out.shape[0], 0, 1),
-            "route_entropy": torch.cat(route_entropy_chunks, dim=1) if route_entropy_chunks else low_out.new_zeros(low_out.shape[0], 0, 1),
-            "evidence_mass": torch.cat(evidence_mass_chunks, dim=1) if evidence_mass_chunks else low_out.new_zeros(low_out.shape[0], 0, 1),
-            "raw_gate": torch.cat(raw_gate_chunks, dim=1) if raw_gate_chunks else low_out.new_zeros(low_out.shape[0], 0, 1),
+            "support_mass": support_mass,
+            "route_confidence": route_confidence,
+            "route_entropy": route_entropy,
+            "evidence_mass": evidence_mass,
+            "raw_gate": raw_gate,
         }
         if route_debug is not None:
             aux["route_debug"] = route_debug
@@ -713,10 +738,10 @@ class DARM(SMART):
 
         query_pos = torch.cat([surf_query_pos, vol_query_pos], dim=1)
 
-        surf_low_chunks = []
-        surf_high_chunks = []
-        vol_low_chunks = []
-        vol_high_chunks = []
+        surf_low = surf_query_pos.new_zeros(surf_query_pos.shape[0], surf_count, self.surface_channels)
+        surf_high = surf_query_pos.new_zeros(surf_query_pos.shape[0], surf_count, self.surface_channels)
+        vol_low = vol_query_pos.new_zeros(vol_query_pos.shape[0], vol_count, self.volume_channels)
+        vol_high = vol_query_pos.new_zeros(vol_query_pos.shape[0], vol_count, self.volume_channels)
         surf_support_sum = query_pos.new_zeros(())
         surf_gate_sum = query_pos.new_zeros(())
         surf_raw_gate_sum = query_pos.new_zeros(())
@@ -731,16 +756,17 @@ class DARM(SMART):
         vol_query_total = 0
         surf_debug = None
         vol_debug = None
-        surf_support_chunks = []
-        surf_conf_chunks = []
-        surf_entropy_chunks = []
-        surf_evidence_chunks = []
-        surf_raw_gate_chunks = []
-        vol_support_chunks = []
-        vol_conf_chunks = []
-        vol_entropy_chunks = []
-        vol_evidence_chunks = []
-        vol_raw_gate_chunks = []
+        if return_aux:
+            surf_support = surf_query_pos.new_zeros(surf_query_pos.shape[0], surf_count, 1)
+            surf_conf = surf_query_pos.new_zeros(surf_query_pos.shape[0], surf_count, 1)
+            surf_entropy = surf_query_pos.new_zeros(surf_query_pos.shape[0], surf_count, 1)
+            surf_evidence = surf_query_pos.new_zeros(surf_query_pos.shape[0], surf_count, 1)
+            surf_raw_gate = surf_query_pos.new_zeros(surf_query_pos.shape[0], surf_count, 1)
+            vol_support = vol_query_pos.new_zeros(vol_query_pos.shape[0], vol_count, 1)
+            vol_conf = vol_query_pos.new_zeros(vol_query_pos.shape[0], vol_count, 1)
+            vol_entropy = vol_query_pos.new_zeros(vol_query_pos.shape[0], vol_count, 1)
+            vol_evidence = vol_query_pos.new_zeros(vol_query_pos.shape[0], vol_count, 1)
+            vol_raw_gate = vol_query_pos.new_zeros(vol_query_pos.shape[0], vol_count, 1)
 
         for start in range(0, total_count, self.prediction_query_chunk_size):
             end = min(start + self.prediction_query_chunk_size, total_count)
@@ -764,8 +790,9 @@ class DARM(SMART):
                     return_route_debug=return_route_debug and surf_debug is None,
                     route_debug_max_queries=route_debug_max_queries,
                 )
-                surf_low_chunks.append(surf_low_chunk)
-                surf_high_chunks.append(surf_high_chunk)
+                surf_slice = slice(start, start + surf_local_end)
+                surf_low[:, surf_slice] = surf_low_chunk
+                surf_high[:, surf_slice] = surf_high_chunk
                 chunk_weight = float(max(int(query_chunk.shape[0] * surf_local_end), 1))
                 surf_support_sum = surf_support_sum + surf_aux["mean_support_mass"] * chunk_weight
                 surf_gate_sum = surf_gate_sum + surf_aux["mean_evidence_gate"] * chunk_weight
@@ -773,11 +800,12 @@ class DARM(SMART):
                 surf_conf_sum = surf_conf_sum + surf_aux["mean_route_confidence"] * chunk_weight
                 surf_entropy_sum = surf_entropy_sum + surf_aux["mean_route_entropy"] * chunk_weight
                 surf_query_total += int(query_chunk.shape[0] * surf_local_end)
-                surf_support_chunks.append(surf_aux["support_mass"])
-                surf_conf_chunks.append(surf_aux["route_confidence"])
-                surf_entropy_chunks.append(surf_aux["route_entropy"])
-                surf_evidence_chunks.append(surf_aux["evidence_mass"])
-                surf_raw_gate_chunks.append(surf_aux["raw_gate"])
+                if return_aux:
+                    surf_support[:, surf_slice] = surf_aux["support_mass"]
+                    surf_conf[:, surf_slice] = surf_aux["route_confidence"]
+                    surf_entropy[:, surf_slice] = surf_aux["route_entropy"]
+                    surf_evidence[:, surf_slice] = surf_aux["evidence_mass"]
+                    surf_raw_gate[:, surf_slice] = surf_aux["raw_gate"]
                 if "route_debug" in surf_aux and surf_debug is None:
                     surf_debug = surf_aux["route_debug"]
 
@@ -793,27 +821,26 @@ class DARM(SMART):
                     return_route_debug=return_route_debug and vol_debug is None,
                     route_debug_max_queries=route_debug_max_queries,
                 )
-                vol_low_chunks.append(vol_low_chunk)
-                vol_high_chunks.append(vol_high_chunk)
-                chunk_weight = float(max(int(query_chunk.shape[0] * (end - start - vol_local_start)), 1))
+                vol_count_chunk = end - start - vol_local_start
+                vol_global_start = max(start - surf_count, 0)
+                vol_slice = slice(vol_global_start, vol_global_start + vol_count_chunk)
+                vol_low[:, vol_slice] = vol_low_chunk
+                vol_high[:, vol_slice] = vol_high_chunk
+                chunk_weight = float(max(int(query_chunk.shape[0] * vol_count_chunk), 1))
                 vol_support_sum = vol_support_sum + vol_aux["mean_support_mass"] * chunk_weight
                 vol_gate_sum = vol_gate_sum + vol_aux["mean_evidence_gate"] * chunk_weight
                 vol_raw_gate_sum = vol_raw_gate_sum + vol_aux["mean_raw_evidence_gate"] * chunk_weight
                 vol_conf_sum = vol_conf_sum + vol_aux["mean_route_confidence"] * chunk_weight
                 vol_entropy_sum = vol_entropy_sum + vol_aux["mean_route_entropy"] * chunk_weight
-                vol_query_total += int(query_chunk.shape[0] * (end - start - vol_local_start))
-                vol_support_chunks.append(vol_aux["support_mass"])
-                vol_conf_chunks.append(vol_aux["route_confidence"])
-                vol_entropy_chunks.append(vol_aux["route_entropy"])
-                vol_evidence_chunks.append(vol_aux["evidence_mass"])
-                vol_raw_gate_chunks.append(vol_aux["raw_gate"])
+                vol_query_total += int(query_chunk.shape[0] * vol_count_chunk)
+                if return_aux:
+                    vol_support[:, vol_slice] = vol_aux["support_mass"]
+                    vol_conf[:, vol_slice] = vol_aux["route_confidence"]
+                    vol_entropy[:, vol_slice] = vol_aux["route_entropy"]
+                    vol_evidence[:, vol_slice] = vol_aux["evidence_mass"]
+                    vol_raw_gate[:, vol_slice] = vol_aux["raw_gate"]
                 if "route_debug" in vol_aux and vol_debug is None:
                     vol_debug = vol_aux["route_debug"]
-
-        surf_low = torch.cat(surf_low_chunks, dim=1) if surf_low_chunks else surf_query_pos.new_zeros(surf_query_pos.shape[0], 0, self.surface_channels)
-        surf_high = torch.cat(surf_high_chunks, dim=1) if surf_high_chunks else surf_low.new_zeros(surf_low.shape)
-        vol_low = torch.cat(vol_low_chunks, dim=1) if vol_low_chunks else vol_query_pos.new_zeros(vol_query_pos.shape[0], 0, self.volume_channels)
-        vol_high = torch.cat(vol_high_chunks, dim=1) if vol_high_chunks else vol_low.new_zeros(vol_low.shape)
 
         pred_surf = surf_low + surf_high
         pred_vol = vol_low + vol_high
@@ -829,16 +856,16 @@ class DARM(SMART):
             "surface_high": surf_high,
             "volume_low": vol_low,
             "volume_high": vol_high,
-            "surface_support_mass": torch.cat(surf_support_chunks, dim=1) if surf_support_chunks else surf_query_pos.new_zeros(surf_query_pos.shape[0], 0, 1),
-            "volume_support_mass": torch.cat(vol_support_chunks, dim=1) if vol_support_chunks else vol_query_pos.new_zeros(vol_query_pos.shape[0], 0, 1),
-            "surface_route_confidence": torch.cat(surf_conf_chunks, dim=1) if surf_conf_chunks else surf_query_pos.new_zeros(surf_query_pos.shape[0], 0, 1),
-            "volume_route_confidence": torch.cat(vol_conf_chunks, dim=1) if vol_conf_chunks else vol_query_pos.new_zeros(vol_query_pos.shape[0], 0, 1),
-            "surface_route_entropy": torch.cat(surf_entropy_chunks, dim=1) if surf_entropy_chunks else surf_query_pos.new_zeros(surf_query_pos.shape[0], 0, 1),
-            "volume_route_entropy": torch.cat(vol_entropy_chunks, dim=1) if vol_entropy_chunks else vol_query_pos.new_zeros(vol_query_pos.shape[0], 0, 1),
-            "surface_evidence_mass": torch.cat(surf_evidence_chunks, dim=1) if surf_evidence_chunks else surf_query_pos.new_zeros(surf_query_pos.shape[0], 0, 1),
-            "volume_evidence_mass": torch.cat(vol_evidence_chunks, dim=1) if vol_evidence_chunks else vol_query_pos.new_zeros(vol_query_pos.shape[0], 0, 1),
-            "surface_raw_evidence_gate": torch.cat(surf_raw_gate_chunks, dim=1) if surf_raw_gate_chunks else surf_query_pos.new_zeros(surf_query_pos.shape[0], 0, 1),
-            "volume_raw_evidence_gate": torch.cat(vol_raw_gate_chunks, dim=1) if vol_raw_gate_chunks else vol_query_pos.new_zeros(vol_query_pos.shape[0], 0, 1),
+            "surface_support_mass": surf_support,
+            "volume_support_mass": vol_support,
+            "surface_route_confidence": surf_conf,
+            "volume_route_confidence": vol_conf,
+            "surface_route_entropy": surf_entropy,
+            "volume_route_entropy": vol_entropy,
+            "surface_evidence_mass": surf_evidence,
+            "volume_evidence_mass": vol_evidence,
+            "surface_raw_evidence_gate": surf_raw_gate,
+            "volume_raw_evidence_gate": vol_raw_gate,
             "mean_support_mass": (surf_support_sum + vol_support_sum) / total_weight,
             "mean_evidence_gate": (surf_gate_sum + vol_gate_sum) / total_weight,
             "mean_raw_evidence_gate": (surf_raw_gate_sum + vol_raw_gate_sum) / total_weight,

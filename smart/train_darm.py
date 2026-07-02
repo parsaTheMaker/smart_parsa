@@ -33,6 +33,47 @@ from utils.utils import (
 )
 
 
+DARM_PARAMETER_PREFIXES = (
+    "pos_encoder.",
+    "low_pos_encoder.",
+    "type_embedding.",
+    "layer_router.",
+    "anchor_context_norm.",
+    "route_query_norm.",
+    "route_anchor_norm.",
+    "route_query_proj.",
+    "route_anchor_proj.",
+    "anchor_shift_proj.",
+    "anchor_metric_proj.",
+    "anchor_scale_proj.",
+    "anchor_bias_proj.",
+    "anchor_value_proj.",
+    "delta_value_proj.",
+    "type_value_proj.",
+    "query_gate_proj.",
+    "anchor_gate_proj.",
+    "delta_gate_proj.",
+    "route_temperature_proj.",
+    "support_gain_proj.",
+    "high_context_norm.",
+    "high_value_block.",
+    "low_query_proj.",
+    "low_pos_proj.",
+    "low_type_proj.",
+    "low_block.",
+    "surface_low_head.",
+    "volume_low_head.",
+    "surface_high_head.",
+    "volume_high_head.",
+)
+DARM_PARAMETER_NAMES = {
+    "score_gate_scale",
+    "distance_gate_scale",
+    "gate_bias",
+    "margin_confidence_scale",
+}
+
+
 def unwrap_model(model):
     return model.module if hasattr(model, "module") else model
 
@@ -61,6 +102,108 @@ def parse_batch(batch, params_dim):
         else:
             raise ValueError(f"Unexpected batch size {len(batch)}")
     return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, sample_info
+
+
+def move_to_device(value, device):
+    if torch.is_tensor(value):
+        if value.device == device:
+            return value
+        return value.to(device, non_blocking=True)
+    if isinstance(value, tuple):
+        return tuple(move_to_device(item, device) for item in value)
+    if isinstance(value, list):
+        return [move_to_device(item, device) for item in value]
+    if isinstance(value, dict):
+        return {key: move_to_device(item, device) for key, item in value.items()}
+    return value
+
+
+def record_batch_stream(value, stream):
+    if torch.is_tensor(value):
+        if value.is_cuda:
+            value.record_stream(stream)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            record_batch_stream(item, stream)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            record_batch_stream(item, stream)
+
+
+class CudaPrefetchLoader:
+    def __init__(self, loader, device):
+        self.loader = loader
+        self.device = device
+        self.enabled = device.type == "cuda" and torch.cuda.is_available()
+        self.stream = torch.cuda.Stream(device=device) if self.enabled else None
+
+    def __len__(self):
+        return len(self.loader)
+
+    def __iter__(self):
+        if not self.enabled:
+            yield from self.loader
+            return
+
+        loader_iter = iter(self.loader)
+        next_batch = None
+
+        def preload():
+            nonlocal next_batch
+            try:
+                batch = next(loader_iter)
+            except StopIteration:
+                next_batch = None
+                return
+            with torch.cuda.stream(self.stream):
+                next_batch = move_to_device(batch, self.device)
+
+        preload()
+        while next_batch is not None:
+            torch.cuda.current_stream(device=self.device).wait_stream(self.stream)
+            batch = next_batch
+            record_batch_stream(batch, torch.cuda.current_stream(device=self.device))
+            preload()
+            yield batch
+
+
+def is_darm_parameter_name(name):
+    return name in DARM_PARAMETER_NAMES or name.startswith(DARM_PARAMETER_PREFIXES)
+
+
+def iter_named_backbone_parameters(model):
+    for name, param in unwrap_model(model).named_parameters():
+        if not is_darm_parameter_name(name):
+            yield name, param
+
+
+def configure_backbone_trainability(model, trainable):
+    for _name, param in iter_named_backbone_parameters(model):
+        param.requires_grad_(trainable)
+
+
+def scale_backbone_gradients(model, grad_scale):
+    grad_scale = float(grad_scale)
+    if grad_scale >= 0.999999:
+        return
+    for _name, param in iter_named_backbone_parameters(model):
+        if param.grad is not None:
+            param.grad.mul_(grad_scale)
+
+
+def count_parameter_group_sizes(model):
+    backbone = 0
+    darm = 0
+    for name, param in unwrap_model(model).named_parameters():
+        if not param.requires_grad:
+            continue
+        if is_darm_parameter_name(name):
+            darm += param.numel()
+        else:
+            backbone += param.numel()
+    return backbone, darm
 
 
 def load_full_training_state(model, optimizer, scheduler, scaler, checkpoint_path, device, amp_enabled):
@@ -264,26 +407,15 @@ def split_aux_batch(aux, split_index):
     return left, right
 
 
-def aux_query_mean(aux, *keys):
-    ref = None
-    total = None
-    count = 0
-    for key in keys:
-        value = aux.get(key)
-        if not torch.is_tensor(value):
-            continue
-        ref = value if ref is None else ref
-        if value.ndim < 2 or value.shape[1] == 0:
-            continue
-        per_query = value.float().mean(dim=-1)
-        component = per_query.sum()
-        total = component if total is None else (total + component)
-        count += int(per_query.numel())
-    if ref is None:
-        return torch.tensor(0.0)
-    if count == 0:
-        return ref.new_zeros((), dtype=torch.float32)
-    return total / float(count)
+def aux_scalar_mean(aux, key):
+    value = aux.get(key)
+    if torch.is_tensor(value):
+        return value.float()
+    return torch.tensor(0.0)
+
+
+def mean_aux_scalar_pair(aux_left, aux_right, key):
+    return 0.5 * (aux_scalar_mean(aux_left, key) + aux_scalar_mean(aux_right, key))
 
 
 def update_ema_dict(ema_dict, value_dict, momentum):
@@ -315,6 +447,43 @@ def calibrate_loss_scales(loss_terms, base_weights, reference_name, min_scale, m
             continue
         scales[name] = float((ref_value / value).clamp(float(min_scale), float(max_scale)).item())
     scales[reference_name] = 1.0
+    return scales
+
+
+def calibrate_normalized_loss_scales(loss_values, base_weights, min_scale, max_scale, eps=1.0e-8):
+    active_names = [name for name, weight in base_weights.items() if float(weight) > 0.0]
+    if not active_names:
+        return {name: 1.0 for name in loss_values}
+
+    raw_effective_weights = {}
+    for name in active_names:
+        value = loss_values.get(name, 0.0)
+        value = max(float(value), eps)
+        raw_effective_weights[name] = 1.0 / value
+
+    base_weight_sum = sum(float(base_weights[name]) for name in active_names)
+    raw_weight_sum = sum(raw_effective_weights.values())
+    if raw_weight_sum <= eps:
+        return {name: 1.0 for name in loss_values}
+
+    normalized_effective_weights = {
+        name: raw_effective_weights[name] * (base_weight_sum / raw_weight_sum)
+        for name in active_names
+    }
+    scales = {}
+    for name in loss_values:
+        base_weight = float(base_weights.get(name, 0.0))
+        if base_weight <= 0.0:
+            scales[name] = 1.0
+            continue
+        target_weight = normalized_effective_weights.get(name, base_weight)
+        scales[name] = float(np.clip(target_weight / base_weight, float(min_scale), float(max_scale)))
+
+    effective_sum = sum(float(base_weights[name]) * float(scales[name]) for name in active_names)
+    if effective_sum > eps:
+        renorm = base_weight_sum / effective_sum
+        for name in active_names:
+            scales[name] = float(np.clip(scales[name] * renorm, float(min_scale), float(max_scale)))
     return scales
 
 
@@ -399,6 +568,11 @@ def find_non_finite_gradients(model, max_entries=8):
     return problems
 
 
+def should_run_periodic_check(step_index, interval):
+    interval = max(1, int(interval))
+    return step_index == 0 or ((step_index + 1) % interval == 0)
+
+
 def build_checkpoint(
     epoch,
     model,
@@ -445,43 +619,48 @@ def evaluate_loader(
     combined_loss_fn,
     loss_fn,
     use_surface_supervision,
+    cuda_batch_prefetch,
+    eval_nonfinite_check_interval,
 ):
     metrics = init_metric_dict(fields["surface"], fields["volume"])
     model.eval()
     eval_sample_count = 0
     skipped_nonfinite_batches = 0
 
+    eval_loader = CudaPrefetchLoader(loader, device) if cuda_batch_prefetch else loader
+
     with torch.inference_mode():
-        for batch in tqdm(loader, desc="Eval", leave=False, dynamic_ncols=True):
+        for batch_idx, batch in enumerate(tqdm(eval_loader, desc="Eval", leave=False, dynamic_ncols=True)):
             geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, _sample_info = parse_batch(batch, params_dim)
 
-            geo_mesh = geo_mesh.to(device, non_blocking=True)
-            surf_mesh = surf_mesh.to(device, non_blocking=True)
-            surf_data = surf_data.to(device, non_blocking=True)
-            vol_mesh = vol_mesh.to(device, non_blocking=True)
-            vol_data = vol_data.to(device, non_blocking=True)
+            geo_mesh = move_to_device(geo_mesh, device)
+            surf_mesh = move_to_device(surf_mesh, device)
+            surf_data = move_to_device(surf_data, device)
+            vol_mesh = move_to_device(vol_mesh, device)
+            vol_data = move_to_device(vol_data, device)
             if params is not None:
-                params = params.to(device, non_blocking=True)
+                params = move_to_device(params, device)
 
             if config.dataset == "NACA4":
                 surf_data = surf_data[..., :1]
                 vol_data = torch.cat([vol_data[..., :1], vol_data[..., 2:4]], dim=-1)
 
-            input_problems = find_non_finite_problems(
-                {
-                    "geo_mesh": geo_mesh,
-                    "surf_mesh": surf_mesh,
-                    "surf_data": surf_data,
-                    "vol_mesh": vol_mesh,
-                    "vol_data": vol_data,
-                    "params": params,
-                },
-                max_entries=4,
-            )
-            if input_problems:
-                skipped_nonfinite_batches += 1
-                print(f"[eval/nonfinite] Skipping batch with invalid inputs: {summarize_non_finite_problems(input_problems)}")
-                continue
+            if should_run_periodic_check(batch_idx, eval_nonfinite_check_interval):
+                input_problems = find_non_finite_problems(
+                    {
+                        "geo_mesh": geo_mesh,
+                        "surf_mesh": surf_mesh,
+                        "surf_data": surf_data,
+                        "vol_mesh": vol_mesh,
+                        "vol_data": vol_data,
+                        "params": params,
+                    },
+                    max_entries=4,
+                )
+                if input_problems:
+                    skipped_nonfinite_batches += 1
+                    print(f"[eval/nonfinite] Skipping batch with invalid inputs: {summarize_non_finite_problems(input_problems)}")
+                    continue
 
             with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=amp):
                 y_hat_surf, y_hat_vol = model(geo_mesh, surf_mesh, vol_mesh, params)
@@ -501,22 +680,23 @@ def evaluate_loader(
             gt_vol = vol_data * std_vol + mean_vol
             volume_rel_l2 = rel_l2_loss_fn(y_hat_vol.float(), vol_data)
 
-            eval_problems = find_non_finite_problems(
-                {
-                    "y_hat_surf": y_hat_surf if use_surface_supervision else None,
-                    "y_hat_vol": y_hat_vol,
-                    "pred_surf": pred_surf if use_surface_supervision else None,
-                    "pred_vol": pred_vol,
-                    "batch_loss": batch_loss,
-                    "surface_rel_l2": surface_rel_l2,
-                    "volume_rel_l2": volume_rel_l2,
-                },
-                max_entries=4,
-            )
-            if eval_problems:
-                skipped_nonfinite_batches += 1
-                print(f"[eval/nonfinite] Skipping batch with invalid outputs: {summarize_non_finite_problems(eval_problems)}")
-                continue
+            if should_run_periodic_check(batch_idx, eval_nonfinite_check_interval):
+                eval_problems = find_non_finite_problems(
+                    {
+                        "y_hat_surf": y_hat_surf if use_surface_supervision else None,
+                        "y_hat_vol": y_hat_vol,
+                        "pred_surf": pred_surf if use_surface_supervision else None,
+                        "pred_vol": pred_vol,
+                        "batch_loss": batch_loss,
+                        "surface_rel_l2": surface_rel_l2,
+                        "volume_rel_l2": volume_rel_l2,
+                    },
+                    max_entries=4,
+                )
+                if eval_problems:
+                    skipped_nonfinite_batches += 1
+                    print(f"[eval/nonfinite] Skipping batch with invalid outputs: {summarize_non_finite_problems(eval_problems)}")
+                    continue
 
             batch_size = surf_data.size(0)
             eval_sample_count += batch_size
@@ -550,10 +730,18 @@ def main(cfg: DictConfig):
     run = initialize_wandb(config, wandb_config)
     initialize_gpu(config.random_seed, high_precision=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
 
     gradient_norm = config.gradient_norm
     precisions = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
     dtype = precisions.get(config.precision, torch.float16)
+    if dtype == torch.bfloat16 and torch.cuda.is_available() and not torch.cuda.is_bf16_supported():
+        print("[DARM] CUDA device does not report bfloat16 support. Falling back to float16.")
+        dtype = torch.float16
     amp = bool(config.amp)
     print(f"Model {config.model_name}, random seed: {config.random_seed}, epochs: {config.epochs}, learning rate: {config.learning_rate}")
     print(gradient_norm, amp, dtype)
@@ -584,6 +772,7 @@ def main(cfg: DictConfig):
     prefetch_factor = int(getattr(config, "prefetch_factor", 2))
     pin_memory = bool(getattr(config, "pin_memory", True))
     num_workers = int(getattr(config, "num_workers", 0))
+    cuda_batch_prefetch = bool(getattr(config, "cuda_batch_prefetch", device.type == "cuda")) and device.type == "cuda"
     dl_common = dict(batch_size=config.batch_size, num_workers=num_workers, pin_memory=pin_memory)
     if num_workers > 0:
         dl_common["prefetch_factor"] = prefetch_factor
@@ -628,6 +817,18 @@ def main(cfg: DictConfig):
     optimizer, scheduler, loss_fn, rel_l2_loss_fn = get_optimizer_scheduler_loss(model, config, train_loader, loss_dim=1)
     combined_loss_fn = CombinedLoss(loss_fn, fields) if use_surface_supervision else None
 
+    supervised_only_warmup_epochs = max(0, int(getattr(config, "supervised_only_warmup_epochs", 0)))
+    freeze_backbone_epochs = max(0, int(getattr(config, "freeze_backbone_epochs", 0)))
+    backbone_grad_scale = float(getattr(config, "backbone_grad_scale", 1.0))
+    backbone_grad_scale = min(max(backbone_grad_scale, 0.0), 1.0)
+    backbone_param_count, darm_param_count = count_parameter_group_sizes(model)
+    print(
+        f"[DARM] fine-tune split -> backbone_params={backbone_param_count}, "
+        f"darm_params={darm_param_count}, supervised_only_warmup_epochs={supervised_only_warmup_epochs}, "
+        f"freeze_backbone_epochs={freeze_backbone_epochs}, "
+        f"backbone_grad_scale={backbone_grad_scale:.4f}"
+    )
+
     start_epoch = 0
     global_step = 0
     best_rel_l2 = np.inf
@@ -645,10 +846,14 @@ def main(cfg: DictConfig):
     train_model = model
     if multi_gpu_strategy == "data_parallel" and torch.cuda.is_available() and torch.cuda.device_count() > 1:
         device_ids = list(range(torch.cuda.device_count()))
-        train_model = DataParallel(model, device_ids=device_ids, output_device=device_ids[0], dim=0)
-        print(f"[DARM] Enabled DataParallel on device ids {device_ids}.")
-        if int(config.batch_size) < len(device_ids):
-            print(f"[DARM] Warning: batch_size={config.batch_size} is smaller than num_gpus={len(device_ids)}.")
+        if int(config.batch_size) >= len(device_ids):
+            train_model = DataParallel(model, device_ids=device_ids, output_device=device_ids[0], dim=0)
+            print(f"[DARM] Enabled DataParallel on device ids {device_ids}.")
+        else:
+            print(
+                f"[DARM] DataParallel disabled because batch_size={config.batch_size} "
+                f"is smaller than num_gpus={len(device_ids)}. Using a single process on cuda:0."
+            )
 
     extra_metric_keys = [
         "loss_supervised",
@@ -703,17 +908,29 @@ def main(cfg: DictConfig):
     console_log_every_n_steps = int(getattr(config, "console_log_every_n_steps", 0))
     show_first_batch_timing = bool(getattr(config, "show_first_batch_timing", False))
     track_train_channel_metrics = bool(getattr(config, "track_train_channel_metrics", False))
+    train_input_check_interval = max(1, int(getattr(config, "train_input_check_interval", 16)))
+    train_edit_check_interval = max(1, int(getattr(config, "train_edit_check_interval", 16)))
+    train_forward_check_interval = max(1, int(getattr(config, "train_forward_check_interval", 16)))
+    train_grad_check_interval = max(1, int(getattr(config, "train_grad_check_interval", 8)))
+    eval_nonfinite_check_interval = max(1, int(getattr(config, "eval_nonfinite_check_interval", 8)))
 
-    effective_forward_batch_size = 2 * int(config.batch_size)
+    base_forward_batch_size = int(config.batch_size)
+    local_edit_forward_batch_size = 2 * int(config.batch_size)
     print(
         f"[DARM] steps_per_epoch={len(train_loader)}, "
         f"visible_gpus={torch.cuda.device_count() if torch.cuda.is_available() else 0}, "
         f"batch_size={int(config.batch_size)}, "
-        f"effective_forward_batch_size={effective_forward_batch_size}"
+        f"base_forward_batch_size={base_forward_batch_size}, "
+        f"local_edit_forward_batch_size={local_edit_forward_batch_size}, "
+        f"num_workers={num_workers}, "
+        f"prefetch_factor={prefetch_factor}, "
+        f"cuda_batch_prefetch={cuda_batch_prefetch}, "
+        f"train_checks=({train_input_check_interval},{train_edit_check_interval},{train_forward_check_interval},{train_grad_check_interval})"
     )
     print(
-        "[DARM] Local-edit consistency duplicates each batch for the forward pass. "
-        "If CUDA memory is tight, reduce experiment.batch_size first."
+        "[DARM] Local-edit consistency uses one concatenated forward pass over "
+        "full surface/volume query sets while preserving the current "
+        "methodology and improving DataParallel utilization."
     )
 
     loss_balance_enabled = bool(getattr(config, "loss_balance_enabled", getattr(config, "loss_calibration_enabled", True)))
@@ -724,12 +941,24 @@ def main(cfg: DictConfig):
     loss_balance_steps = max(1, int(getattr(config, "loss_balance_steps", 16)))
     loss_balance_ema_momentum = float(getattr(config, "loss_balance_ema_momentum", 0.8))
     loss_balance_ema = None
+    dynamic_loss_reweight_enabled = bool(getattr(config, "dynamic_loss_reweight_enabled", True))
+    dynamic_loss_reweight_start_steps = max(1, int(getattr(config, "dynamic_loss_reweight_start_steps", 64)))
+    dynamic_loss_reweight_epochs = {
+        int(epoch_idx) for epoch_idx in getattr(config, "dynamic_loss_reweight_epochs", [3])
+    }
+    dynamic_loss_reweight_min_scale = float(getattr(config, "dynamic_loss_reweight_min_scale", 0.25))
+    dynamic_loss_reweight_max_scale = float(getattr(config, "dynamic_loss_reweight_max_scale", 4.0))
+    dynamic_loss_reweight_momentum = float(getattr(config, "dynamic_loss_reweight_momentum", 0.9))
+    dynamic_loss_scales = None
+    dynamic_loss_start_ema = None
     oom_skip_batches = bool(getattr(config, "oom_skip_batches", True))
     oom_clear_cache = bool(getattr(config, "oom_clear_cache", True))
     total_oom_batches = 0
     nonfinite_skip_batches = bool(getattr(config, "nonfinite_skip_batches", True))
     nonfinite_clear_cache = bool(getattr(config, "nonfinite_clear_cache", True))
     total_nonfinite_batches = 0
+    backbone_trainable = None
+    local_edit_enabled_state = None
 
     try:
         for ep in tqdm(range(start_epoch, config.epochs), desc="Epochs", dynamic_ncols=True):
@@ -748,10 +977,28 @@ def main(cfg: DictConfig):
             train_sample_count = 0
             epoch_oom_batches = 0
             epoch_nonfinite_batches = 0
+            epoch_loss_term_sums = OrderedDict(
+                (name, 0.0) for name in ("supervised", "stability", "ghost", "high_sparsity")
+            )
+            epoch_loss_term_count = 0
+
+            local_edit_enabled = ep >= supervised_only_warmup_epochs
+            if local_edit_enabled_state is None or local_edit_enabled != local_edit_enabled_state:
+                local_edit_enabled_state = local_edit_enabled
+                stage = "local-edit consistency" if local_edit_enabled else "supervised-only warmup"
+                print(f"[DARM] epoch={ep + 1}: stage is now {stage}.")
+
+            epoch_backbone_trainable = ep >= freeze_backbone_epochs
+            if backbone_trainable is None or epoch_backbone_trainable != backbone_trainable:
+                configure_backbone_trainability(model, epoch_backbone_trainable)
+                backbone_trainable = epoch_backbone_trainable
+                state = "trainable" if backbone_trainable else "frozen"
+                print(f"[DARM] epoch={ep + 1}: backbone is now {state}.")
 
             train_model.train()
+            train_batch_source = CudaPrefetchLoader(train_loader, device) if cuda_batch_prefetch else train_loader
             train_pbar = tqdm(
-                train_loader,
+                train_batch_source,
                 desc=f"Train {ep + 1}/{config.epochs}",
                 leave=False,
                 dynamic_ncols=True,
@@ -776,123 +1023,147 @@ def main(cfg: DictConfig):
                 try:
                     batch_t0 = default_timer()
                     geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, _sample_info = parse_batch(batch, params_dim)
-                    geo_mesh = geo_mesh.to(device, non_blocking=True)
-                    surf_mesh = surf_mesh.to(device, non_blocking=True)
-                    surf_data = surf_data.to(device, non_blocking=True)
-                    vol_mesh = vol_mesh.to(device, non_blocking=True)
-                    vol_data = vol_data.to(device, non_blocking=True)
+                    geo_mesh = move_to_device(geo_mesh, device)
+                    surf_mesh = move_to_device(surf_mesh, device)
+                    surf_data = move_to_device(surf_data, device)
+                    vol_mesh = move_to_device(vol_mesh, device)
+                    vol_data = move_to_device(vol_data, device)
                     if params is not None:
-                        params = params.to(device, non_blocking=True)
+                        params = move_to_device(params, device)
 
                     if config.dataset == "NACA4":
                         surf_data = surf_data[..., :1]
                         vol_data = torch.cat([vol_data[..., :1], vol_data[..., 2:4]], dim=-1)
 
-                    input_problems = find_non_finite_problems(
-                        {
-                            "geo_mesh": geo_mesh,
-                            "surf_mesh": surf_mesh,
-                            "surf_data": surf_data,
-                            "vol_mesh": vol_mesh,
-                            "vol_data": vol_data,
-                            "params": params,
-                        },
-                        max_entries=4,
-                    )
-                    if input_problems:
-                        epoch_nonfinite_batches += 1
-                        total_nonfinite_batches += 1
-                        print(
-                            f"[train/nonfinite] epoch={ep + 1}/{config.epochs} "
-                            f"batch={batch_idx + 1}/{len(train_loader)} invalid inputs: "
-                            f"{summarize_non_finite_problems(input_problems)}"
+                    if should_run_periodic_check(batch_idx, train_input_check_interval):
+                        input_problems = find_non_finite_problems(
+                            {
+                                "geo_mesh": geo_mesh,
+                                "surf_mesh": surf_mesh,
+                                "surf_data": surf_data,
+                                "vol_mesh": vol_mesh,
+                                "vol_data": vol_data,
+                                "params": params,
+                            },
+                            max_entries=4,
                         )
-                        if not nonfinite_skip_batches:
-                            raise RuntimeError("Encountered non-finite inputs during training.")
-                        cleanup_after_invalid_step(optimizer, clear_cache=nonfinite_clear_cache)
-                        continue
+                        if input_problems:
+                            epoch_nonfinite_batches += 1
+                            total_nonfinite_batches += 1
+                            print(
+                                f"[train/nonfinite] epoch={ep + 1}/{config.epochs} "
+                                f"batch={batch_idx + 1}/{len(train_loader)} invalid inputs: "
+                                f"{summarize_non_finite_problems(input_problems)}"
+                            )
+                            if not nonfinite_skip_batches:
+                                raise RuntimeError("Encountered non-finite inputs during training.")
+                            cleanup_after_invalid_step(optimizer, clear_cache=nonfinite_clear_cache)
+                            continue
 
                     optimizer.zero_grad(set_to_none=True)
 
-                    with torch.no_grad():
-                        edit_ramp_power = float(getattr(config, "edit_ramp_power", 1.5))
-                        edited_geo, edit_center, edit_normal, edit_sigma, edit_scale, changed_radius, unchanged_radius = build_local_edit(
-                            geo_mesh,
-                            min_points=int(getattr(config, "edit_patch_min_points", 256)),
-                            max_points=int(getattr(config, "edit_patch_max_points", 1024)),
-                            edit_strength=float(getattr(config, "edit_strength", 0.75)),
-                            ramp_power=edit_ramp_power,
-                            changed_scale=float(getattr(config, "edit_changed_radius_scale", 1.2)),
-                            unchanged_scale=float(getattr(config, "edit_unchanged_radius_scale", 2.5)),
-                            candidate_points=int(getattr(config, "edit_candidate_points", 2048)),
-                        )
-                        edited_surf_mesh = apply_gaussian_deformation(
-                            surf_mesh,
-                            edit_center,
-                            edit_normal,
-                            edit_sigma,
-                            edit_scale=edit_scale,
-                            ramp_power=edit_ramp_power,
-                        )
-                        edited_vol_mesh = apply_gaussian_deformation(
-                            vol_mesh,
-                            edit_center,
-                            edit_normal,
-                            edit_sigma,
-                            edit_scale=edit_scale,
-                            ramp_power=edit_ramp_power,
-                        )
-                        surf_changed_w, surf_unchanged_w = build_query_locality_weights(
-                            surf_mesh, edit_center, changed_radius, unchanged_radius
-                        )
-                        vol_changed_w, vol_unchanged_w = build_query_locality_weights(
-                            vol_mesh, edit_center, changed_radius, unchanged_radius
-                        )
+                    if local_edit_enabled:
+                        with torch.no_grad():
+                            edit_ramp_power = float(getattr(config, "edit_ramp_power", 1.5))
+                            edited_geo, edit_center, edit_normal, edit_sigma, edit_scale, changed_radius, unchanged_radius = build_local_edit(
+                                geo_mesh,
+                                min_points=int(getattr(config, "edit_patch_min_points", 256)),
+                                max_points=int(getattr(config, "edit_patch_max_points", 1024)),
+                                edit_strength=float(getattr(config, "edit_strength", 0.75)),
+                                ramp_power=edit_ramp_power,
+                                changed_scale=float(getattr(config, "edit_changed_radius_scale", 1.2)),
+                                unchanged_scale=float(getattr(config, "edit_unchanged_radius_scale", 2.5)),
+                                candidate_points=int(getattr(config, "edit_candidate_points", 2048)),
+                            )
+                            edited_surf_mesh = apply_gaussian_deformation(
+                                surf_mesh,
+                                edit_center,
+                                edit_normal,
+                                edit_sigma,
+                                edit_scale=edit_scale,
+                                ramp_power=edit_ramp_power,
+                            )
+                            edited_vol_mesh = apply_gaussian_deformation(
+                                vol_mesh,
+                                edit_center,
+                                edit_normal,
+                                edit_sigma,
+                                edit_scale=edit_scale,
+                                ramp_power=edit_ramp_power,
+                            )
+                            surf_changed_w, surf_unchanged_w = build_query_locality_weights(
+                                surf_mesh, edit_center, changed_radius, unchanged_radius
+                            )
+                            vol_changed_w, vol_unchanged_w = build_query_locality_weights(
+                                vol_mesh, edit_center, changed_radius, unchanged_radius
+                            )
+                    else:
+                        edited_geo = geo_mesh
+                        edited_surf_mesh = surf_mesh
+                        edited_vol_mesh = vol_mesh
+                        surf_changed_w = surf_mesh.new_zeros(surf_mesh.shape[:2])
+                        surf_unchanged_w = surf_mesh.new_zeros(surf_mesh.shape[:2])
+                        vol_changed_w = vol_mesh.new_zeros(vol_mesh.shape[:2])
+                        vol_unchanged_w = vol_mesh.new_zeros(vol_mesh.shape[:2])
                     prep_t1 = default_timer()
 
-                    edit_problems = find_non_finite_problems(
-                        {
-                            "edited_geo": edited_geo,
-                            "edited_surf_mesh": edited_surf_mesh,
-                            "edited_vol_mesh": edited_vol_mesh,
-                            "surf_changed_w": surf_changed_w,
-                            "surf_unchanged_w": surf_unchanged_w,
-                            "vol_changed_w": vol_changed_w,
-                            "vol_unchanged_w": vol_unchanged_w,
-                        },
-                        max_entries=4,
-                    )
-                    if edit_problems:
-                        epoch_nonfinite_batches += 1
-                        total_nonfinite_batches += 1
-                        print(
-                            f"[train/nonfinite] epoch={ep + 1}/{config.epochs} "
-                            f"batch={batch_idx + 1}/{len(train_loader)} invalid edit tensors: "
-                            f"{summarize_non_finite_problems(edit_problems)}"
+                    if should_run_periodic_check(batch_idx, train_edit_check_interval):
+                        edit_problems = find_non_finite_problems(
+                            {
+                                "edited_geo": edited_geo,
+                                "edited_surf_mesh": edited_surf_mesh,
+                                "edited_vol_mesh": edited_vol_mesh,
+                                "surf_changed_w": surf_changed_w,
+                                "surf_unchanged_w": surf_unchanged_w,
+                                "vol_changed_w": vol_changed_w,
+                                "vol_unchanged_w": vol_unchanged_w,
+                            },
+                            max_entries=4,
                         )
-                        if not nonfinite_skip_batches:
-                            raise RuntimeError("Encountered non-finite edit tensors during training.")
-                        cleanup_after_invalid_step(optimizer, clear_cache=nonfinite_clear_cache)
-                        continue
+                        if edit_problems:
+                            epoch_nonfinite_batches += 1
+                            total_nonfinite_batches += 1
+                            print(
+                                f"[train/nonfinite] epoch={ep + 1}/{config.epochs} "
+                                f"batch={batch_idx + 1}/{len(train_loader)} invalid edit tensors: "
+                                f"{summarize_non_finite_problems(edit_problems)}"
+                            )
+                            if not nonfinite_skip_batches:
+                                raise RuntimeError("Encountered non-finite edit tensors during training.")
+                            cleanup_after_invalid_step(optimizer, clear_cache=nonfinite_clear_cache)
+                            continue
 
                     with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=amp):
-                        geo_pair = torch.cat([geo_mesh, edited_geo], dim=0)
-                        surf_pair = torch.cat([surf_mesh, edited_surf_mesh], dim=0)
-                        vol_pair = torch.cat([vol_mesh, edited_vol_mesh], dim=0)
-                        params_pair = duplicate_batch(params)
+                        if local_edit_enabled:
+                            geo_pair = torch.cat([geo_mesh, edited_geo], dim=0)
+                            surf_pair = torch.cat([surf_mesh, edited_surf_mesh], dim=0)
+                            vol_pair = torch.cat([vol_mesh, edited_vol_mesh], dim=0)
+                            params_pair = duplicate_batch(params)
 
-                        y_pair_surf, y_pair_vol, aux_pair = train_model(
-                            geo_pair,
-                            surf_pair,
-                            vol_pair,
-                            params_pair,
-                            return_aux=True,
-                        )
+                            y_pair_surf, y_pair_vol, aux_pair = train_model(
+                                geo_pair,
+                                surf_pair,
+                                vol_pair,
+                                params_pair,
+                                return_aux=True,
+                            )
 
-                        pair_batch = int(geo_mesh.shape[0])
-                        y_orig_surf, y_edit_surf = y_pair_surf.split(pair_batch, dim=0)
-                        y_orig_vol, y_edit_vol = y_pair_vol.split(pair_batch, dim=0)
-                        aux_orig, aux_edit = split_aux_batch(aux_pair, pair_batch)
+                            pair_batch = int(geo_mesh.shape[0])
+                            y_orig_surf, y_edit_surf = y_pair_surf.split(pair_batch, dim=0)
+                            y_orig_vol, y_edit_vol = y_pair_vol.split(pair_batch, dim=0)
+                            aux_orig, aux_edit = split_aux_batch(aux_pair, pair_batch)
+                        else:
+                            y_orig_surf, y_orig_vol, aux_orig = train_model(
+                                geo_mesh,
+                                surf_mesh,
+                                vol_mesh,
+                                params,
+                                return_aux=True,
+                            )
+                            y_edit_surf = y_orig_surf
+                            y_edit_vol = y_orig_vol
+                            aux_edit = aux_orig
+                            aux_pair = aux_orig
 
                         y_orig_surf_f = y_orig_surf.float()
                         y_orig_vol_f = y_orig_vol.float()
@@ -984,20 +1255,20 @@ def main(cfg: DictConfig):
                         if collapse_support_weight > 0.0:
                             collapse_support_penalty = F.relu(
                                 y_orig_vol_f.new_tensor(collapse_support_target)
-                                - aux_query_mean(aux_pair, "surface_support_mass", "volume_support_mass").float()
+                                - mean_aux_scalar_pair(aux_orig, aux_edit, "mean_support_mass").to(device=device)
                             )
 
                         collapse_evidence_penalty = y_orig_vol_f.new_zeros(())
                         if collapse_evidence_weight > 0.0:
                             collapse_evidence_penalty = F.relu(
                                 y_orig_vol_f.new_tensor(collapse_evidence_target)
-                                - aux_query_mean(aux_pair, "surface_evidence_mass", "volume_evidence_mass").float()
+                                - mean_aux_scalar_pair(aux_orig, aux_edit, "mean_evidence_gate").to(device=device)
                             )
 
                         collapse_entropy_penalty = y_orig_vol_f.new_zeros(())
                         if collapse_entropy_weight > 0.0:
                             collapse_entropy_penalty = F.relu(
-                                aux_query_mean(aux_pair, "surface_route_entropy", "volume_route_entropy").float()
+                                mean_aux_scalar_pair(aux_orig, aux_edit, "mean_route_entropy").to(device=device)
                                 - y_orig_vol_f.new_tensor(collapse_entropy_target)
                             )
 
@@ -1043,30 +1314,33 @@ def main(cfg: DictConfig):
 
                         forward_t1 = default_timer()
 
-                    forward_problems = find_non_finite_problems(
-                        {
-                            "y_pair_surf": y_pair_surf if use_surface_supervision else None,
-                            "y_pair_vol": y_pair_vol,
-                            "aux_pair": aux_pair,
-                            "loss_supervised": loss_supervised,
-                            "stability_loss": stability_loss,
-                            "ghost_loss": ghost_loss,
-                            "high_sparsity_loss": high_sparsity_loss,
-                        },
-                        max_entries=6,
-                    )
-                    if forward_problems:
-                        epoch_nonfinite_batches += 1
-                        total_nonfinite_batches += 1
-                        print(
-                            f"[train/nonfinite] epoch={ep + 1}/{config.epochs} "
-                            f"batch={batch_idx + 1}/{len(train_loader)} invalid forward tensors: "
-                            f"{summarize_non_finite_problems(forward_problems)}"
+                    if should_run_periodic_check(batch_idx, train_forward_check_interval):
+                        forward_problems = find_non_finite_problems(
+                            {
+                                "y_orig_surf": y_orig_surf if use_surface_supervision else None,
+                                "y_orig_vol": y_orig_vol,
+                                "y_edit_surf": y_edit_surf if use_surface_supervision else None,
+                                "y_edit_vol": y_edit_vol,
+                                "aux_pair": aux_pair,
+                                "loss_supervised": loss_supervised,
+                                "stability_loss": stability_loss,
+                                "ghost_loss": ghost_loss,
+                                "high_sparsity_loss": high_sparsity_loss,
+                            },
+                            max_entries=6,
                         )
-                        if not nonfinite_skip_batches:
-                            raise RuntimeError("Encountered non-finite forward outputs during training.")
-                        cleanup_after_invalid_step(optimizer, clear_cache=nonfinite_clear_cache)
-                        continue
+                        if forward_problems:
+                            epoch_nonfinite_batches += 1
+                            total_nonfinite_batches += 1
+                            print(
+                                f"[train/nonfinite] epoch={ep + 1}/{config.epochs} "
+                                f"batch={batch_idx + 1}/{len(train_loader)} invalid forward tensors: "
+                                f"{summarize_non_finite_problems(forward_problems)}"
+                            )
+                            if not nonfinite_skip_batches:
+                                raise RuntimeError("Encountered non-finite forward outputs during training.")
+                            cleanup_after_invalid_step(optimizer, clear_cache=nonfinite_clear_cache)
+                            continue
 
                     loss_terms = OrderedDict(
                         [
@@ -1084,11 +1358,31 @@ def main(cfg: DictConfig):
                             ("high_sparsity", high_sparsity_weight),
                         ]
                     )
+                    current_loss_values = {
+                        name: float(term.detach().float().abs().item())
+                        for name, term in loss_terms.items()
+                    }
+                    for name, value in current_loss_values.items():
+                        epoch_loss_term_sums[name] += value
+                    epoch_loss_term_count += 1
+
+                    if dynamic_loss_reweight_enabled and ep == 0 and global_step < dynamic_loss_reweight_start_steps:
+                        dynamic_loss_start_ema = update_ema_dict(
+                            dynamic_loss_start_ema,
+                            current_loss_values,
+                            dynamic_loss_reweight_momentum,
+                        )
+                        dynamic_loss_scales = calibrate_normalized_loss_scales(
+                            dynamic_loss_start_ema,
+                            loss_base_weights,
+                            min_scale=dynamic_loss_reweight_min_scale,
+                            max_scale=dynamic_loss_reweight_max_scale,
+                        )
+                        if run is not None and (global_step == 0 or global_step + 1 == dynamic_loss_reweight_start_steps):
+                            print(f"[DARM] dynamic loss scales at start: {dynamic_loss_scales}")
+                            wandb.log({f"dynamic_loss_scale/{name}": scale for name, scale in dynamic_loss_scales.items()}, step=global_step)
+
                     if loss_balance_enabled and global_step < loss_balance_steps:
-                        current_loss_values = {
-                            name: float(term.detach().float().abs().item())
-                            for name, term in loss_terms.items()
-                        }
                         loss_balance_ema = update_ema_dict(loss_balance_ema, current_loss_values, loss_balance_ema_momentum)
                         ema_terms = {
                             name: torch.tensor(value, device=device, dtype=torch.float32)
@@ -1121,7 +1415,13 @@ def main(cfg: DictConfig):
                         cleanup_after_invalid_step(optimizer, clear_cache=nonfinite_clear_cache)
                         continue
 
-                    loss = weighted_loss_sum(loss_terms, loss_base_weights, loss_balance_scales)
+                    combined_loss_scales = {name: 1.0 for name in loss_terms}
+                    for name in combined_loss_scales:
+                        combined_loss_scales[name] *= float(loss_balance_scales.get(name, 1.0))
+                        if dynamic_loss_scales is not None:
+                            combined_loss_scales[name] *= float(dynamic_loss_scales.get(name, 1.0))
+
+                    loss = weighted_loss_sum(loss_terms, loss_base_weights, combined_loss_scales)
                     loss = loss + collapse_prevention_loss
 
                     if not torch.isfinite(loss):
@@ -1135,20 +1435,23 @@ def main(cfg: DictConfig):
                         prev_scale = scaler.get_scale()
                         scaler.scale(loss).backward()
                         scaler.unscale_(optimizer)
-                        grad_problems = find_non_finite_gradients(model, max_entries=6)
-                        if grad_problems:
-                            epoch_nonfinite_batches += 1
-                            total_nonfinite_batches += 1
-                            print(
-                                f"[train/nonfinite] epoch={ep + 1}/{config.epochs} "
-                                f"batch={batch_idx + 1}/{len(train_loader)} invalid gradients: "
-                                f"{summarize_non_finite_problems(grad_problems)}"
-                            )
-                            if not nonfinite_skip_batches:
-                                raise RuntimeError("Encountered non-finite gradients during training.")
-                            cleanup_after_invalid_step(optimizer, clear_cache=nonfinite_clear_cache)
-                            scaler.update()
-                            continue
+                        if should_run_periodic_check(batch_idx, train_grad_check_interval):
+                            grad_problems = find_non_finite_gradients(model, max_entries=6)
+                            if grad_problems:
+                                epoch_nonfinite_batches += 1
+                                total_nonfinite_batches += 1
+                                print(
+                                    f"[train/nonfinite] epoch={ep + 1}/{config.epochs} "
+                                    f"batch={batch_idx + 1}/{len(train_loader)} invalid gradients: "
+                                    f"{summarize_non_finite_problems(grad_problems)}"
+                                )
+                                if not nonfinite_skip_batches:
+                                    raise RuntimeError("Encountered non-finite gradients during training.")
+                                cleanup_after_invalid_step(optimizer, clear_cache=nonfinite_clear_cache)
+                                scaler.update()
+                                continue
+                        if backbone_trainable and backbone_grad_scale < 1.0:
+                            scale_backbone_gradients(model, backbone_grad_scale)
                         if gradient_norm is not None:
                             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
                         scaler.step(optimizer)
@@ -1157,19 +1460,22 @@ def main(cfg: DictConfig):
                             scheduler.step()
                     else:
                         loss.backward()
-                        grad_problems = find_non_finite_gradients(model, max_entries=6)
-                        if grad_problems:
-                            epoch_nonfinite_batches += 1
-                            total_nonfinite_batches += 1
-                            print(
-                                f"[train/nonfinite] epoch={ep + 1}/{config.epochs} "
-                                f"batch={batch_idx + 1}/{len(train_loader)} invalid gradients: "
-                                f"{summarize_non_finite_problems(grad_problems)}"
-                            )
-                            if not nonfinite_skip_batches:
-                                raise RuntimeError("Encountered non-finite gradients during training.")
-                            cleanup_after_invalid_step(optimizer, clear_cache=nonfinite_clear_cache)
-                            continue
+                        if should_run_periodic_check(batch_idx, train_grad_check_interval):
+                            grad_problems = find_non_finite_gradients(model, max_entries=6)
+                            if grad_problems:
+                                epoch_nonfinite_batches += 1
+                                total_nonfinite_batches += 1
+                                print(
+                                    f"[train/nonfinite] epoch={ep + 1}/{config.epochs} "
+                                    f"batch={batch_idx + 1}/{len(train_loader)} invalid gradients: "
+                                    f"{summarize_non_finite_problems(grad_problems)}"
+                                )
+                                if not nonfinite_skip_batches:
+                                    raise RuntimeError("Encountered non-finite gradients during training.")
+                                cleanup_after_invalid_step(optimizer, clear_cache=nonfinite_clear_cache)
+                                continue
+                        if backbone_trainable and backbone_grad_scale < 1.0:
+                            scale_backbone_gradients(model, backbone_grad_scale)
                         if gradient_norm is not None:
                             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
                         optimizer.step()
@@ -1192,21 +1498,21 @@ def main(cfg: DictConfig):
                     train_losses["loss_stability_volume"] += stability_volume.detach().float() * batch_size_float
                     train_losses["loss_ghost_surface"] += ghost_surface.detach().float() * batch_size_float
                     train_losses["loss_ghost_volume"] += ghost_volume.detach().float() * batch_size_float
-                    mean_support_mass = aux_query_mean(aux_pair, "surface_support_mass", "volume_support_mass").detach().float()
-                    mean_support_mass_orig = aux_query_mean(aux_orig, "surface_support_mass", "volume_support_mass").detach().float()
-                    mean_support_mass_edit = aux_query_mean(aux_edit, "surface_support_mass", "volume_support_mass").detach().float()
-                    mean_route_confidence = aux_query_mean(aux_pair, "surface_route_confidence", "volume_route_confidence").detach().float()
-                    mean_route_confidence_orig = aux_query_mean(aux_orig, "surface_route_confidence", "volume_route_confidence").detach().float()
-                    mean_route_confidence_edit = aux_query_mean(aux_edit, "surface_route_confidence", "volume_route_confidence").detach().float()
-                    mean_route_entropy = aux_query_mean(aux_pair, "surface_route_entropy", "volume_route_entropy").detach().float()
-                    mean_route_entropy_orig = aux_query_mean(aux_orig, "surface_route_entropy", "volume_route_entropy").detach().float()
-                    mean_route_entropy_edit = aux_query_mean(aux_edit, "surface_route_entropy", "volume_route_entropy").detach().float()
-                    mean_evidence_gate = aux_query_mean(aux_pair, "surface_evidence_mass", "volume_evidence_mass").detach().float()
-                    mean_evidence_gate_orig = aux_query_mean(aux_orig, "surface_evidence_mass", "volume_evidence_mass").detach().float()
-                    mean_evidence_gate_edit = aux_query_mean(aux_edit, "surface_evidence_mass", "volume_evidence_mass").detach().float()
-                    mean_raw_evidence_gate = aux_query_mean(aux_pair, "surface_raw_evidence_gate", "volume_raw_evidence_gate").detach().float()
-                    mean_raw_evidence_gate_orig = aux_query_mean(aux_orig, "surface_raw_evidence_gate", "volume_raw_evidence_gate").detach().float()
-                    mean_raw_evidence_gate_edit = aux_query_mean(aux_edit, "surface_raw_evidence_gate", "volume_raw_evidence_gate").detach().float()
+                    mean_support_mass_orig = aux_scalar_mean(aux_orig, "mean_support_mass").detach()
+                    mean_support_mass_edit = aux_scalar_mean(aux_edit, "mean_support_mass").detach()
+                    mean_support_mass = 0.5 * (mean_support_mass_orig + mean_support_mass_edit)
+                    mean_route_confidence_orig = aux_scalar_mean(aux_orig, "mean_route_confidence").detach()
+                    mean_route_confidence_edit = aux_scalar_mean(aux_edit, "mean_route_confidence").detach()
+                    mean_route_confidence = 0.5 * (mean_route_confidence_orig + mean_route_confidence_edit)
+                    mean_route_entropy_orig = aux_scalar_mean(aux_orig, "mean_route_entropy").detach()
+                    mean_route_entropy_edit = aux_scalar_mean(aux_edit, "mean_route_entropy").detach()
+                    mean_route_entropy = 0.5 * (mean_route_entropy_orig + mean_route_entropy_edit)
+                    mean_evidence_gate_orig = aux_scalar_mean(aux_orig, "mean_evidence_gate").detach()
+                    mean_evidence_gate_edit = aux_scalar_mean(aux_edit, "mean_evidence_gate").detach()
+                    mean_evidence_gate = 0.5 * (mean_evidence_gate_orig + mean_evidence_gate_edit)
+                    mean_raw_evidence_gate_orig = aux_scalar_mean(aux_orig, "mean_raw_evidence_gate").detach()
+                    mean_raw_evidence_gate_edit = aux_scalar_mean(aux_edit, "mean_raw_evidence_gate").detach()
+                    mean_raw_evidence_gate = 0.5 * (mean_raw_evidence_gate_orig + mean_raw_evidence_gate_edit)
                     train_losses["mean_support_mass_orig"] += mean_support_mass_orig * batch_size_float
                     train_losses["mean_support_mass_edit"] += mean_support_mass_edit * batch_size_float
                     train_losses["mean_support_mass"] += mean_support_mass * batch_size_float
@@ -1354,9 +1660,12 @@ def main(cfg: DictConfig):
                     if oom_clear_cache:
                         cleanup_after_oom(optimizer)
                     free_gib = torch.cuda.mem_get_info(device=device)[0] / (1024 ** 3) if torch.cuda.is_available() else float("nan")
+                    current_forward_batch_size = (
+                        local_edit_forward_batch_size if local_edit_enabled else base_forward_batch_size
+                    )
                     print(
                         f"[OOM] epoch={ep + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)} "
-                        f"effective_forward_batch_size={effective_forward_batch_size} "
+                        f"effective_forward_batch_size={current_forward_batch_size} "
                         f"free_cuda_gib={free_gib:.2f} "
                         f"message={exc}"
                     )
@@ -1370,6 +1679,32 @@ def main(cfg: DictConfig):
 
             denom = max(int(train_sample_count), 1)
             train_losses_log = {key: float((value / float(denom)).detach().cpu().item()) for key, value in train_losses.items()}
+
+            if dynamic_loss_reweight_enabled and epoch_loss_term_count > 0 and (ep + 1) in dynamic_loss_reweight_epochs:
+                epoch_loss_averages = {
+                    name: value / float(epoch_loss_term_count)
+                    for name, value in epoch_loss_term_sums.items()
+                }
+                reweight_base_weights = OrderedDict(
+                    [
+                        ("supervised", supervised_weight),
+                        ("stability", stability_weight),
+                        ("ghost", ghost_weight),
+                        ("high_sparsity", high_sparsity_weight),
+                    ]
+                )
+                dynamic_loss_scales = calibrate_normalized_loss_scales(
+                    epoch_loss_averages,
+                    reweight_base_weights,
+                    min_scale=dynamic_loss_reweight_min_scale,
+                    max_scale=dynamic_loss_reweight_max_scale,
+                )
+                print(f"[DARM] dynamic loss scales after epoch {ep + 1}: {dynamic_loss_scales}")
+                if run is not None:
+                    wandb.log(
+                        {f"dynamic_loss_scale/{name}": scale for name, scale in dynamic_loss_scales.items()},
+                        step=global_step,
+                    )
 
             test_losses = evaluate_loader(
                 train_model,
@@ -1388,6 +1723,8 @@ def main(cfg: DictConfig):
                 combined_loss_fn,
                 loss_fn,
                 use_surface_supervision,
+                cuda_batch_prefetch,
+                eval_nonfinite_check_interval,
             )
 
             if test_losses["rel_l2"] < best_rel_l2:

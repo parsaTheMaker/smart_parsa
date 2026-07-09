@@ -9,8 +9,9 @@ hydra:
     dir: .
 
 wandb:
-  project: "smart"
+  project: "smart_drivaerml"
   entity: "parsa-vatani99-technical-university-of-munich"
+  mode: "online"
 
 experiment:
   name: "DrivAerML_DARM"
@@ -21,8 +22,8 @@ experiment:
 
   architecture:
     latent_dim: 256
-    latent_geometry_points: 2048
-    subsampled_geometry_points: 8192
+    latent_geometry_points: 4096
+    subsampled_geometry_points: 16384
     subsampled_geometry_with_replacement: True
     num_encoder_decoder_blocks: 6
     pos_scale_factor: 100
@@ -30,7 +31,7 @@ experiment:
     route_dim: 64
     route_temperature: 1.0
     route_chunk_size: 4096
-    route_anchor_chunk_size: 2048
+    route_anchor_chunk_size: 1024
     high_compute_chunk_size: 2048
     anchor_shift_scale: 0.5
     anchor_metric_eps: 1.e-4
@@ -42,14 +43,18 @@ experiment:
     low_hidden_dim: 64
     low_pos_scale_factor: 25.0
     low_branch_num_coarse_layers: 1
-    high_hidden_dim: 64
+    high_hidden_dim: 96
     prediction_query_chunk_size: 32768
     decoder_checkpointing: True
-    use_high_value_block: False
-    route_confidence_floor: 0.15
-    route_entropy_mix: 0.75
+    use_high_value_block: True
     route_margin_norm_eps: 1.e-4
-    evidence_gate_floor: 0.02
+    use_low_residual_branch: False
+    low_residual_init_gain: 0.05
+    high_residual_init_gain: 0.005
+    lora_rank: 16
+    lora_alpha: 16.0
+    lora_dropout: 0.0
+    lora_last_n_blocks: 2
 
   optimizer: "adamw"
   loss_fn: "rel_l2"
@@ -57,63 +62,43 @@ experiment:
   scheduler_warmup_fraction: 0.0
   batch_size: 2
   epochs: 300
-  learning_rate: 2.e-5
+  learning_rate: 1.e-4
   gradient_norm: 1.0
   amp: True
   precision: "bfloat16"
   multi_gpu_strategy: "data_parallel"
-  log_every_n_steps: 50
+  log_every_n_steps: 10
   console_log_every_n_steps: 0
   show_first_batch_timing: False
   inspect_first_sample: False
   init_ckpt: "/home/parsa/smart_parsa/checkpoints/smart-smart-drivaerml-131k16kwr-drivaerml-s42_best.pt"
   resume_ckpt: ""
   resume_full_state: False
+  freeze_loaded_pretrained_params: True
   wandb_watch_model: False
-  supervised_only_warmup_epochs: 0
-  freeze_backbone_epochs: 0
-  backbone_grad_scale: 0.05
 
   supervised_weight: 1.0
-  stability_weight: 0.04
-  ghost_suppression_weight: 0.015
-  ghost_target_ratio: 0.35
-  ghost_absolute_weight: 0.05
-  high_sparsity_weight: 0.0
-  collapse_support_weight: 0.03
-  collapse_support_target: 0.1
-  collapse_evidence_weight: 0.03
-  collapse_evidence_target: 0.05
-  collapse_entropy_weight: 0.008
-  collapse_entropy_target: 0.998
-  stability_smooth_l1_beta: 0.05
-  edit_warmup_epochs: 0
-  loss_balance_enabled: False
-  loss_balance_reference: "supervised"
-  loss_balance_min_scale: 0.1
-  loss_balance_max_scale: 10.0
-  loss_balance_steps: 16
-  loss_balance_ema_momentum: 0.8
-  dynamic_loss_reweight_enabled: True
-  dynamic_loss_reweight_start_steps: 64
-  dynamic_loss_reweight_epochs: [3]
-  dynamic_loss_reweight_min_scale: 0.25
-  dynamic_loss_reweight_max_scale: 4.0
-  dynamic_loss_reweight_momentum: 0.9
+  ghost_suppression_weight: 0.10
+  reliability_weight: 0.10
+  loss_reweight_epochs: [3]
+  loss_reweight_interval_epochs: 10
+  loss_reweight_batches: 8
+  loss_reweight_reference: "loss_supervised"
+  loss_reweight_supervised_ratio: 4.0
+  loss_reweight_min_scale: 0.05
+  loss_reweight_max_scale: 25.0
 
   edit_patch_min_points: 256
   edit_patch_max_points: 1024
   edit_candidate_points: 2048
-  edit_strength: 0.2
+  edit_strength: 0.50
   edit_ramp_power: 1.5
-  edit_changed_radius_scale: 1.2
-  edit_unchanged_radius_scale: 2.5
   track_train_channel_metrics: False
 
   dataset: "DrivAerML"
   data_path: "/mnt/ssdraid/parsa/drivaerml_preprocessed"
-  num_workers: 20
-  prefetch_factor: 8
+  num_workers: 16
+  prefetch_factor: 6
   pin_memory: True
   cuda_batch_prefetch: True
   train_input_check_interval: 16

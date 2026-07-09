@@ -219,6 +219,7 @@ def initialize_wandb(config, wandb_config, model_files=[]):
         name=run_name,
         project=wandb_config.project,
         entity=wandb_config.entity,
+        mode=getattr(wandb_config, "mode", "online"),
         tags=tags,
     )
     
@@ -282,6 +283,8 @@ def exclude_params_from_weight_decay(model,
     no_decay_parameters_names = []
 
     for name, param in named_parameters:
+        if not param.requires_grad:
+            continue
         if not any(ex in name for ex in exclude):
             decay_parameters_names.append(name)
             decay_parameters.append(param)

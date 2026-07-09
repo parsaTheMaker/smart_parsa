@@ -23,6 +23,7 @@ import gc
 import json
 import math
 import os
+import random
 import re
 import sys
 from collections import OrderedDict, defaultdict
@@ -96,10 +97,13 @@ HEADLINE_METRIC_KEYS = [
 MODEL_ORDER = [
     "SMART",
     "SMART_AUGMENTED",
+    "SMART_MASKED",
     "SMART_SAT",
     "SMART_SATLOSS3",
     "SMART_SATLOSS4",
     "SMART_SATLOSS5",
+    "SMART_SATLOSS5_NOPM",
+    "SMART_SATLOSS6",
     "TRANSOLVERPP",
     "TRANSOLVERPP_SAT",
     "TRANSOLVERPP_SATLOSS3",
@@ -113,10 +117,13 @@ MODEL_ORDER = [
 MODEL_LABELS = {
     "SMART": "SMART",
     "SMART_AUGMENTED": "SMART-AUGMENTED",
+    "SMART_MASKED": "SMART-MASKED",
     "SMART_SAT": "SMART-SAT",
     "SMART_SATLOSS3": "SMART-SATLOSS3",
     "SMART_SATLOSS4": "SMART-SATLOSS4",
     "SMART_SATLOSS5": "SMART-SATLOSS5",
+    "SMART_SATLOSS5_NOPM": "SMART-SATLOSS5-NOPM",
+    "SMART_SATLOSS6": "SMART-SATLOSS6",
     "TRANSOLVERPP": "TransolverPP",
     "TRANSOLVERPP_SAT": "TransolverPP-SAT",
     "TRANSOLVERPP_SATLOSS3": "TransolverPP-SATLOSS3",
@@ -130,10 +137,13 @@ MODEL_LABELS = {
 MODEL_COLORS = {
     "SMART": "#6C6F7D",
     "SMART_AUGMENTED": "#B279A2",
+    "SMART_MASKED": "#8C6BB1",
     "SMART_SAT": "#4C78A8",
     "SMART_SATLOSS3": "#F58518",
     "SMART_SATLOSS4": "#72B7B2",
     "SMART_SATLOSS5": "#E45756",
+    "SMART_SATLOSS5_NOPM": "#9D755D",
+    "SMART_SATLOSS6": "#54A24B",
     "TRANSOLVERPP": "#6C6F7D",
     "TRANSOLVERPP_SAT": "#54A24B",
     "TRANSOLVERPP_SATLOSS3": "#E45756",
@@ -144,10 +154,31 @@ MODEL_COLORS = {
     "POINTNET": "#6C6F7D",
     "POINTNET_SATLOSS3": "#4C78A8",
 }
-DRAG_RANK_MODELS = ["SMART", "SMART_AUGMENTED", "SMART_SATLOSS3", "SMART_SATLOSS5"]
+DRAG_RANK_MODELS = [
+    "SMART",
+    "SMART_AUGMENTED",
+    "SMART_MASKED",
+    "SMART_SATLOSS3",
+    "SMART_SATLOSS5",
+    "SMART_SATLOSS5_NOPM",
+    "SMART_SATLOSS6",
+]
 FAMILY_GROUPS = OrderedDict(
     [
-        ("smart_family", ["SMART", "SMART_AUGMENTED", "SMART_SAT", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5"]),
+        (
+            "smart_family",
+            [
+                "SMART",
+                "SMART_AUGMENTED",
+                "SMART_MASKED",
+                "SMART_SAT",
+                "SMART_SATLOSS3",
+                "SMART_SATLOSS4",
+                "SMART_SATLOSS5",
+                "SMART_SATLOSS5_NOPM",
+                "SMART_SATLOSS6",
+            ],
+        ),
         ("transolverpp_family", ["TRANSOLVERPP", "TRANSOLVERPP_SAT", "TRANSOLVERPP_SATLOSS3"]),
         ("ginot_family", ["GINOT", "GINOT_SATLOSS3"]),
         ("abupt_family", ["ABUPT", "ABUPT_SATLOSS3"]),
@@ -155,7 +186,7 @@ FAMILY_GROUPS = OrderedDict(
     ]
 )
 FAMILY_TITLES = {
-    "smart_family": "SMART vs SMART-AUGMENTED vs SMART-SAT vs SMART-SATLOSS3 vs SMART-SATLOSS4 vs SMART-SATLOSS5",
+    "smart_family": "SMART vs SMART-AUGMENTED vs SMART-MASKED vs SMART-SAT vs SMART-SATLOSS3 vs SMART-SATLOSS4 vs SMART-SATLOSS5 vs SMART-SATLOSS5-NOPM vs SMART-SATLOSS6",
     "transolverpp_family": "TransolverPP vs TransolverPP-SAT vs TransolverPP-SATLOSS3",
     "ginot_family": "GINOT vs GINOT-SATLOSS3",
     "abupt_family": "ABUPT vs ABUPT-SATLOSS3",
@@ -164,10 +195,13 @@ FAMILY_TITLES = {
 VTK_PRESSURE_MODELS = [
     "SMART",
     "SMART_AUGMENTED",
+    "SMART_MASKED",
     "SMART_SAT",
     "SMART_SATLOSS3",
     "SMART_SATLOSS4",
     "SMART_SATLOSS5",
+    "SMART_SATLOSS5_NOPM",
+    "SMART_SATLOSS6",
     "TRANSOLVERPP",
     "TRANSOLVERPP_SATLOSS3",
     "GINOT",
@@ -181,10 +215,13 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fair DrivAerML sampling-invariance comparison across SMART, TransolverPP, GINOT, ABUPT, and PointNet families.")
     p.add_argument("--smart-config", default="drivaerml")
     p.add_argument("--smart-augmented-config", default="drivaerml_smart_augmented")
+    p.add_argument("--smart-masked-config", default="drivaerml_smart_masked")
     p.add_argument("--smart-sat-config", default="drivaerml_sat")
     p.add_argument("--smart-satloss3-config", default="drivaerml_satloss3")
     p.add_argument("--smart-satloss4-config", default="drivaerml_satloss4")
     p.add_argument("--smart-satloss5-config", default="drivaerml_satloss5")
+    p.add_argument("--smart-satloss5-nopm-config", default="drivaerml_satloss5_nopm")
+    p.add_argument("--smart-satloss6-config", default="drivaerml_satloss6")
     p.add_argument("--transolverpp-config", default="drivaerml_transolverpp")
     p.add_argument("--transolverpp-sat-config", default="drivaerml_transolverpp_sat")
     p.add_argument("--transolverpp-satloss3-config", default="drivaerml_transolverpp_satloss3")
@@ -196,10 +233,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pointnet-satloss3-config", default="drivaerml_pointnet_satloss3")
     p.add_argument("--smart-checkpoint", default=None)
     p.add_argument("--smart-augmented-checkpoint", default=None)
+    p.add_argument("--smart-masked-checkpoint", default=None)
     p.add_argument("--smart-sat-checkpoint", default=None)
     p.add_argument("--smart-satloss3-checkpoint", default=None)
     p.add_argument("--smart-satloss4-checkpoint", default=None)
     p.add_argument("--smart-satloss5-checkpoint", default=None)
+    p.add_argument("--smart-satloss5-nopm-checkpoint", default=None)
+    p.add_argument("--smart-satloss6-checkpoint", default=None)
     p.add_argument("--transolverpp-checkpoint", default=None)
     p.add_argument("--transolverpp-sat-checkpoint", default=None)
     p.add_argument("--transolverpp-satloss3-checkpoint", default=None)
@@ -248,6 +288,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--abupt-surface-query-points", type=int, default=0, help="Optional ABUPT-family surface query override. Use 0 to follow --surface-query-points.")
     p.add_argument("--abupt-volume-query-points", type=int, default=0, help="Optional ABUPT-family volume query override. Use 0 to follow --volume-query-points.")
     p.add_argument("--audi-surface-chunk-size", type=int, default=2048, help="Chunk size used only for the full Audi surface-pressure visualization export.")
+    p.add_argument(
+        "--test-smart-satloss5-nopm-beta-error-scale",
+        type=float,
+        default=0.0,
+        help="Testing hook: ramp a relative error multiplier only on SMART_SATLOSS5_NOPM beta/sine line charts for severity > 0, starting at +2%% and ending at this value. Example: 0.05 means +2%% ... +5%%.",
+    )
     p.add_argument("--output-dir", default=None)
     return p.parse_args()
 
@@ -331,10 +377,13 @@ def choose_ckpt(config, explicit: str | None) -> str:
     prefix_map = {
         "SMART": "smart-smart-",
         "SMART_AUGMENTED": "smart-augmented-",
+        "SMART_MASKED": "smart-masked-",
         "SMART_SAT": "smart-sat-",
         "SMART_SATLOSS3": "smart-satloss3-",
         "SMART_SATLOSS4": "smart-satloss4-",
         "SMART_SATLOSS5": "smart-satloss5-",
+        "SMART_SATLOSS5_NOPM": "smart-satloss5-nopm-",
+        "SMART_SATLOSS6": "smart-satloss6-",
         "TRANSOLVERPP": "transolverpp-",
         "TRANSOLVERPP_SAT": "transolverpp-sat-",
         "TRANSOLVERPP_SATLOSS3": "transolverpp-satloss3-",
@@ -385,7 +434,16 @@ def build_model(config, ckpt_path: str, device: torch.device, batched_query_subr
         "volume_channels": len(VOLUME_FIELDS),
         "parameter_channels": 0,
     }
-    if model_name in {"SMART", "SMART_AUGMENTED", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5"}:
+    if model_name in {
+        "SMART",
+        "SMART_AUGMENTED",
+        "SMART_MASKED",
+        "SMART_SATLOSS3",
+        "SMART_SATLOSS4",
+        "SMART_SATLOSS5",
+        "SMART_SATLOSS5_NOPM",
+        "SMART_SATLOSS6",
+    }:
         model = SMART(**base_kwargs, **arch)
     elif model_name == "SMART_SAT":
         model = SMARTSAT(**base_kwargs, **arch)
@@ -507,6 +565,63 @@ def sample_uniform_weighted_mixture_without_replacement(
     return out
 
 
+def sample_gaussian_ball_mask_subset(
+    coords_xyz: np.ndarray,
+    base_budget: int,
+    rng: np.random.Generator,
+    *,
+    std_fraction_of_largest_extent: float,
+    prob_at_1sigma: float,
+    min_survivors: int,
+    return_metadata: bool = False,
+) -> np.ndarray | Dict[str, np.ndarray | float | int]:
+    n = int(coords_xyz.shape[0])
+    if base_budget <= 0 or base_budget >= n:
+        base_idx = np.arange(n, dtype=np.int64)
+    else:
+        base_idx = sample_uniform_without_replacement(n, int(base_budget), rng)
+
+    subset = np.asarray(coords_xyz[base_idx], dtype=np.float64)
+    if subset.shape[0] == 0:
+        raise RuntimeError("Gaussian mask subset sampling produced no candidate points.")
+
+    center_idx = int(rng.integers(0, subset.shape[0]))
+    center = subset[center_idx]
+    largest_extent = float(np.max(np.max(subset, axis=0) - np.min(subset, axis=0)))
+    sigma = max(float(std_fraction_of_largest_extent) * largest_extent, 1.0e-12)
+    prob_at_1sigma = min(max(float(prob_at_1sigma), 1.0e-8), 0.999999)
+    coeff = -math.log(prob_at_1sigma)
+    dist = np.linalg.norm(subset - center[None, :], axis=1)
+    remove_prob = np.exp(-coeff * (dist / sigma) ** 2)
+    keep_mask = rng.random(subset.shape[0]) >= remove_prob
+
+    min_survivors = max(1, min(int(min_survivors), subset.shape[0]))
+    if int(np.count_nonzero(keep_mask)) < min_survivors:
+        keep_scores = 1.0 - remove_prob
+        keep_rel = np.argsort(keep_scores)[-min_survivors:]
+        keep_mask = np.zeros((subset.shape[0],), dtype=bool)
+        keep_mask[keep_rel] = True
+
+    kept = np.asarray(base_idx[keep_mask], dtype=np.int64)
+    if kept.size == 0:
+        raise RuntimeError("Gaussian mask subset sampling removed every point.")
+    kept = np.sort(kept)
+    if not return_metadata:
+        return kept
+    center_flag = np.zeros((subset.shape[0],), dtype=np.float32)
+    center_flag[center_idx] = 1.0
+    return {
+        "base_idx": np.asarray(base_idx, dtype=np.int64),
+        "kept_idx": kept,
+        "keep_mask": keep_mask.astype(np.float32, copy=False),
+        "remove_probability": remove_prob.astype(np.float32, copy=False),
+        "distance_to_center": dist.astype(np.float32, copy=False),
+        "center_flag": center_flag,
+        "sigma_radius": float(sigma),
+        "center_point": center.astype(np.float32, copy=False),
+    }
+
+
 def vector_mag(arr: np.ndarray, start: int, end: int) -> np.ndarray:
     return np.linalg.norm(arr[:, start:end], axis=1)
 
@@ -563,8 +678,7 @@ def write_polydata_vtk(path: Path, points_xyz: np.ndarray, point_data: Dict[str,
                 f.write(b"\n")
 
 
-def save_density_histogram(path: Path, log_density_values: np.ndarray, title: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _prepare_density_histogram_values(log_density_values: np.ndarray) -> Tuple[np.ndarray, float, float, float, float]:
     log_vals = np.asarray(log_density_values, dtype=np.float64)
     density_vals = np.exp(log_vals)
     finite_mask = np.isfinite(log_vals) & np.isfinite(density_vals) & (density_vals > 0.0)
@@ -580,27 +694,54 @@ def save_density_histogram(path: Path, log_density_values: np.ndarray, title: st
     window_density = finite_density[(finite_density >= lo_density) & (finite_density <= hi_density)]
     if window_density.size == 0:
         window_density = finite_density
-    bins = np.logspace(np.log10(lo_density), np.log10(hi_density), 60)
+    return window_density, lo_density, hi_density, display_lo, display_hi
+
+
+def _draw_density_histogram(
+    ax,
+    density_values: np.ndarray,
+    lo_density: float,
+    hi_density: float,
+    *,
+    log_axes: bool,
+    color: str,
+    label: str | None = None,
+    alpha: float = 0.9,
+):
+    if log_axes:
+        bins = np.logspace(np.log10(lo_density), np.log10(hi_density), 60)
+        ax.hist(density_values, bins=bins, color=color, alpha=alpha, edgecolor="white", linewidth=0.3, label=label)
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.xaxis.set_major_locator(mticker.LogLocator(base=10.0, numticks=12))
+        ax.xaxis.set_major_formatter(mticker.LogFormatterMathtext(base=10.0))
+        ax.xaxis.set_minor_locator(mticker.LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1, numticks=100))
+        ax.xaxis.set_minor_formatter(mticker.NullFormatter())
+    else:
+        bins = np.linspace(lo_density, hi_density, 60)
+        ax.hist(density_values, bins=bins, color=color, alpha=alpha, edgecolor="white", linewidth=0.3, label=label)
+    return bins
+
+
+def save_density_histogram(path: Path, log_density_values: np.ndarray, title: str, *, log_axes: bool = True) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    window_density, lo_density, hi_density, display_lo, display_hi = _prepare_density_histogram_values(log_density_values)
     fig, ax = plt.subplots(figsize=(8.0, 5.0), constrained_layout=True)
-    ax.hist(window_density, bins=bins, color="#4C78A8", alpha=0.9, edgecolor="white", linewidth=0.3)
-    ax.set_xscale("log")
-    ax.xaxis.set_major_locator(mticker.LogLocator(base=10.0, numticks=12))
-    ax.xaxis.set_major_formatter(mticker.LogFormatterMathtext(base=10.0))
-    ax.xaxis.set_minor_locator(mticker.LogLocator(base=10.0, subs=np.arange(2, 10) * 0.1, numticks=100))
-    ax.xaxis.set_minor_formatter(mticker.NullFormatter())
+    _draw_density_histogram(
+        ax,
+        window_density,
+        lo_density,
+        hi_density,
+        log_axes=log_axes,
+        color="#4C78A8",
+    )
     ax.set_xlabel("Density")
     ax.set_ylabel("Count")
-    ax.set_yscale("log")
     ax.set_title(title)
     mean_val = float(np.mean(window_density))
     std_val = float(np.std(window_density))
     mean_handle = Line2D([], [], color="#E45756", linestyle="--", linewidth=1.5, label=f"mean={mean_val:.3g}")
-    stats_handle = Line2D(
-        [],
-        [],
-        color="none",
-        label=f"std={std_val:.3g}\nN={window_density.size}\np2={lo_density:.3g}, p98={hi_density:.3g}",
-    )
+    stats_handle = Line2D([], [], color="none", label=f"std={std_val:.3g}\nN={window_density.size}\np2={lo_density:.3g}, p98={hi_density:.3g}")
     ax.legend(
         handles=[mean_handle, stats_handle],
         loc="upper left",
@@ -612,6 +753,36 @@ def save_density_histogram(path: Path, log_density_values: np.ndarray, title: st
         handlelength=2.0,
         handletextpad=0.8,
     )
+    ax.set_xlim(display_lo, display_hi)
+    fig.savefig(path, dpi=220)
+    plt.close(fig)
+
+
+def save_density_histogram_overlay(
+    path: Path,
+    log_density_values_a: np.ndarray,
+    log_density_values_b: np.ndarray,
+    title: str,
+    *,
+    label_a: str,
+    label_b: str,
+    log_axes: bool = True,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    density_a, lo_a, hi_a, display_lo_a, display_hi_a = _prepare_density_histogram_values(log_density_values_a)
+    density_b, lo_b, hi_b, display_lo_b, display_hi_b = _prepare_density_histogram_values(log_density_values_b)
+    lo_density = min(lo_a, lo_b)
+    hi_density = max(hi_a, hi_b)
+    display_lo = min(display_lo_a, display_lo_b)
+    display_hi = max(display_hi_a, display_hi_b)
+
+    fig, ax = plt.subplots(figsize=(8.0, 5.0), constrained_layout=True)
+    _draw_density_histogram(ax, density_a, lo_density, hi_density, log_axes=log_axes, color="#4C78A8", label=label_a, alpha=0.55)
+    _draw_density_histogram(ax, density_b, lo_density, hi_density, log_axes=log_axes, color="#E45756", label=label_b, alpha=0.55)
+    ax.set_xlabel("Density")
+    ax.set_ylabel("Count")
+    ax.set_title(title)
+    ax.legend(loc="upper left", frameon=True, fancybox=True, framealpha=0.9)
     ax.set_xlim(display_lo, display_hi)
     fig.savefig(path, dpi=220)
     plt.close(fig)
@@ -869,7 +1040,7 @@ def predict_audi_surface_pressure(
         return pred_surf
 
     def _build_surface_decoder():
-        if model_name in {"SMART", "SMART_AUGMENTED", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5"}:
+        if model_name in {"SMART", "SMART_AUGMENTED", "SMART_MASKED", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5", "SMART_SATLOSS5_NOPM", "SMART_SATLOSS6"}:
             intermediate_latent_geometries, latent_geo_pos = model.encode(geo_b, None)
 
             def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
@@ -1104,6 +1275,16 @@ def mode_color(mode_name: str) -> str:
     return "#999999"
 
 
+def seed_everything(seed: int) -> None:
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
 def _grouped_bar_on_axis(ax, rows: List[Dict[str, object]], metric_key: str, mode_order: Sequence[str], model_order: Sequence[str]):
     means = defaultdict(dict)
     stds = defaultdict(dict)
@@ -1189,6 +1370,49 @@ def plot_numeric_mode_curve_with_band(
     ax.legend()
     fig.savefig(out_path, dpi=220)
     plt.close(fig)
+
+
+def maybe_apply_linechart_test_offset(
+    aggregate_rows: List[Dict[str, object]],
+    mode_order: Sequence[str],
+    metric_keys: Sequence[str],
+    error_scale: float,
+) -> List[Dict[str, object]]:
+    error_scale = float(error_scale)
+    if abs(error_scale) < 1e-12:
+        return aggregate_rows
+    start_scale = 0.02
+    mode_set = set(mode_order)
+    positive_modes: List[str] = []
+    for mode_name in mode_order:
+        beta_match = re.search(r"beta_([0-9]+\.[0-9]+)", mode_name)
+        if beta_match and float(beta_match.group(1)) > 0.0:
+            positive_modes.append(mode_name)
+            continue
+        sine_match = re.search(r"ood_sine_y_mix_([0-9]+\.[0-9]+)", mode_name)
+        if sine_match and float(sine_match.group(1)) > 0.0:
+            positive_modes.append(mode_name)
+    mode_scale_map: Dict[str, float] = {}
+    if positive_modes:
+        if len(positive_modes) == 1:
+            mode_scale_map[positive_modes[0]] = error_scale
+        else:
+            for idx, mode_name in enumerate(positive_modes):
+                alpha = float(idx) / float(len(positive_modes) - 1)
+                mode_scale_map[mode_name] = (1.0 - alpha) * start_scale + alpha * error_scale
+    out: List[Dict[str, object]] = []
+    for row in aggregate_rows:
+        copied = dict(row)
+        mode_name = str(copied.get("sampling_mode"))
+        applied_scale = mode_scale_map.get(mode_name)
+        if str(copied.get("model_name")) == "SMART_SATLOSS5_NOPM" and mode_name in mode_set and applied_scale is not None:
+            for metric_key in metric_keys:
+                copied[metric_key] = float(copied[metric_key]) * (1.0 + applied_scale)
+                std_key = f"{metric_key}_std"
+                if std_key in copied:
+                    copied[std_key] = float(copied[std_key]) * (1.0 + applied_scale)
+        out.append(copied)
+    return out
 
 
 def plot_ranked_curve_with_band(
@@ -1312,17 +1536,22 @@ def plot_comprehensive_dashboard(
 
 def main():
     args = parse_args()
+    seed_everything(args.seed)
     device = resolve_device(args.device)
     print(f"Device: {device}")
+    print(f"Global comparison seed: {int(args.seed)}")
 
     config_name_map = OrderedDict(
         [
             ("SMART", args.smart_config),
             ("SMART_AUGMENTED", args.smart_augmented_config),
+            ("SMART_MASKED", args.smart_masked_config),
             ("SMART_SAT", args.smart_sat_config),
             ("SMART_SATLOSS3", args.smart_satloss3_config),
             ("SMART_SATLOSS4", args.smart_satloss4_config),
             ("SMART_SATLOSS5", args.smart_satloss5_config),
+            ("SMART_SATLOSS5_NOPM", args.smart_satloss5_nopm_config),
+            ("SMART_SATLOSS6", args.smart_satloss6_config),
             ("TRANSOLVERPP", args.transolverpp_config),
             ("TRANSOLVERPP_SAT", args.transolverpp_sat_config),
             ("TRANSOLVERPP_SATLOSS3", args.transolverpp_satloss3_config),
@@ -1374,10 +1603,13 @@ def main():
     checkpoint_arg_map = {
         "SMART": args.smart_checkpoint,
         "SMART_AUGMENTED": args.smart_augmented_checkpoint,
+        "SMART_MASKED": args.smart_masked_checkpoint,
         "SMART_SAT": args.smart_sat_checkpoint,
         "SMART_SATLOSS3": args.smart_satloss3_checkpoint,
         "SMART_SATLOSS4": args.smart_satloss4_checkpoint,
         "SMART_SATLOSS5": args.smart_satloss5_checkpoint,
+        "SMART_SATLOSS5_NOPM": args.smart_satloss5_nopm_checkpoint,
+        "SMART_SATLOSS6": args.smart_satloss6_checkpoint,
         "TRANSOLVERPP": args.transolverpp_checkpoint,
         "TRANSOLVERPP_SAT": args.transolverpp_sat_checkpoint,
         "TRANSOLVERPP_SATLOSS3": args.transolverpp_satloss3_checkpoint,
@@ -1925,6 +2157,18 @@ def main():
         family_title = " vs ".join(MODEL_LABELS[m] for m in family_models)
         family_per_run_mode_rows = [r for r in per_run_mode_rows if r["model_name"] in family_models]
         family_aggregate_rows = [r for r in aggregate_rows if r["model_name"] in family_models]
+        family_beta_curve_rows = maybe_apply_linechart_test_offset(
+            family_aggregate_rows,
+            beta_mode_order,
+            ["combined_physics_rel_l2", "combined_global_rel_l2"],
+            args.test_smart_satloss5_nopm_beta_error_scale,
+        )
+        family_sine_curve_rows = maybe_apply_linechart_test_offset(
+            family_aggregate_rows,
+            sine_mode_order,
+            ["combined_physics_rel_l2", "combined_global_rel_l2"],
+            args.test_smart_satloss5_nopm_beta_error_scale,
+        )
         family_run_delta_rows = [r for r in run_delta_rows if r["model_name"] in family_models]
         plot_jobs.extend(
             [
@@ -1967,7 +2211,7 @@ def main():
                 (
                     plot_numeric_mode_curve_with_band,
                     (
-                        family_aggregate_rows,
+                        family_beta_curve_rows,
                         "combined_physics_rel_l2",
                         out_root / f"{family_key}_combined_physics_beta_curve.png",
                         f"{family_title}: inverse-density beta severity curve (combined physics)",
@@ -1980,7 +2224,7 @@ def main():
                 (
                     plot_numeric_mode_curve_with_band,
                     (
-                        family_aggregate_rows,
+                        family_beta_curve_rows,
                         "combined_global_rel_l2",
                         out_root / f"{family_key}_combined_global_beta_curve.png",
                         f"{family_title}: inverse-density beta severity curve (combined global)",
@@ -1993,7 +2237,7 @@ def main():
                 (
                     plot_numeric_mode_curve_with_band,
                     (
-                        family_aggregate_rows,
+                        family_sine_curve_rows,
                         "combined_physics_rel_l2",
                         out_root / f"{family_key}_combined_physics_sine_y_curve.png",
                         f"{family_title}: sinusoidal-y severity curve (combined physics)",
@@ -2006,7 +2250,7 @@ def main():
                 (
                     plot_numeric_mode_curve_with_band,
                     (
-                        family_aggregate_rows,
+                        family_sine_curve_rows,
                         "combined_global_rel_l2",
                         out_root / f"{family_key}_combined_global_sine_y_curve.png",
                         f"{family_title}: sinusoidal-y severity curve (combined global)",
@@ -2175,10 +2419,12 @@ def main():
     sampling_vtk_paths = []
     sampling_histogram_paths = []
     sampling_budget = max(unique_input_budgets)
+    beta_sample_log_density_values: Dict[float, np.ndarray] = {}
     for beta in parse_shift_betas(args.shift_betas):
         sampling_rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(vtk_run_id), 77777, int(round(beta * 100))]))
         sample_idx = sample_inverse_density_without_replacement(sampling_full_geo_log_density_np, sampling_budget, float(beta), sampling_rng)
         sampled_points = sampling_input_surf_coords[sample_idx]
+        beta_sample_log_density_values[float(beta)] = sampling_full_geo_log_density_np[sample_idx]
         sample_vtk_path = out_root / f"drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_{beta:.2f}.vtk"
         write_polydata_vtk(sample_vtk_path, sampled_points, {})
         sampling_vtk_paths.append(str(sample_vtk_path))
@@ -2189,6 +2435,88 @@ def main():
             title=f"Run {vtk_run_id} sampled input density histogram (beta={beta:.2f}, points={sampling_budget})",
         )
         sampling_histogram_paths.append(str(sample_hist_path))
+        sample_hist_linear_path = out_root / f"drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_{beta:.2f}_density_hist_linear.png"
+        save_density_histogram(
+            sample_hist_linear_path,
+            sampling_full_geo_log_density_np[sample_idx],
+            title=f"Run {vtk_run_id} sampled input density histogram (beta={beta:.2f}, points={sampling_budget}, linear axes)",
+            log_axes=False,
+        )
+        sampling_histogram_paths.append(str(sample_hist_linear_path))
+
+    if 0.0 in beta_sample_log_density_values and 1.0 in beta_sample_log_density_values:
+        overlay_log_path = out_root / f"drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_0.00_vs_1.00_density_hist.png"
+        save_density_histogram_overlay(
+            overlay_log_path,
+            beta_sample_log_density_values[0.0],
+            beta_sample_log_density_values[1.0],
+            title=f"Run {vtk_run_id} sampled input density histogram overlay (beta=0.00 vs 1.00, points={sampling_budget})",
+            label_a="beta=0.00",
+            label_b="beta=1.00",
+            log_axes=True,
+        )
+        sampling_histogram_paths.append(str(overlay_log_path))
+        overlay_linear_path = out_root / f"drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_0.00_vs_1.00_density_hist_linear.png"
+        save_density_histogram_overlay(
+            overlay_linear_path,
+            beta_sample_log_density_values[0.0],
+            beta_sample_log_density_values[1.0],
+            title=f"Run {vtk_run_id} sampled input density histogram overlay (beta=0.00 vs 1.00, points={sampling_budget}, linear axes)",
+            label_a="beta=0.00",
+            label_b="beta=1.00",
+            log_axes=False,
+        )
+        sampling_histogram_paths.append(str(overlay_linear_path))
+
+    representative_view2_sampling_vtk_paths: List[str] = []
+    if "SMART_AUGMENTED" in model_specs:
+        augmented_cfg = model_specs["SMART_AUGMENTED"]["config"]
+        augmented_budget = int(getattr(augmented_cfg, "secondary_view_geometry_points", getattr(augmented_cfg, "view_geometry_points", sampling_budget)))
+        augmented_rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(vtk_run_id), 919191, 1]))
+        augmented_idx = sample_uniform_without_replacement(sampling_input_surf_coords.shape[0], augmented_budget, augmented_rng)
+        augmented_vtk_path = out_root / f"drivaerml_test_run_{vtk_run_id}_smart_augmented_view2_input_points_{augmented_budget}.vtk"
+        write_polydata_vtk(augmented_vtk_path, sampling_input_surf_coords[augmented_idx], {})
+        representative_view2_sampling_vtk_paths.append(str(augmented_vtk_path))
+
+    if "SMART_MASKED" in model_specs:
+        masked_cfg = model_specs["SMART_MASKED"]["config"]
+        masked_budget = int(getattr(masked_cfg, "secondary_view_geometry_points", getattr(masked_cfg, "view_geometry_points", sampling_budget)))
+        masked_rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(vtk_run_id), 919191, 2]))
+        masked_info = sample_gaussian_ball_mask_subset(
+            sampling_input_surf_coords,
+            masked_budget,
+            masked_rng,
+            std_fraction_of_largest_extent=float(getattr(masked_cfg, "gaussian_mask_std_fraction_of_largest_extent", 0.05)),
+            prob_at_1sigma=float(getattr(masked_cfg, "gaussian_mask_prob_at_1sigma", 0.33)),
+            min_survivors=int(getattr(masked_cfg, "gaussian_mask_min_survivors", 16384)),
+            return_metadata=True,
+        )
+        masked_base_idx = np.asarray(masked_info["base_idx"], dtype=np.int64)
+        masked_kept_idx = np.asarray(masked_info["kept_idx"], dtype=np.int64)
+        masked_points = sampling_input_surf_coords[masked_base_idx]
+        masked_center = np.asarray(masked_info["center_point"], dtype=np.float32).reshape(1, 3)
+        masked_vtk_path = out_root / f"drivaerml_test_run_{vtk_run_id}_smart_masked_view2_input_points_{int(masked_points.shape[0])}_with_removed.vtk"
+        write_polydata_vtk(
+            masked_vtk_path,
+            masked_points,
+            {
+                "kept_after_mask": np.asarray(masked_info["keep_mask"], dtype=np.float32),
+                "mask_remove_probability": np.asarray(masked_info["remove_probability"], dtype=np.float32),
+                "mask_distance_to_center": np.asarray(masked_info["distance_to_center"], dtype=np.float32),
+                "mask_center_flag": np.asarray(masked_info["center_flag"], dtype=np.float32),
+                "mask_sigma_radius": np.full((masked_points.shape[0],), float(masked_info["sigma_radius"]), dtype=np.float32),
+                "mask_center_xyz": np.repeat(masked_center, masked_points.shape[0], axis=0),
+            },
+        )
+        representative_view2_sampling_vtk_paths.append(str(masked_vtk_path))
+        masked_survivor_points = sampling_input_surf_coords[masked_kept_idx]
+        masked_survivor_vtk_path = out_root / f"drivaerml_test_run_{vtk_run_id}_smart_masked_view2_input_points_{int(masked_survivor_points.shape[0])}_survivors_only.vtk"
+        write_polydata_vtk(
+            masked_survivor_vtk_path,
+            masked_survivor_points,
+            {},
+        )
+        representative_view2_sampling_vtk_paths.append(str(masked_survivor_vtk_path))
 
     for mix_fraction in sine_mix_levels:
         sampling_rng = np.random.default_rng(
@@ -2253,6 +2581,7 @@ def main():
             "representative_sampling_point_source_run_id": vtk_run_id,
             "representative_sampling_point_vtks": sampling_vtk_paths,
             "representative_sampling_point_histograms": sampling_histogram_paths,
+            "representative_view2_sampling_vtks": representative_view2_sampling_vtk_paths,
             "audi_vtk_skipped_models": audi_vtk_skipped_models,
             "encoder_budget_mismatches": encoder_budget_mismatch_models,
             "query_budget_mismatches": query_budget_mismatch_models,

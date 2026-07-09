@@ -48,6 +48,7 @@ experiment:
   num_workers: 8
   prefetch_factor: 4
   pin_memory: True
+  cuda_batch_prefetch: True
   geometry_density_cache_dtype: "float16"
   density_knn_k: 16
   density_neighbor_hops: 1

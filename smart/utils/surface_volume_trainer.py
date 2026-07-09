@@ -44,11 +44,15 @@ def accumulate_channel_metrics(metrics, prefix, pred, gt, field_names, rel_l2_lo
 def add_canonical_field_metrics(wandb_dict, split, surface_fields, volume_fields, metric_values=None):
     metric_values = metric_values or {}
     for f in CANON_SURF_FIELDS:
+        if f not in surface_fields:
+            continue
         src_key = f"rel_l2_surf_{f}"
-        wandb_dict[f"{split}/rel_l2_surf_{f}"] = metric_values.get(src_key, np.nan) if f in surface_fields else np.nan
+        wandb_dict[f"{split}/rel_l2_surf_{f}"] = metric_values.get(src_key, np.nan)
     for f in CANON_VOL_FIELDS:
+        if f not in volume_fields:
+            continue
         src_key = f"rel_l2_vol_{f}"
-        wandb_dict[f"{split}/rel_l2_vol_{f}"] = metric_values.get(src_key, np.nan) if f in volume_fields else np.nan
+        wandb_dict[f"{split}/rel_l2_vol_{f}"] = metric_values.get(src_key, np.nan)
 
 
 def add_all_field_metrics(wandb_dict, split, surface_fields, volume_fields, metric_values=None):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from contextlib import contextmanager
 from timeit import default_timer
@@ -349,6 +350,69 @@ def gather_scalar(points, idx):
     return torch.gather(points, 1, idx)
 
 
+def move_to_device(value, device):
+    if torch.is_tensor(value):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {key: move_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [move_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(move_to_device(item, device) for item in value)
+    return value
+
+
+def record_batch_stream(value, stream):
+    if torch.is_tensor(value):
+        if value.is_cuda:
+            value.record_stream(stream)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            record_batch_stream(item, stream)
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            record_batch_stream(item, stream)
+
+
+class CudaPrefetchLoader:
+    def __init__(self, loader, device):
+        self.loader = loader
+        self.device = device
+        self.enabled = device.type == "cuda" and torch.cuda.is_available()
+        self.stream = torch.cuda.Stream(device=device) if self.enabled else None
+
+    def __len__(self):
+        return len(self.loader)
+
+    def __iter__(self):
+        if not self.enabled:
+            yield from self.loader
+            return
+
+        loader_iter = iter(self.loader)
+        next_batch = None
+
+        def preload():
+            nonlocal next_batch
+            try:
+                batch = next(loader_iter)
+            except StopIteration:
+                next_batch = None
+                return
+            with torch.cuda.stream(self.stream):
+                next_batch = move_to_device(batch, self.device)
+
+        preload()
+        while next_batch is not None:
+            torch.cuda.current_stream(device=self.device).wait_stream(self.stream)
+            batch = next_batch
+            record_batch_stream(batch, torch.cuda.current_stream(device=self.device))
+            preload()
+            yield batch
+
+
 def _cpu_generator(seed):
     gen = torch.Generator(device="cpu")
     gen.manual_seed(int(seed))
@@ -373,7 +437,61 @@ def sample_uniform_beta(beta_min, beta_max, generator):
     return float(torch.empty((), dtype=torch.float32).uniform_(beta_min, beta_max, generator=generator).item())
 
 
-def _sample_single_view_indices(log_density_row, n_points, num_points, mode, inverse_density_beta, mixed_inverse_density_prob, generator):
+def _sample_gaussian_ball_mask_indices(
+    geo_row,
+    n_points,
+    num_points,
+    generator,
+    std_fraction,
+    prob_at_1sigma,
+    min_survivors,
+):
+    if geo_row is None:
+        raise RuntimeError("gaussian_ball_mask sampling requires geometry coordinates.")
+
+    if num_points <= 0 or num_points >= n_points:
+        base_idx = torch.arange(n_points, dtype=torch.long)
+    else:
+        base_idx = torch.randperm(n_points, generator=generator)[:num_points].to(dtype=torch.long)
+
+    base_idx_for_geo = base_idx.to(device=geo_row.device, dtype=torch.long)
+    geo_subset = geo_row.index_select(0, base_idx_for_geo).detach().float().cpu()
+    if geo_subset.shape[0] == 0:
+        raise RuntimeError("gaussian_ball_mask sampling produced an empty base subset.")
+
+    center_rel = int(torch.randint(0, int(geo_subset.shape[0]), (1,), generator=generator, dtype=torch.long).item())
+    center = geo_subset[center_rel]
+    extent = (geo_subset.max(dim=0).values - geo_subset.min(dim=0).values).amax().item()
+    sigma = max(float(std_fraction) * float(extent), 1.0e-8)
+    prob_at_1sigma = min(max(float(prob_at_1sigma), 1.0e-8), 0.999999)
+    gaussian_coeff = -math.log(prob_at_1sigma)
+    dist = torch.linalg.vector_norm(geo_subset - center.unsqueeze(0), dim=1)
+    remove_prob = torch.exp(-gaussian_coeff * (dist / sigma).pow(2)).clamp_(0.0, 1.0)
+    keep_mask = torch.rand((geo_subset.shape[0],), generator=generator, dtype=torch.float32) >= remove_prob
+
+    min_survivors = max(1, min(int(min_survivors), int(base_idx.shape[0])))
+    if int(keep_mask.sum().item()) < min_survivors:
+        keep_scores = 1.0 - remove_prob
+        keep_rel = torch.topk(keep_scores, k=min_survivors, largest=True).indices
+        keep_mask = torch.zeros_like(keep_mask, dtype=torch.bool)
+        keep_mask[keep_rel] = True
+
+    return base_idx[keep_mask].to(dtype=torch.long), "gaussian_ball_mask"
+
+
+def _sample_single_view_indices(
+    geo_row,
+    log_density_row,
+    n_points,
+    num_points,
+    mode,
+    inverse_density_beta,
+    mixed_inverse_density_prob,
+    generator,
+    gaussian_mask_std_fraction=0.05,
+    gaussian_mask_prob_at_1sigma=0.33,
+    gaussian_mask_min_survivors=16384,
+):
     resolved_mode = _resolve_sampling_mode(mode, mixed_inverse_density_prob, generator)
 
     if num_points <= 0:
@@ -404,10 +522,32 @@ def _sample_single_view_indices(log_density_row, n_points, num_points, mode, inv
         idx = torch.multinomial(weights, num_samples=num_points, replacement=replacement, generator=generator)
         return idx.to(dtype=torch.long), resolved_mode
 
+    if resolved_mode == "gaussian_ball_mask":
+        return _sample_gaussian_ball_mask_indices(
+            geo_row,
+            n_points=n_points,
+            num_points=num_points,
+            generator=generator,
+            std_fraction=gaussian_mask_std_fraction,
+            prob_at_1sigma=gaussian_mask_prob_at_1sigma,
+            min_survivors=gaussian_mask_min_survivors,
+        )
+
     raise ValueError(f"Unsupported sampling mode: {resolved_mode}")
 
 
-def sample_geometry_view(geo_mesh, geo_log_density, num_points, mode, inverse_density_beta, mixed_inverse_density_prob, seed):
+def sample_geometry_view(
+    geo_mesh,
+    geo_log_density,
+    num_points,
+    mode,
+    inverse_density_beta,
+    mixed_inverse_density_prob,
+    seed,
+    gaussian_mask_std_fraction=0.05,
+    gaussian_mask_prob_at_1sigma=0.33,
+    gaussian_mask_min_survivors=16384,
+):
     if geo_log_density is None and _sampling_mode_requires_density(mode):
         raise RuntimeError(f"Sampling mode {mode!r} requires geometry log density for view sampling.")
 
@@ -417,8 +557,10 @@ def sample_geometry_view(geo_mesh, geo_log_density, num_points, mode, inverse_de
     n_points = int(geo_mesh.shape[1])
     for batch_idx in range(batch_size):
         generator = _cpu_generator(seed + 1009 * batch_idx)
+        geo_row = geo_mesh[batch_idx]
         log_density_row = None if geo_log_density is None else geo_log_density[batch_idx]
         idx_row, resolved_mode = _sample_single_view_indices(
+            geo_row,
             log_density_row,
             n_points=n_points,
             num_points=num_points,
@@ -426,11 +568,29 @@ def sample_geometry_view(geo_mesh, geo_log_density, num_points, mode, inverse_de
             inverse_density_beta=inverse_density_beta,
             mixed_inverse_density_prob=mixed_inverse_density_prob,
             generator=generator,
+            gaussian_mask_std_fraction=gaussian_mask_std_fraction,
+            gaussian_mask_prob_at_1sigma=gaussian_mask_prob_at_1sigma,
+            gaussian_mask_min_survivors=gaussian_mask_min_survivors,
         )
         idx_rows.append(idx_row)
         resolved_modes.append(resolved_mode)
 
+    row_lengths = [int(idx_row.numel()) for idx_row in idx_rows]
+    if len(set(row_lengths)) > 1:
+        common_num_points = max(1, min(row_lengths))
+        trimmed_rows = []
+        for batch_idx, idx_row in enumerate(idx_rows):
+            if int(idx_row.numel()) == common_num_points:
+                trimmed_rows.append(idx_row)
+                continue
+            trim_generator = _cpu_generator(seed + 200003 + 1009 * batch_idx)
+            keep_rel = torch.randperm(int(idx_row.numel()), generator=trim_generator)[:common_num_points]
+            trimmed_rows.append(idx_row[keep_rel].to(dtype=torch.long))
+        idx_rows = trimmed_rows
+
     idx = torch.stack(idx_rows, dim=0)
+    if geo_mesh.device.type != idx.device.type or geo_mesh.device != idx.device:
+        idx = idx.to(device=geo_mesh.device, non_blocking=(geo_mesh.device.type == "cuda"))
     sampled_density = None if geo_log_density is None else gather_scalar(geo_log_density, idx)
     return gather_points(geo_mesh, idx), sampled_density, resolved_modes
 
@@ -779,12 +939,14 @@ def evaluate_loader(
     eval_subsampled_geometry_points,
     fixed_seed_offset,
     model_requires_density,
+    cuda_batch_prefetch,
 ):
     metrics = init_metric_dict(fields["surface"], fields["volume"])
     model.eval()
     sample_count = 0
 
-    pbar = tqdm(loader, desc=f"Eval {mode_name}", leave=False, dynamic_ncols=True, disable=not is_main_process())
+    eval_loader = CudaPrefetchLoader(loader, device) if cuda_batch_prefetch else loader
+    pbar = tqdm(eval_loader, desc=f"Eval {mode_name}", leave=False, dynamic_ncols=True, disable=not is_main_process())
     with torch.inference_mode():
         for batch_idx, batch in enumerate(pbar):
             geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, geo_log_density = unpack_batch(batch, params_dim)
@@ -921,6 +1083,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
 
     prefetch_factor = int(getattr(config, "prefetch_factor", 2))
     pin_memory = bool(getattr(config, "pin_memory", True))
+    cuda_batch_prefetch = bool(getattr(config, "cuda_batch_prefetch", device.type == "cuda")) and device.type == "cuda"
     effective_num_workers = int(getattr(config, "num_workers", 0))
     if dist_info["enabled"]:
         effective_num_workers = 0
@@ -937,7 +1100,8 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             f"[dataloader] world_size={dist_info['world_size']}, "
             f"num_workers_per_rank={effective_num_workers}, "
             f"prefetch_factor={dl_common.get('prefetch_factor', 'n/a')}, "
-            f"persistent_workers={dl_common.get('persistent_workers', False)}"
+            f"persistent_workers={dl_common.get('persistent_workers', False)}, "
+            f"cuda_batch_prefetch={cuda_batch_prefetch}"
         )
 
     train_sampler = DistributedSampler(train_data, shuffle=True) if dist_info["enabled"] else None
@@ -984,6 +1148,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
     if run is not None and bool(getattr(config, "wandb_watch_model", False)):
         run.watch(model, log="all")
 
+    use_prediction_consistency = bool(getattr(config, "use_prediction_consistency", True))
     use_gradnorm = bool(getattr(config, "use_gradnorm", False))
     use_learned_task_weighting = bool(
         getattr(config, "use_learned_task_weighting", getattr(config, "use_uncertainty_weighting", False))
@@ -997,8 +1162,9 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
     uncertainty_balancer = None
     extra_optimizer_param_groups = []
     if use_gradnorm:
+        gradnorm_num_tasks = 3 if use_prediction_consistency else 2
         gradnorm_balancer = GradNormBalancer(
-            num_tasks=3,
+            num_tasks=gradnorm_num_tasks,
             alpha=float(getattr(config, "gradnorm_alpha", 1.5)),
             update_interval=int(getattr(config, "gradnorm_update_interval", 1)),
             clamp_start=float(getattr(config, "gradnorm_clamp_start", 0.2)),
@@ -1011,13 +1177,16 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
         )
         gradnorm_reference_params = resolve_gradnorm_reference_params(model)
     if use_learned_task_weighting:
+        learned_task_names = ["supervised_mean", "supervised_worst"]
+        if use_prediction_consistency:
+            learned_task_names.append("prediction_consistency")
         uncertainty_balancer = LearnedTaskWeighting(
-            task_names=("supervised_mean", "supervised_worst", "prediction_consistency"),
-            init_logits=list(getattr(config, "task_weight_init_logits", [0.0, 0.0, 0.0])),
+            task_names=tuple(learned_task_names),
+            init_logits=list(getattr(config, "task_weight_init_logits", [0.0] * len(learned_task_names))),
             min_logit=float(getattr(config, "task_weight_logit_min", -4.0)),
             max_logit=float(getattr(config, "task_weight_logit_max", 4.0)),
-            min_weights=list(getattr(config, "task_weight_min_weights", [0.4, 0.4, 0.0])),
-            base_weights=list(getattr(config, "task_weight_base_weights", [0.45, 0.45, 0.10])),
+            min_weights=list(getattr(config, "task_weight_min_weights", [0.4] * len(learned_task_names))),
+            base_weights=list(getattr(config, "task_weight_base_weights", [1.0 / len(learned_task_names)] * len(learned_task_names))),
             warmup_epochs=int(getattr(config, "task_weight_warmup_epochs", 25)),
         ).to(device)
         extra_optimizer_param_groups.append(
@@ -1127,6 +1296,8 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
         "loss_supervised_worst",
         "loss_supervised_worst_soft",
         "loss_prediction_consistency",
+        "primary_inverse_density_fraction",
+        "primary_inverse_density_beta",
         "secondary_inverse_density_fraction",
         "secondary_inverse_density_beta",
         "gradnorm_weight_primary",
@@ -1164,8 +1335,9 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             train_losses = init_metric_tensor_dict(fields["surface"], fields["volume"], device, extra_keys=train_extra_keys)
             train_model.train()
             train_sample_count = 0
+            train_batch_source = CudaPrefetchLoader(train_loader, device) if cuda_batch_prefetch else train_loader
             train_pbar = tqdm(
-                train_loader,
+                train_batch_source,
                 desc=f"Train {ep + 1}/{config.epochs}",
                 leave=False,
                 dynamic_ncols=True,
@@ -1177,6 +1349,8 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
 
             warmup = consistency_warmup_factor(ep, getattr(config, "consistency_warmup_epochs", 0))
             pred_consistency_weight = warmup * float(getattr(config, "prediction_consistency_weight", 1.0))
+            if not use_prediction_consistency:
+                pred_consistency_weight = 0.0
             use_latent_consistency = bool(getattr(config, "use_latent_consistency", False))
 
             for batch_idx, batch in enumerate(train_pbar):
@@ -1193,14 +1367,26 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                         "but the dataset did not return geometry log density."
                     )
 
-                primary_view_geo, primary_view_density, _ = sample_geometry_view(
+                primary_beta_generator = _cpu_generator(int(config.random_seed + ep * 1000003 + batch_idx * 10007 + 17))
+                if bool(getattr(config, "randomize_primary_inverse_density_beta", False)):
+                    primary_inverse_density_beta = sample_uniform_beta(
+                        getattr(config, "primary_inverse_density_beta_min", 0.0),
+                        getattr(config, "primary_inverse_density_beta_max", 0.5),
+                        primary_beta_generator,
+                    )
+                else:
+                    primary_inverse_density_beta = float(getattr(config, "inverse_density_beta", 1.0))
+                primary_view_geo, primary_view_density, primary_modes = sample_geometry_view(
                     geo_mesh,
                     geo_log_density,
                     num_points=primary_view_points,
                     mode=primary_sampling_mode,
-                    inverse_density_beta=float(getattr(config, "inverse_density_beta", 1.0)),
+                    inverse_density_beta=primary_inverse_density_beta,
                     mixed_inverse_density_prob=float(getattr(config, "mixed_inverse_density_prob", 0.5)),
                     seed=int(config.random_seed + ep * 1000003 + batch_idx * 10007 + 11),
+                    gaussian_mask_std_fraction=float(getattr(config, "gaussian_mask_std_fraction_of_largest_extent", 0.05)),
+                    gaussian_mask_prob_at_1sigma=float(getattr(config, "gaussian_mask_prob_at_1sigma", 0.33)),
+                    gaussian_mask_min_survivors=int(getattr(config, "gaussian_mask_min_survivors", 16384)),
                 )
                 secondary_beta_generator = _cpu_generator(int(config.random_seed + ep * 1000003 + batch_idx * 10007 + 23))
                 if bool(getattr(config, "randomize_secondary_inverse_density_beta", False)):
@@ -1219,6 +1405,9 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     inverse_density_beta=secondary_inverse_density_beta,
                     mixed_inverse_density_prob=float(getattr(config, "mixed_inverse_density_prob", 0.5)),
                     seed=int(config.random_seed + ep * 1000003 + batch_idx * 10007 + 29),
+                    gaussian_mask_std_fraction=float(getattr(config, "gaussian_mask_std_fraction_of_largest_extent", 0.05)),
+                    gaussian_mask_prob_at_1sigma=float(getattr(config, "gaussian_mask_prob_at_1sigma", 0.33)),
+                    gaussian_mask_min_survivors=int(getattr(config, "gaussian_mask_min_survivors", 16384)),
                 )
 
                 params = move_optional_tensor(params, device)
@@ -1313,13 +1502,16 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                 supervised_secondary = combined_loss_fn(y2_surf_f, y2_vol_f, surf_data, vol_data) if use_surface_supervision else loss_fn(y2_vol_f, vol_data)
                 y1_surf_teacher = y1_surf_f.detach()
                 y1_vol_teacher = y1_vol_f.detach()
-                pred_consistency = prediction_consistency_smooth_l1_loss(
-                    y1_surf_teacher,
-                    y1_vol_teacher,
-                    y2_surf_f,
-                    y2_vol_f,
-                    beta=float(getattr(config, "prediction_consistency_smooth_l1_beta", 0.05)),
-                )
+                if use_prediction_consistency:
+                    pred_consistency = prediction_consistency_smooth_l1_loss(
+                        y1_surf_teacher,
+                        y1_vol_teacher,
+                        y2_surf_f,
+                        y2_vol_f,
+                        beta=float(getattr(config, "prediction_consistency_smooth_l1_beta", 0.05)),
+                    )
+                else:
+                    pred_consistency = y1_vol_f.new_zeros(())
                 supervised_mean = 0.5 * (supervised_primary + supervised_secondary)
                 supervised_worst = torch.maximum(supervised_primary, supervised_secondary)
                 supervised_worst_soft = soft_worst_case_loss(
@@ -1335,12 +1527,14 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     pred_consistency.float(),
                 ]
                 if use_gradnorm:
+                    gradnorm_tasks = [
+                        task_losses[0],
+                        task_losses[1],
+                    ]
+                    if use_prediction_consistency:
+                        gradnorm_tasks.append((pred_consistency_weight * task_losses[4]).float())
                     gradnorm_info = gradnorm_balancer.compute(
-                        [
-                            task_losses[0],
-                            task_losses[1],
-                            (pred_consistency_weight * task_losses[4]).float(),
-                        ],
+                        gradnorm_tasks,
                         gradnorm_reference_params,
                         epoch_idx=ep,
                         step_idx=global_step,
@@ -1349,22 +1543,18 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     gradnorm_should_update = bool(gradnorm_info.get("should_update", True))
                     weighted_total_loss = sum(
                         current_task_weights[i] * task_loss
-                        for i, task_loss in enumerate(
-                            [
-                                task_losses[0],
-                                task_losses[1],
-                                (pred_consistency_weight * task_losses[4]).float(),
-                            ]
-                        )
+                        for i, task_loss in enumerate(gradnorm_tasks)
                     )
                     uncertainty_info = None
                 elif use_learned_task_weighting:
+                    learned_tasks = [
+                        task_losses[2],
+                        task_losses[3],
+                    ]
+                    if use_prediction_consistency:
+                        learned_tasks.append((pred_consistency_weight * task_losses[4]).float())
                     uncertainty_info = uncertainty_balancer.combine(
-                        [
-                            task_losses[2],
-                            task_losses[3],
-                            (pred_consistency_weight * task_losses[4]).float(),
-                        ],
+                        learned_tasks,
                         epoch_idx=ep,
                     )
                     current_task_weights = uncertainty_info["weights"].float()
@@ -1378,7 +1568,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     gradnorm_should_update = False
                     weighted_total_loss = (
                         supervised_mean
-                        + pred_consistency_weight * pred_consistency
+                        + (pred_consistency_weight * pred_consistency if use_prediction_consistency else 0.0)
                     ).float()
 
                 if gradnorm_should_update:
@@ -1426,6 +1616,9 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                 secondary_inverse_density_fraction = float(
                     sum(mode.startswith("inverse_density") for mode in secondary_modes) / max(len(secondary_modes), 1)
                 )
+                primary_inverse_density_fraction = float(
+                    sum(mode.startswith("inverse_density") for mode in primary_modes) / max(len(primary_modes), 1)
+                )
 
                 with torch.inference_mode():
                     surf_rel_primary = rel_l2_loss_fn(y1_surf_teacher, surf_data) if use_surface_supervision else torch.tensor(0.0, device=device)
@@ -1447,6 +1640,12 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     train_losses["loss_supervised_worst"] += supervised_worst.detach().float() * batch_size_float
                     train_losses["loss_supervised_worst_soft"] += supervised_worst_soft.detach().float() * batch_size_float
                     train_losses["loss_prediction_consistency"] += pred_consistency.detach().float() * batch_size_float
+                    train_losses["primary_inverse_density_fraction"] += torch.tensor(
+                        primary_inverse_density_fraction, device=device, dtype=torch.float32
+                    ) * batch_size_float
+                    train_losses["primary_inverse_density_beta"] += torch.tensor(
+                        float(primary_inverse_density_beta), device=device, dtype=torch.float32
+                    ) * batch_size_float
                     train_losses["secondary_inverse_density_fraction"] += torch.tensor(
                         secondary_inverse_density_fraction, device=device, dtype=torch.float32
                     ) * batch_size_float
@@ -1456,16 +1655,18 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     if gradnorm_info is not None:
                         train_losses["gradnorm_weight_primary"] += current_task_weights[0].detach().float() * batch_size_float
                         train_losses["gradnorm_weight_secondary"] += current_task_weights[1].detach().float() * batch_size_float
-                        train_losses["gradnorm_weight_prediction_consistency"] += current_task_weights[2].detach().float() * batch_size_float
+                        if use_prediction_consistency:
+                            train_losses["gradnorm_weight_prediction_consistency"] += current_task_weights[2].detach().float() * batch_size_float
                     if gradnorm_info is not None:
                         train_losses["gradnorm_loss"] += gradnorm_info["gradnorm_loss"].detach().float() * batch_size_float
                     if uncertainty_info is not None:
                         train_losses["learned_weight_supervised_mean"] += current_task_weights[0].detach().float() * batch_size_float
                         train_losses["learned_weight_supervised_worst"] += current_task_weights[1].detach().float() * batch_size_float
-                        train_losses["learned_weight_prediction_consistency"] += current_task_weights[2].detach().float() * batch_size_float
                         train_losses["learned_logit_supervised_mean"] += uncertainty_info["logits"][0].detach().float() * batch_size_float
                         train_losses["learned_logit_supervised_worst"] += uncertainty_info["logits"][1].detach().float() * batch_size_float
-                        train_losses["learned_logit_prediction_consistency"] += uncertainty_info["logits"][2].detach().float() * batch_size_float
+                        if use_prediction_consistency:
+                            train_losses["learned_weight_prediction_consistency"] += current_task_weights[2].detach().float() * batch_size_float
+                            train_losses["learned_logit_prediction_consistency"] += uncertainty_info["logits"][2].detach().float() * batch_size_float
 
                     if use_surface_supervision:
                         pred_surf_primary = y1_surf_teacher * std_surf + mean_surf
@@ -1494,6 +1695,8 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             supervised_mean.item(),
                             supervised_worst_soft.item(),
                             pred_consistency.item(),
+                            primary_inverse_density_fraction,
+                            float(primary_inverse_density_beta),
                             secondary_inverse_density_fraction,
                             float(secondary_inverse_density_beta),
                         ]
@@ -1509,8 +1712,10 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             "train/batch_supervised_mean": log_scalars[6],
                             "train/batch_supervised_worst_soft": log_scalars[7],
                             "train/batch_prediction_consistency": log_scalars[8],
-                            "train/batch_secondary_inverse_density_fraction": log_scalars[9],
-                            "train/batch_secondary_inverse_density_beta": log_scalars[10],
+                            "train/batch_primary_inverse_density_fraction": log_scalars[9],
+                            "train/batch_primary_inverse_density_beta": log_scalars[10],
+                            "train/batch_secondary_inverse_density_fraction": log_scalars[11],
+                            "train/batch_secondary_inverse_density_beta": log_scalars[12],
                             "train/prediction_consistency_weight": pred_consistency_weight,
                             "lr": scheduler.get_last_lr()[0],
                             "epoch": ep,
@@ -1518,21 +1723,20 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                         step=global_step,
                     )
                     if gradnorm_info is not None:
-                        gradnorm_weight_log_scalars = distributed_average_scalars(
-                            [
-                                float(current_task_weights[0].item()),
-                                float(current_task_weights[1].item()),
-                                float(current_task_weights[2].item()),
-                            ]
-                        )
-                        wandb.log(
-                            {
-                                "train/batch_gradnorm_weight_primary": gradnorm_weight_log_scalars[0],
-                                "train/batch_gradnorm_weight_secondary": gradnorm_weight_log_scalars[1],
-                                "train/batch_gradnorm_weight_prediction_consistency": gradnorm_weight_log_scalars[2],
-                            },
-                            step=global_step,
-                        )
+                        gradnorm_weight_values = [
+                            float(current_task_weights[0].item()),
+                            float(current_task_weights[1].item()),
+                        ]
+                        if use_prediction_consistency:
+                            gradnorm_weight_values.append(float(current_task_weights[2].item()))
+                        gradnorm_weight_log_scalars = distributed_average_scalars(gradnorm_weight_values)
+                        gradnorm_weight_log_dict = {
+                            "train/batch_gradnorm_weight_primary": gradnorm_weight_log_scalars[0],
+                            "train/batch_gradnorm_weight_secondary": gradnorm_weight_log_scalars[1],
+                        }
+                        if use_prediction_consistency:
+                            gradnorm_weight_log_dict["train/batch_gradnorm_weight_prediction_consistency"] = gradnorm_weight_log_scalars[2]
+                        wandb.log(gradnorm_weight_log_dict, step=global_step)
                     if gradnorm_info is not None:
                         gradnorm_log_scalars = distributed_average_scalars(
                             [
@@ -1546,27 +1750,30 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             step=global_step,
                         )
                     if uncertainty_info is not None:
-                        uncertainty_log_scalars = distributed_average_scalars(
-                            [
-                                float(current_task_weights[0].item()),
-                                float(current_task_weights[1].item()),
-                                float(current_task_weights[2].item()),
-                                float(uncertainty_info["logits"][0].item()),
-                                float(uncertainty_info["logits"][1].item()),
-                                float(uncertainty_info["logits"][2].item()),
-                            ]
-                        )
-                        wandb.log(
-                            {
-                                "train/batch_learned_weight_supervised_mean": uncertainty_log_scalars[0],
-                                "train/batch_learned_weight_supervised_worst": uncertainty_log_scalars[1],
-                                "train/batch_learned_weight_prediction_consistency": uncertainty_log_scalars[2],
-                                "train/batch_learned_logit_supervised_mean": uncertainty_log_scalars[3],
-                                "train/batch_learned_logit_supervised_worst": uncertainty_log_scalars[4],
-                                "train/batch_learned_logit_prediction_consistency": uncertainty_log_scalars[5],
-                            },
-                            step=global_step,
-                        )
+                        uncertainty_values = [
+                            float(current_task_weights[0].item()),
+                            float(current_task_weights[1].item()),
+                            float(uncertainty_info["logits"][0].item()),
+                            float(uncertainty_info["logits"][1].item()),
+                        ]
+                        if use_prediction_consistency:
+                            uncertainty_values.extend(
+                                [
+                                    float(current_task_weights[2].item()),
+                                    float(uncertainty_info["logits"][2].item()),
+                                ]
+                            )
+                        uncertainty_log_scalars = distributed_average_scalars(uncertainty_values)
+                        uncertainty_log_dict = {
+                            "train/batch_learned_weight_supervised_mean": uncertainty_log_scalars[0],
+                            "train/batch_learned_weight_supervised_worst": uncertainty_log_scalars[1],
+                            "train/batch_learned_logit_supervised_mean": uncertainty_log_scalars[2],
+                            "train/batch_learned_logit_supervised_worst": uncertainty_log_scalars[3],
+                        }
+                        if use_prediction_consistency:
+                            uncertainty_log_dict["train/batch_learned_weight_prediction_consistency"] = uncertainty_log_scalars[4]
+                            uncertainty_log_dict["train/batch_learned_logit_prediction_consistency"] = uncertainty_log_scalars[5]
+                        wandb.log(uncertainty_log_dict, step=global_step)
                 if should_log:
                     train_pbar.set_postfix(loss=f"{total_loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
                     train_pbar.refresh()
@@ -1596,6 +1803,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     eval_subsampled_geometry_points=eval_aligned_subsampled_geometry_points,
                     fixed_seed_offset=50000011,
                     model_requires_density=model_requires_density,
+                    cuda_batch_prefetch=cuda_batch_prefetch,
                 )
                 shifted_metrics = evaluate_loader(
                     model=model,
@@ -1619,6 +1827,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     eval_subsampled_geometry_points=eval_shifted_subsampled_geometry_points,
                     fixed_seed_offset=70000029,
                     model_requires_density=model_requires_density,
+                    cuda_batch_prefetch=cuda_batch_prefetch,
                 )
             else:
                 aligned_metrics = init_metric_dict(fields["surface"], fields["volume"])

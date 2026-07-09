@@ -1,11 +1,12 @@
 import gc
+import inspect
 import os
-from collections import OrderedDict
 from timeit import default_timer
 
 import hydra
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import wandb
 from omegaconf import DictConfig
@@ -13,7 +14,7 @@ from torch.nn import DataParallel
 from tqdm.auto import tqdm
 
 from data.datasets import get_dataset
-from loss.losses import CombinedLoss
+from loss.losses import CombinedLoss, RelL2Loss
 from models.smart.darm import DARM
 from utils.surface_volume_trainer import (
     accumulate_channel_metrics,
@@ -26,52 +27,10 @@ from utils.utils import (
     apply_naca4_auto_point_budget,
     count_model_params,
     get_model_checkpoint_name,
-    get_optimizer_scheduler_loss,
     initialize_gpu,
     initialize_wandb,
     print_point_budget,
 )
-
-
-DARM_PARAMETER_PREFIXES = (
-    "pos_encoder.",
-    "low_pos_encoder.",
-    "type_embedding.",
-    "layer_router.",
-    "anchor_context_norm.",
-    "route_query_norm.",
-    "route_anchor_norm.",
-    "route_query_proj.",
-    "route_anchor_proj.",
-    "anchor_shift_proj.",
-    "anchor_metric_proj.",
-    "anchor_scale_proj.",
-    "anchor_bias_proj.",
-    "anchor_value_proj.",
-    "delta_value_proj.",
-    "type_value_proj.",
-    "query_gate_proj.",
-    "anchor_gate_proj.",
-    "delta_gate_proj.",
-    "route_temperature_proj.",
-    "support_gain_proj.",
-    "high_context_norm.",
-    "high_value_block.",
-    "low_query_proj.",
-    "low_pos_proj.",
-    "low_type_proj.",
-    "low_block.",
-    "surface_low_head.",
-    "volume_low_head.",
-    "surface_high_head.",
-    "volume_high_head.",
-)
-DARM_PARAMETER_NAMES = {
-    "score_gate_scale",
-    "distance_gate_scale",
-    "gate_bias",
-    "margin_confidence_scale",
-}
 
 
 def unwrap_model(model):
@@ -169,43 +128,6 @@ class CudaPrefetchLoader:
             yield batch
 
 
-def is_darm_parameter_name(name):
-    return name in DARM_PARAMETER_NAMES or name.startswith(DARM_PARAMETER_PREFIXES)
-
-
-def iter_named_backbone_parameters(model):
-    for name, param in unwrap_model(model).named_parameters():
-        if not is_darm_parameter_name(name):
-            yield name, param
-
-
-def configure_backbone_trainability(model, trainable):
-    for _name, param in iter_named_backbone_parameters(model):
-        param.requires_grad_(trainable)
-
-
-def scale_backbone_gradients(model, grad_scale):
-    grad_scale = float(grad_scale)
-    if grad_scale >= 0.999999:
-        return
-    for _name, param in iter_named_backbone_parameters(model):
-        if param.grad is not None:
-            param.grad.mul_(grad_scale)
-
-
-def count_parameter_group_sizes(model):
-    backbone = 0
-    darm = 0
-    for name, param in unwrap_model(model).named_parameters():
-        if not param.requires_grad:
-            continue
-        if is_darm_parameter_name(name):
-            darm += param.numel()
-        else:
-            backbone += param.numel()
-    return backbone, darm
-
-
 def load_full_training_state(model, optimizer, scheduler, scaler, checkpoint_path, device, amp_enabled):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     unwrap_model(model).load_state_dict(checkpoint["model_state_dict"], strict=True)
@@ -223,11 +145,29 @@ def load_full_training_state(model, optimizer, scheduler, scaler, checkpoint_pat
     return start_epoch, global_step, best_rel_l2
 
 
-def consistency_warmup_factor(epoch, warmup_epochs):
-    warmup_epochs = int(warmup_epochs)
-    if warmup_epochs <= 0:
-        return 1.0
-    return min(1.0, float(epoch + 1) / float(warmup_epochs))
+def get_checkpoint_compatible_parameter_names(model, checkpoint_path, device):
+    if not checkpoint_path:
+        return set()
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    source = checkpoint.get("model_state_dict", checkpoint)
+    if any(key.startswith("module.") for key in source.keys()):
+        source = {key.removeprefix("module."): value for key, value in source.items()}
+
+    model_params = dict(unwrap_model(model).named_parameters())
+    compatible_names = set()
+    for key, value in source.items():
+        if key in model_params and model_params[key].shape == value.shape:
+            compatible_names.add(key)
+    return compatible_names
+
+
+def freeze_named_parameters(model, parameter_names):
+    frozen = 0
+    for name, param in unwrap_model(model).named_parameters():
+        if name in parameter_names:
+            param.requires_grad_(False)
+            frozen += 1
+    return frozen
 
 
 def gather_points(points, idx):
@@ -250,25 +190,72 @@ def masked_mean(values, weight, eps=1.0e-6):
     return (values * weight).sum() / denom
 
 
-def masked_smooth_l1(pred, target, weight, beta=0.05):
-    loss = F.smooth_l1_loss(pred, target, beta=beta, reduction="none")
-    return masked_mean(loss, weight)
-
-
-def masked_group_sparsity(x, weight, eps=1.0e-8):
-    norms = torch.sqrt(x.float().pow(2).sum(dim=-1) + eps)
-    return masked_mean(norms, weight)
-
-
-def relative_locality_penalty(spill_value, anchor_value, target_ratio, eps=1.0e-6):
-    target = anchor_value.detach() * float(target_ratio)
-    return F.relu(spill_value - target) / (anchor_value.detach() + eps)
-
-
 def masked_response_norm(pred, target, weight, eps=1.0e-8):
     delta = pred.float() - target.float()
     response = torch.sqrt(delta.pow(2).mean(dim=-1, keepdim=True) + eps)
     return masked_mean(response, weight)
+
+
+def pointwise_response_norm(pred, target, eps=1.0e-8):
+    delta = pred.float() - target.float()
+    return torch.sqrt(delta.pow(2).mean(dim=-1, keepdim=True) + eps)
+
+
+def pointwise_feature_norm(values, eps=1.0e-8):
+    return torch.sqrt(values.float().pow(2).mean(dim=-1, keepdim=True) + eps)
+
+
+def build_displacement_targets(original_points, edited_points, eps=1.0e-6):
+    displacement = (edited_points - original_points).float().norm(dim=-1, keepdim=True)
+    max_disp = displacement.amax(dim=1, keepdim=True).clamp_min(eps)
+    changed = (displacement / max_disp).clamp_(0.0, 1.0)
+    unchanged = 1.0 - changed
+    return (
+        changed.to(dtype=original_points.dtype),
+        unchanged.to(dtype=original_points.dtype),
+        displacement.to(dtype=original_points.dtype),
+    )
+
+
+def locality_focus_loss(values, changed_weight, eps=1.0e-6):
+    values = values.float().clamp_min(0.0)
+    changed_weight = changed_weight.float().clamp_min(0.0)
+    inside_mass = (values * changed_weight).sum(dim=1)
+    total_mass = values.sum(dim=1).clamp_min(eps)
+    focus = inside_mass / total_mass
+    return (-torch.log(focus.clamp_min(eps))).mean()
+
+
+def locality_separation_loss(values, changed_weight, unchanged_weight):
+    changed_mean = masked_mean(values, changed_weight)
+    unchanged_mean = masked_mean(values, unchanged_weight)
+    return F.softplus(unchanged_mean - changed_mean)
+
+
+def balanced_soft_bce(pred, target, eps=1.0e-6):
+    with torch.autocast(device_type=pred.device.type, enabled=False):
+        pred = pred.float().clamp(eps, 1.0 - eps)
+        target = target.float().clamp(0.0, 1.0)
+        pos_weight = target / target.sum(dim=1, keepdim=True).clamp_min(eps)
+        neg_target = 1.0 - target
+        neg_weight = neg_target / neg_target.sum(dim=1, keepdim=True).clamp_min(eps)
+        weight = pos_weight + neg_weight
+        loss = F.binary_cross_entropy(pred, target, reduction="none")
+        return (loss * weight).sum() / weight.sum().clamp_min(eps)
+
+
+def reliability_map_loss(pred_map, changed_weight, unchanged_weight):
+    calibration = balanced_soft_bce(pred_map, changed_weight)
+    separation = locality_separation_loss(pred_map, changed_weight, unchanged_weight)
+    return 0.5 * (calibration + separation)
+
+
+def ensure_scalar_tensor(value):
+    if not torch.is_tensor(value):
+        return value
+    if value.ndim == 0:
+        return value
+    return value.mean()
 
 
 def apply_gaussian_deformation(points, center, normal, sigma, edit_scale, ramp_power):
@@ -276,6 +263,8 @@ def apply_gaussian_deformation(points, center, normal, sigma, edit_scale, ramp_p
     dist2 = delta.float().pow(2).sum(dim=-1, keepdim=True)
     sigma2 = sigma.float().unsqueeze(1).unsqueeze(-1).pow(2).clamp_min(1.0e-6)
     weight = torch.exp(-0.5 * dist2 / sigma2).to(dtype=points.dtype)
+    support_mask = dist2 <= (9.0 * sigma2)
+    weight = weight * support_mask.to(dtype=weight.dtype)
     weight = weight.pow(float(ramp_power))
     if torch.is_tensor(edit_scale):
         scale = edit_scale.to(device=points.device, dtype=points.dtype).unsqueeze(1).unsqueeze(-1)
@@ -285,14 +274,27 @@ def apply_gaussian_deformation(points, center, normal, sigma, edit_scale, ramp_p
     return points + displacement
 
 
+def apply_deformation_field(points, centers, directions, sigmas, scales, ramp_power):
+    edited = points
+    num_lobes = int(centers.shape[1])
+    for lobe_idx in range(num_lobes):
+        edited = apply_gaussian_deformation(
+            edited,
+            centers[:, lobe_idx],
+            directions[:, lobe_idx],
+            sigmas[:, lobe_idx],
+            edit_scale=scales[:, lobe_idx],
+            ramp_power=ramp_power,
+        )
+    return edited
+
+
 def build_local_edit(
     geo_mesh,
     min_points,
     max_points,
     edit_strength,
     ramp_power,
-    changed_scale,
-    unchanged_scale,
     candidate_points=8192,
 ):
     batch_size, num_points, _spatial_dim = geo_mesh.shape
@@ -330,47 +332,49 @@ def build_local_edit(
     cov = torch.einsum("bki,bkj,bk->bij", centered.float(), centered.float(), patch_weight.float() / weight_sum.float())
     _eigvals, eigvecs = torch.linalg.eigh(cov)
     normal = eigvecs[..., 0].to(dtype=geo_mesh.dtype)
+    tangent_a = eigvecs[..., 2].to(dtype=geo_mesh.dtype)
+    tangent_b = eigvecs[..., 1].to(dtype=geo_mesh.dtype)
 
-    signed = (centered * normal.unsqueeze(1)).sum(dim=-1)
-    signed_rms = torch.sqrt(
-        ((signed.float().pow(2) * patch_weight.float()).sum(dim=1) / weight_sum.squeeze(1).float()).clamp_min(1.0e-8)
-    ).to(dtype=geo_mesh.dtype)
     edit_sigma = patch_radius.clamp_min(1.0e-6)
-    # Use a small signed normal bump/dent so the edit stays local and remains
-    # meaningful even on nearly planar patches where signed_rms is tiny.
-    amplitude_floor = 0.05 * patch_radius
-    amplitude_cap = 0.20 * patch_radius
-    amplitude = signed_rms.clamp_min(amplitude_floor)
-    amplitude = torch.minimum(amplitude, amplitude_cap)
-    direction = torch.where(
-        torch.rand(batch_size, device=device) < 0.5,
-        -torch.ones(batch_size, device=device, dtype=geo_mesh.dtype),
-        torch.ones(batch_size, device=device, dtype=geo_mesh.dtype),
+    primary_mix_a = torch.empty(batch_size, device=device, dtype=geo_mesh.dtype).uniform_(-0.35, 0.35)
+    primary_mix_b = torch.empty(batch_size, device=device, dtype=geo_mesh.dtype).uniform_(-0.20, 0.20)
+    primary_direction = F.normalize(
+        normal + primary_mix_a.unsqueeze(-1) * tangent_a + primary_mix_b.unsqueeze(-1) * tangent_b,
+        dim=-1,
     )
-    edit_scale = direction * float(edit_strength) * amplitude
-    edited_geo = apply_gaussian_deformation(
+    secondary_offset = torch.empty(batch_size, device=device, dtype=geo_mesh.dtype).uniform_(-0.60, 0.60)
+    secondary_center = center + secondary_offset.unsqueeze(-1) * patch_radius.unsqueeze(-1) * tangent_a
+    secondary_mix_n = torch.empty(batch_size, device=device, dtype=geo_mesh.dtype).uniform_(-0.75, 0.75)
+    secondary_mix_t = torch.empty(batch_size, device=device, dtype=geo_mesh.dtype).uniform_(-0.50, 0.50)
+    secondary_direction = F.normalize(
+        secondary_mix_n.unsqueeze(-1) * normal + tangent_b + secondary_mix_t.unsqueeze(-1) * tangent_a,
+        dim=-1,
+    )
+    primary_scale = torch.empty(batch_size, device=device, dtype=geo_mesh.dtype).uniform_(-1.0, 1.0)
+    primary_scale = primary_scale * float(edit_strength) * patch_radius
+    secondary_scale = torch.empty(batch_size, device=device, dtype=geo_mesh.dtype).uniform_(-0.5, 0.5)
+    secondary_scale = secondary_scale * float(edit_strength) * patch_radius
+
+    centers = torch.stack([center, secondary_center], dim=1)
+    directions = torch.stack([primary_direction, secondary_direction], dim=1)
+    sigmas = torch.stack([edit_sigma, 0.65 * edit_sigma], dim=1)
+    scales = torch.stack([primary_scale, secondary_scale], dim=1)
+    edited_geo = apply_deformation_field(
         geo_mesh,
-        center,
-        normal,
-        edit_sigma,
-        edit_scale=edit_scale,
+        centers,
+        directions,
+        sigmas,
+        scales,
         ramp_power=ramp_power,
     )
 
-    changed_radius = edit_sigma * float(changed_scale)
-    unchanged_radius = edit_sigma * float(max(unchanged_scale, changed_scale + 1.0e-3))
-    return edited_geo, center, normal, edit_sigma, edit_scale, changed_radius, unchanged_radius
-
-
-def build_query_locality_weights(query_pos, center, changed_radius, unchanged_radius):
-    delta = query_pos - center.unsqueeze(1)
-    dist2 = delta.float().pow(2).sum(dim=-1)
-    changed_sigma2 = changed_radius.float().unsqueeze(1).pow(2).clamp_min(1.0e-6)
-    unchanged_sigma2 = unchanged_radius.float().unsqueeze(1).pow(2).clamp_min(1.0e-6)
-    changed = torch.exp(-0.5 * dist2 / changed_sigma2)
-    outer = torch.exp(-0.5 * dist2 / unchanged_sigma2)
-    unchanged = (outer - changed).clamp_min(0.0)
-    return changed.to(dtype=query_pos.dtype), unchanged.to(dtype=query_pos.dtype)
+    deformation_field = {
+        "centers": centers,
+        "directions": directions,
+        "sigmas": sigmas,
+        "scales": scales,
+    }
+    return edited_geo, deformation_field
 
 
 def duplicate_batch(x):
@@ -407,97 +411,175 @@ def split_aux_batch(aux, split_index):
     return left, right
 
 
-def aux_scalar_mean(aux, key):
-    value = aux.get(key)
-    if torch.is_tensor(value):
-        return value.float()
+def aux_query_mean(aux, *keys):
+    total = None
+    count = 0
+    ref = None
+    for key in keys:
+        value = aux.get(key)
+        if not torch.is_tensor(value):
+            continue
+        ref = value if ref is None else ref
+        if value.numel() == 0:
+            continue
+        value_f = value.float()
+        component = value_f.sum()
+        total = component if total is None else (total + component)
+        count += int(value_f.numel())
+    if total is not None and count > 0:
+        return ensure_scalar_tensor(total / float(count))
+    if ref is not None:
+        return ref.new_zeros((), dtype=torch.float32)
     return torch.tensor(0.0)
 
 
-def mean_aux_scalar_pair(aux_left, aux_right, key):
-    return 0.5 * (aux_scalar_mean(aux_left, key) + aux_scalar_mean(aux_right, key))
-
-
-def update_ema_dict(ema_dict, value_dict, momentum):
-    if ema_dict is None:
-        return {key: float(value) for key, value in value_dict.items()}
-    out = {}
-    momentum = float(momentum)
-    for key, value in value_dict.items():
-        out[key] = momentum * float(ema_dict.get(key, value)) + (1.0 - momentum) * float(value)
-    return out
-
-
-def calibrate_loss_scales(loss_terms, base_weights, reference_name, min_scale, max_scale, eps=1.0e-8):
+def normalized_loss_scales(
+    loss_values,
+    base_weights,
+    reference_name="loss_supervised",
+    min_scale=0.25,
+    max_scale=4.0,
+    eps=1.0e-8,
+    target_multipliers=None,
+):
     active_names = [name for name, weight in base_weights.items() if float(weight) > 0.0]
     if not active_names:
-        return {name: 1.0 for name in loss_terms}
-    if reference_name not in loss_terms or float(base_weights.get(reference_name, 0.0)) <= 0.0:
+        return {name: 1.0 for name in loss_values}
+
+    if reference_name not in active_names:
         reference_name = active_names[0]
 
-    ref_value = loss_terms[reference_name].detach().float().abs().clamp_min(eps)
-    scales = {}
-    for name, term in loss_terms.items():
-        if float(base_weights.get(name, 0.0)) <= 0.0:
+    target_multipliers = dict(target_multipliers or {})
+    reference_target = float(target_multipliers.get(reference_name, 1.0))
+    reference_target = max(reference_target, eps)
+
+    reference_value = abs(float(loss_values.get(reference_name, 0.0)))
+    reference_contribution = abs(float(base_weights.get(reference_name, 0.0))) * reference_value
+    if not np.isfinite(reference_contribution) or reference_contribution <= eps:
+        return {name: 1.0 for name in loss_values}
+
+    scales = {name: 1.0 for name in loss_values}
+    for name in active_names:
+        loss_value = abs(float(loss_values.get(name, 0.0)))
+        weighted_contribution = abs(float(base_weights.get(name, 0.0))) * loss_value
+        if not np.isfinite(weighted_contribution) or weighted_contribution <= eps:
             scales[name] = 1.0
             continue
-        value = term.detach().float().abs()
-        if not bool(torch.isfinite(value).item()) or float(value.item()) <= eps:
-            scales[name] = 1.0
-            continue
-        scales[name] = float((ref_value / value).clamp(float(min_scale), float(max_scale)).item())
+        target_multiplier = float(target_multipliers.get(name, 1.0))
+        target_contribution = reference_contribution * (target_multiplier / reference_target)
+        scale = target_contribution / weighted_contribution
+        scales[name] = float(np.clip(scale, float(min_scale), float(max_scale)))
+
     scales[reference_name] = 1.0
     return scales
 
 
-def calibrate_normalized_loss_scales(loss_values, base_weights, min_scale, max_scale, eps=1.0e-8):
-    active_names = [name for name, weight in base_weights.items() if float(weight) > 0.0]
-    if not active_names:
-        return {name: 1.0 for name in loss_values}
+def should_reweight_epoch(epoch, explicit_epochs, interval_epochs):
+    if int(epoch) in explicit_epochs:
+        return True
+    if int(interval_epochs) <= 0:
+        return False
+    return int(epoch) > 0 and (int(epoch) % int(interval_epochs) == 0)
 
-    raw_effective_weights = {}
-    for name in active_names:
-        value = loss_values.get(name, 0.0)
-        value = max(float(value), eps)
-        raw_effective_weights[name] = 1.0 / value
 
-    base_weight_sum = sum(float(base_weights[name]) for name in active_names)
-    raw_weight_sum = sum(raw_effective_weights.values())
-    if raw_weight_sum <= eps:
-        return {name: 1.0 for name in loss_values}
+def _cuda_optimizer_impl_kwargs(optimizer_cls):
+    if not torch.cuda.is_available():
+        return {}
+    try:
+        parameters = inspect.signature(optimizer_cls).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "fused" in parameters:
+        return {"fused": True}
+    if "foreach" in parameters:
+        return {"foreach": True}
+    return {}
 
-    normalized_effective_weights = {
-        name: raw_effective_weights[name] * (base_weight_sum / raw_weight_sum)
-        for name in active_names
+
+def build_named_param_groups(named_parameters, lr, weight_decay, exclude=None):
+    exclude = tuple(exclude or ("bias", "norm", "query_pos", "lora_A", "lora_B"))
+    decay = []
+    no_decay = []
+    for name, param in named_parameters:
+        if not param.requires_grad:
+            continue
+        if any(token in name for token in exclude):
+            no_decay.append(param)
+        else:
+            decay.append(param)
+
+    groups = []
+    if decay:
+        groups.append({"params": decay, "lr": lr, "weight_decay": weight_decay})
+    if no_decay:
+        groups.append({"params": no_decay, "lr": lr, "weight_decay": 0.0})
+    return groups
+
+
+def create_darm_optimizer_scheduler_loss(model, config, train_loader, loss_dim=-2):
+    named_parameters = [
+        (name, param) for name, param in unwrap_model(model).named_parameters() if param.requires_grad
+    ]
+    base_lr = float(config.learning_rate)
+    grouped_parameters = build_named_param_groups(named_parameters, lr=base_lr, weight_decay=1.0e-4)
+
+    if config.optimizer == "adam":
+        optimizer = torch.optim.Adam(
+            grouped_parameters,
+            lr=base_lr,
+            weight_decay=1.0e-5,
+            **_cuda_optimizer_impl_kwargs(torch.optim.Adam),
+        )
+    elif config.optimizer == "adamw":
+        optimizer = torch.optim.AdamW(
+            grouped_parameters,
+            lr=base_lr,
+            weight_decay=1.0e-4,
+            **_cuda_optimizer_impl_kwargs(torch.optim.AdamW),
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer for DARM training: {config.optimizer}")
+
+    scheduler_warmup_fraction = float(
+        getattr(config, "scheduler_warmup_fraction", getattr(config, "scheduler_warumup_fraction", 0.2))
+    )
+    if config.scheduler == "one-cycle":
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=base_lr,
+            pct_start=scheduler_warmup_fraction,
+            div_factor=1e2,
+            final_div_factor=1e3,
+            total_steps=config.epochs * len(train_loader),
+        )
+    elif config.scheduler == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, config.epochs * len(train_loader))
+    elif config.scheduler == "step":
+        scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=config.scheduler_step, gamma=config.scheduler_gamma)
+    elif config.scheduler == "exponential":
+        scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.9, last_epoch=-1)
+    else:
+        raise ValueError(f"Unsupported scheduler for DARM training: {config.scheduler}")
+
+    if config.loss_fn == "mse":
+        loss_fn = nn.MSELoss(reduction="mean")
+    elif config.loss_fn == "l1":
+        loss_fn = nn.L1Loss(reduction="mean")
+    elif config.loss_fn == "rel_l2":
+        loss_fn = RelL2Loss(dim=loss_dim, reduction="sum")
+    else:
+        raise ValueError(f"Unsupported loss for DARM training: {config.loss_fn}")
+
+    rel_l2_loss_fn = RelL2Loss(dim=loss_dim, reduction="sum")
+    lora_params = sum(param.numel() for name, param in named_parameters if ".lora_" in name)
+    trainable_params = sum(param.numel() for _name, param in named_parameters)
+    group_info = {
+        "trainable_params": trainable_params,
+        "lora_params": lora_params,
+        "non_lora_params": trainable_params - lora_params,
+        "lr": base_lr,
     }
-    scales = {}
-    for name in loss_values:
-        base_weight = float(base_weights.get(name, 0.0))
-        if base_weight <= 0.0:
-            scales[name] = 1.0
-            continue
-        target_weight = normalized_effective_weights.get(name, base_weight)
-        scales[name] = float(np.clip(target_weight / base_weight, float(min_scale), float(max_scale)))
-
-    effective_sum = sum(float(base_weights[name]) * float(scales[name]) for name in active_names)
-    if effective_sum > eps:
-        renorm = base_weight_sum / effective_sum
-        for name in active_names:
-            scales[name] = float(np.clip(scales[name] * renorm, float(min_scale), float(max_scale)))
-    return scales
-
-
-def weighted_loss_sum(loss_terms, base_weights, loss_scales):
-    total = None
-    for name, term in loss_terms.items():
-        weight = float(base_weights.get(name, 0.0)) * float(loss_scales.get(name, 1.0))
-        if weight == 0.0:
-            continue
-        contribution = weight * term
-        total = contribution if total is None else (total + contribution)
-    if total is None:
-        return next(iter(loss_terms.values())).new_zeros(())
-    return total
+    return optimizer, scheduler, loss_fn, rel_l2_loss_fn, group_info
 
 
 def cleanup_after_oom(optimizer):
@@ -668,17 +750,17 @@ def evaluate_loader(
             if use_surface_supervision:
                 pred_surf = y_hat_surf * std_surf + mean_surf
                 gt_surf = surf_data * std_surf + mean_surf
-                batch_loss = combined_loss_fn(y_hat_surf.float(), y_hat_vol.float(), surf_data, vol_data)
-                surface_rel_l2 = rel_l2_loss_fn(y_hat_surf.float(), surf_data)
+                batch_loss = ensure_scalar_tensor(combined_loss_fn(y_hat_surf.float(), y_hat_vol.float(), surf_data, vol_data))
+                surface_rel_l2 = ensure_scalar_tensor(rel_l2_loss_fn(y_hat_surf.float(), surf_data))
             else:
                 pred_surf = None
                 gt_surf = None
-                batch_loss = loss_fn(y_hat_vol.float(), vol_data)
+                batch_loss = ensure_scalar_tensor(loss_fn(y_hat_vol.float(), vol_data))
                 surface_rel_l2 = torch.tensor(0.0, device=device)
 
             pred_vol = y_hat_vol * std_vol + mean_vol
             gt_vol = vol_data * std_vol + mean_vol
-            volume_rel_l2 = rel_l2_loss_fn(y_hat_vol.float(), vol_data)
+            volume_rel_l2 = ensure_scalar_tensor(rel_l2_loss_fn(y_hat_vol.float(), vol_data))
 
             if should_run_periodic_check(batch_idx, eval_nonfinite_check_interval):
                 eval_problems = find_non_finite_problems(
@@ -802,6 +884,11 @@ def main(cfg: DictConfig):
     merged_kwargs = {**model_kwargs, **config.architecture} if "architecture" in config else model_kwargs
     print(f"Model kwargs: {merged_kwargs}")
     model = DARM(**merged_kwargs).to(device)
+    if getattr(model, "lora_linear_module_count", 0) > 0:
+        print(
+            f"[DARM] Enabled LoRA on {model.lora_linear_module_count} pretrained linear layers "
+            f"(rank={model.lora_rank}, alpha={model.lora_alpha:g}, dropout={model.lora_dropout:g})."
+        )
 
     resume_ckpt = str(getattr(config, "resume_ckpt", "")).strip()
     init_ckpt = str(getattr(config, "init_ckpt", "")).strip()
@@ -813,35 +900,53 @@ def main(cfg: DictConfig):
     if run is not None and bool(getattr(config, "wandb_watch_model", False)):
         run.watch(model, log="all")
 
-    scaler = torch.amp.GradScaler("cuda", enabled=amp and torch.cuda.is_available())
-    optimizer, scheduler, loss_fn, rel_l2_loss_fn = get_optimizer_scheduler_loss(model, config, train_loader, loss_dim=1)
-    combined_loss_fn = CombinedLoss(loss_fn, fields) if use_surface_supervision else None
-
-    supervised_only_warmup_epochs = max(0, int(getattr(config, "supervised_only_warmup_epochs", 0)))
-    freeze_backbone_epochs = max(0, int(getattr(config, "freeze_backbone_epochs", 0)))
-    backbone_grad_scale = float(getattr(config, "backbone_grad_scale", 1.0))
-    backbone_grad_scale = min(max(backbone_grad_scale, 0.0), 1.0)
-    backbone_param_count, darm_param_count = count_parameter_group_sizes(model)
-    print(
-        f"[DARM] fine-tune split -> backbone_params={backbone_param_count}, "
-        f"darm_params={darm_param_count}, supervised_only_warmup_epochs={supervised_only_warmup_epochs}, "
-        f"freeze_backbone_epochs={freeze_backbone_epochs}, "
-        f"backbone_grad_scale={backbone_grad_scale:.4f}"
-    )
-
     start_epoch = 0
     global_step = 0
     best_rel_l2 = np.inf
-    if bool(getattr(config, "resume_full_state", False)):
+    checkpoint_compatible_param_names = set()
+    resume_full_state = bool(getattr(config, "resume_full_state", False))
+    if not resume_full_state and resume_ckpt:
+        checkpoint_compatible_param_names = get_checkpoint_compatible_parameter_names(model, resume_ckpt, device)
+        load_partial_state_dict(model, resume_ckpt, device)
+    elif not resume_full_state and init_ckpt:
+        checkpoint_compatible_param_names = get_checkpoint_compatible_parameter_names(model, init_ckpt, device)
+        load_partial_state_dict(model, init_ckpt, device)
+    if checkpoint_compatible_param_names:
+        print(
+            "[DARM] SMART checkpoint loading only restores the shared pretrained backbone/base predictor "
+            "tensors. DARM-specific residual/router/reliability/LoRA tensors still start from DARM init."
+        )
+
+    freeze_loaded_pretrained_params = bool(getattr(config, "freeze_loaded_pretrained_params", False))
+    if not resume_full_state and checkpoint_compatible_param_names and freeze_loaded_pretrained_params:
+        frozen_count = freeze_named_parameters(model, checkpoint_compatible_param_names)
+        print(
+            f"[DARM] Froze {frozen_count} checkpoint-compatible pretrained parameters. "
+            "Training DARM residual/editor parameters plus LoRA adapters."
+        )
+        print(f"[DARM] Trainable parameters after freezing: {count_model_params(model)}")
+
+    scaler = torch.amp.GradScaler("cuda", enabled=amp and torch.cuda.is_available())
+    optimizer, scheduler, loss_fn, rel_l2_loss_fn, optimizer_group_info = create_darm_optimizer_scheduler_loss(
+        model,
+        config,
+        train_loader,
+        loss_dim=1,
+    )
+    combined_loss_fn = CombinedLoss(loss_fn, fields) if use_surface_supervision else None
+    print(
+        f"[DARM] optimizer setup -> trainable_params={optimizer_group_info['trainable_params']}, "
+        f"lora_params={optimizer_group_info['lora_params']}, "
+        f"non_lora_params={optimizer_group_info['non_lora_params']}, "
+        f"lr={optimizer_group_info['lr']:.3e}"
+    )
+
+    if resume_full_state:
         if not resume_ckpt:
             raise ValueError("resume_full_state=True requires experiment.resume_ckpt to be set.")
         start_epoch, global_step, best_rel_l2 = load_full_training_state(
             model, optimizer, scheduler, scaler, resume_ckpt, device, amp
         )
-    elif resume_ckpt:
-        load_partial_state_dict(model, resume_ckpt, device)
-    elif init_ckpt:
-        load_partial_state_dict(model, init_ckpt, device)
 
     train_model = model
     if multi_gpu_strategy == "data_parallel" and torch.cuda.is_available() and torch.cuda.device_count() > 1:
@@ -857,32 +962,18 @@ def main(cfg: DictConfig):
 
     extra_metric_keys = [
         "loss_supervised",
-        "loss_stability",
         "loss_ghost",
-        "loss_high_sparsity",
-        "loss_collapse_prevention",
-        "loss_collapse_support",
-        "loss_collapse_evidence",
-        "loss_collapse_entropy",
-        "loss_stability_surface",
-        "loss_stability_volume",
+        "loss_reliability",
         "loss_ghost_surface",
         "loss_ghost_volume",
-        "mean_support_mass_orig",
-        "mean_support_mass_edit",
+        "loss_reliability_surface",
+        "loss_reliability_volume",
         "mean_support_mass",
-        "mean_route_confidence_orig",
-        "mean_route_confidence_edit",
         "mean_route_confidence",
-        "mean_route_entropy_orig",
-        "mean_route_entropy_edit",
         "mean_route_entropy",
-        "mean_evidence_gate_orig",
-        "mean_evidence_gate_edit",
         "mean_evidence_gate",
-        "mean_raw_evidence_gate_orig",
-        "mean_raw_evidence_gate_edit",
         "mean_raw_evidence_gate",
+        "mean_route_spread",
         "changed_support_mass_surface",
         "changed_support_mass_volume",
         "unchanged_support_mass_surface",
@@ -891,18 +982,20 @@ def main(cfg: DictConfig):
         "changed_evidence_mass_volume",
         "unchanged_evidence_mass_surface",
         "unchanged_evidence_mass_volume",
-        "changed_route_confidence_surface",
-        "changed_route_confidence_volume",
-        "unchanged_route_confidence_surface",
-        "unchanged_route_confidence_volume",
         "changed_response_surface",
         "changed_response_volume",
         "unchanged_response_surface",
         "unchanged_response_volume",
-        "changed_route_entropy_surface",
-        "changed_route_entropy_volume",
-        "unchanged_route_entropy_surface",
-        "unchanged_route_entropy_volume",
+        "changed_residual_surface",
+        "changed_residual_volume",
+        "unchanged_residual_surface",
+        "unchanged_residual_volume",
+        "changed_base_response_surface",
+        "changed_base_response_volume",
+        "unchanged_base_response_surface",
+        "unchanged_base_response_volume",
+        "changed_edit_displacement_surface",
+        "changed_edit_displacement_volume",
     ]
     log_every_n_steps = int(getattr(config, "log_every_n_steps", 0))
     console_log_every_n_steps = int(getattr(config, "console_log_every_n_steps", 0))
@@ -932,33 +1025,46 @@ def main(cfg: DictConfig):
         "full surface/volume query sets while preserving the current "
         "methodology and improving DataParallel utilization."
     )
-
-    loss_balance_enabled = bool(getattr(config, "loss_balance_enabled", getattr(config, "loss_calibration_enabled", True)))
-    loss_balance_reference = str(getattr(config, "loss_balance_reference", getattr(config, "loss_calibration_reference", "supervised")))
-    loss_balance_min_scale = float(getattr(config, "loss_balance_min_scale", getattr(config, "loss_calibration_min_scale", 0.1)))
-    loss_balance_max_scale = float(getattr(config, "loss_balance_max_scale", getattr(config, "loss_calibration_max_scale", 10.0)))
-    loss_balance_scales = None
-    loss_balance_steps = max(1, int(getattr(config, "loss_balance_steps", 16)))
-    loss_balance_ema_momentum = float(getattr(config, "loss_balance_ema_momentum", 0.8))
-    loss_balance_ema = None
-    dynamic_loss_reweight_enabled = bool(getattr(config, "dynamic_loss_reweight_enabled", True))
-    dynamic_loss_reweight_start_steps = max(1, int(getattr(config, "dynamic_loss_reweight_start_steps", 64)))
-    dynamic_loss_reweight_epochs = {
-        int(epoch_idx) for epoch_idx in getattr(config, "dynamic_loss_reweight_epochs", [3])
-    }
-    dynamic_loss_reweight_min_scale = float(getattr(config, "dynamic_loss_reweight_min_scale", 0.25))
-    dynamic_loss_reweight_max_scale = float(getattr(config, "dynamic_loss_reweight_max_scale", 4.0))
-    dynamic_loss_reweight_momentum = float(getattr(config, "dynamic_loss_reweight_momentum", 0.9))
-    dynamic_loss_scales = None
-    dynamic_loss_start_ema = None
+    if run is not None:
+        wandb.log(
+            {
+                "setup/trainable_params": count_model_params(model),
+                "setup/batch_size": int(config.batch_size),
+                "setup/local_edit_forward_batch_size": local_edit_forward_batch_size,
+                "setup/num_workers": num_workers,
+                "setup/prefetch_factor": prefetch_factor,
+                "setup/trainable_params_total": optimizer_group_info["trainable_params"],
+                "setup/lora_params": optimizer_group_info["lora_params"],
+                "setup/non_lora_params": optimizer_group_info["non_lora_params"],
+                "setup/lr": optimizer_group_info["lr"],
+            },
+            step=global_step,
+        )
     oom_skip_batches = bool(getattr(config, "oom_skip_batches", True))
     oom_clear_cache = bool(getattr(config, "oom_clear_cache", True))
     total_oom_batches = 0
     nonfinite_skip_batches = bool(getattr(config, "nonfinite_skip_batches", True))
     nonfinite_clear_cache = bool(getattr(config, "nonfinite_clear_cache", True))
     total_nonfinite_batches = 0
-    backbone_trainable = None
-    local_edit_enabled_state = None
+    loss_reweight_epochs = {int(epoch_idx) for epoch_idx in getattr(config, "loss_reweight_epochs", [0, 3])}
+    loss_reweight_interval_epochs = max(0, int(getattr(config, "loss_reweight_interval_epochs", 0)))
+    loss_reweight_batches = max(1, int(getattr(config, "loss_reweight_batches", 8)))
+    loss_reweight_reference = str(getattr(config, "loss_reweight_reference", "loss_supervised"))
+    loss_reweight_supervised_ratio = max(float(getattr(config, "loss_reweight_supervised_ratio", 4.0)), 1.0e-6)
+    loss_reweight_min_scale = float(getattr(config, "loss_reweight_min_scale", 0.25))
+    loss_reweight_max_scale = float(getattr(config, "loss_reweight_max_scale", 4.0))
+    reliability_weight = float(getattr(config, "reliability_weight", 0.10))
+    target_loss_multipliers = {
+        "loss_supervised": 1.0,
+        "loss_ghost": 1.0 / loss_reweight_supervised_ratio,
+        "loss_reliability": 1.0 / loss_reweight_supervised_ratio,
+    }
+    loss_weight_scales = {
+        "loss_supervised": 1.0,
+        "loss_ghost": 1.0,
+        "loss_reliability": 1.0,
+    }
+    loss_reweight_done_epochs = set()
 
     try:
         for ep in tqdm(range(start_epoch, config.epochs), desc="Epochs", dynamic_ncols=True):
@@ -977,23 +1083,6 @@ def main(cfg: DictConfig):
             train_sample_count = 0
             epoch_oom_batches = 0
             epoch_nonfinite_batches = 0
-            epoch_loss_term_sums = OrderedDict(
-                (name, 0.0) for name in ("supervised", "stability", "ghost", "high_sparsity")
-            )
-            epoch_loss_term_count = 0
-
-            local_edit_enabled = ep >= supervised_only_warmup_epochs
-            if local_edit_enabled_state is None or local_edit_enabled != local_edit_enabled_state:
-                local_edit_enabled_state = local_edit_enabled
-                stage = "local-edit consistency" if local_edit_enabled else "supervised-only warmup"
-                print(f"[DARM] epoch={ep + 1}: stage is now {stage}.")
-
-            epoch_backbone_trainable = ep >= freeze_backbone_epochs
-            if backbone_trainable is None or epoch_backbone_trainable != backbone_trainable:
-                configure_backbone_trainability(model, epoch_backbone_trainable)
-                backbone_trainable = epoch_backbone_trainable
-                state = "trainable" if backbone_trainable else "frozen"
-                print(f"[DARM] epoch={ep + 1}: backbone is now {state}.")
 
             train_model.train()
             train_batch_source = CudaPrefetchLoader(train_loader, device) if cuda_batch_prefetch else train_loader
@@ -1004,20 +1093,16 @@ def main(cfg: DictConfig):
                 dynamic_ncols=True,
             )
 
-            edit_warmup = consistency_warmup_factor(ep, getattr(config, "edit_warmup_epochs", getattr(config, "consistency_warmup_epochs", 10)))
-            stability_weight = edit_warmup * float(getattr(config, "stability_weight", getattr(config, "edit_consistency_weight", 0.5)))
-            ghost_weight = edit_warmup * float(getattr(config, "ghost_suppression_weight", 0.25))
-            high_sparsity_weight = float(getattr(config, "high_sparsity_weight", 0.0))
+            ghost_weight = float(getattr(config, "ghost_suppression_weight", 0.25))
+            reliability_weight_epoch = reliability_weight
             supervised_weight = float(getattr(config, "supervised_weight", 1.0))
-            loss_beta = float(getattr(config, "stability_smooth_l1_beta", getattr(config, "prediction_consistency_smooth_l1_beta", 0.05)))
-            ghost_target_ratio = float(getattr(config, "ghost_target_ratio", 0.35))
-            ghost_absolute_weight = float(getattr(config, "ghost_absolute_weight", 0.1))
-            collapse_support_weight = float(getattr(config, "collapse_support_weight", 0.1))
-            collapse_support_target = float(getattr(config, "collapse_support_target", 0.1))
-            collapse_evidence_weight = float(getattr(config, "collapse_evidence_weight", 0.1))
-            collapse_evidence_target = float(getattr(config, "collapse_evidence_target", 0.05))
-            collapse_entropy_weight = float(getattr(config, "collapse_entropy_weight", 0.02))
-            collapse_entropy_target = float(getattr(config, "collapse_entropy_target", 0.998))
+            base_loss_weights = {
+                "loss_supervised": supervised_weight,
+                "loss_ghost": ghost_weight,
+                "loss_reliability": reliability_weight_epoch,
+            }
+            reweight_accum = {name: 0.0 for name in loss_weight_scales}
+            reweight_steps = 0
 
             for batch_idx, batch in enumerate(train_pbar):
                 try:
@@ -1062,49 +1147,40 @@ def main(cfg: DictConfig):
 
                     optimizer.zero_grad(set_to_none=True)
 
-                    if local_edit_enabled:
-                        with torch.no_grad():
-                            edit_ramp_power = float(getattr(config, "edit_ramp_power", 1.5))
-                            edited_geo, edit_center, edit_normal, edit_sigma, edit_scale, changed_radius, unchanged_radius = build_local_edit(
-                                geo_mesh,
-                                min_points=int(getattr(config, "edit_patch_min_points", 256)),
-                                max_points=int(getattr(config, "edit_patch_max_points", 1024)),
-                                edit_strength=float(getattr(config, "edit_strength", 0.75)),
-                                ramp_power=edit_ramp_power,
-                                changed_scale=float(getattr(config, "edit_changed_radius_scale", 1.2)),
-                                unchanged_scale=float(getattr(config, "edit_unchanged_radius_scale", 2.5)),
-                                candidate_points=int(getattr(config, "edit_candidate_points", 2048)),
-                            )
-                            edited_surf_mesh = apply_gaussian_deformation(
-                                surf_mesh,
-                                edit_center,
-                                edit_normal,
-                                edit_sigma,
-                                edit_scale=edit_scale,
-                                ramp_power=edit_ramp_power,
-                            )
-                            edited_vol_mesh = apply_gaussian_deformation(
-                                vol_mesh,
-                                edit_center,
-                                edit_normal,
-                                edit_sigma,
-                                edit_scale=edit_scale,
-                                ramp_power=edit_ramp_power,
-                            )
-                            surf_changed_w, surf_unchanged_w = build_query_locality_weights(
-                                surf_mesh, edit_center, changed_radius, unchanged_radius
-                            )
-                            vol_changed_w, vol_unchanged_w = build_query_locality_weights(
-                                vol_mesh, edit_center, changed_radius, unchanged_radius
-                            )
-                    else:
-                        edited_geo = geo_mesh
-                        edited_surf_mesh = surf_mesh
-                        edited_vol_mesh = vol_mesh
-                        surf_changed_w = surf_mesh.new_zeros(surf_mesh.shape[:2])
-                        surf_unchanged_w = surf_mesh.new_zeros(surf_mesh.shape[:2])
-                        vol_changed_w = vol_mesh.new_zeros(vol_mesh.shape[:2])
-                        vol_unchanged_w = vol_mesh.new_zeros(vol_mesh.shape[:2])
+                    with torch.no_grad():
+                        edit_ramp_power = float(getattr(config, "edit_ramp_power", 1.5))
+                        edited_geo, deformation_field = build_local_edit(
+                            geo_mesh,
+                            min_points=int(getattr(config, "edit_patch_min_points", 256)),
+                            max_points=int(getattr(config, "edit_patch_max_points", 1024)),
+                            edit_strength=float(getattr(config, "edit_strength", 0.75)),
+                            ramp_power=edit_ramp_power,
+                            candidate_points=int(getattr(config, "edit_candidate_points", 2048)),
+                        )
+                        edited_surf_mesh = apply_deformation_field(
+                            surf_mesh,
+                            deformation_field["centers"],
+                            deformation_field["directions"],
+                            deformation_field["sigmas"],
+                            deformation_field["scales"],
+                            ramp_power=edit_ramp_power,
+                        )
+                        edited_vol_mesh = apply_deformation_field(
+                            vol_mesh,
+                            deformation_field["centers"],
+                            deformation_field["directions"],
+                            deformation_field["sigmas"],
+                            deformation_field["scales"],
+                            ramp_power=edit_ramp_power,
+                        )
+                        surf_changed_w, surf_unchanged_w, surf_edit_disp_map = build_displacement_targets(
+                            surf_mesh,
+                            edited_surf_mesh,
+                        )
+                        vol_changed_w, vol_unchanged_w, vol_edit_disp_map = build_displacement_targets(
+                            vol_mesh,
+                            edited_vol_mesh,
+                        )
                     prep_t1 = default_timer()
 
                     if should_run_periodic_check(batch_idx, train_edit_check_interval):
@@ -1134,148 +1210,235 @@ def main(cfg: DictConfig):
                             continue
 
                     with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=amp):
-                        if local_edit_enabled:
-                            geo_pair = torch.cat([geo_mesh, edited_geo], dim=0)
-                            surf_pair = torch.cat([surf_mesh, edited_surf_mesh], dim=0)
-                            vol_pair = torch.cat([vol_mesh, edited_vol_mesh], dim=0)
-                            params_pair = duplicate_batch(params)
+                        geo_pair = torch.cat([geo_mesh, edited_geo], dim=0)
+                        surf_pair = torch.cat([surf_mesh, edited_surf_mesh], dim=0)
+                        vol_pair = torch.cat([vol_mesh, edited_vol_mesh], dim=0)
+                        params_pair = duplicate_batch(params)
 
-                            y_pair_surf, y_pair_vol, aux_pair = train_model(
-                                geo_pair,
-                                surf_pair,
-                                vol_pair,
-                                params_pair,
-                                return_aux=True,
-                            )
+                        y_pair_surf, y_pair_vol, aux_pair = train_model(
+                            geo_pair,
+                            surf_pair,
+                            vol_pair,
+                            params_pair,
+                            return_aux=True,
+                        )
 
-                            pair_batch = int(geo_mesh.shape[0])
-                            y_orig_surf, y_edit_surf = y_pair_surf.split(pair_batch, dim=0)
-                            y_orig_vol, y_edit_vol = y_pair_vol.split(pair_batch, dim=0)
-                            aux_orig, aux_edit = split_aux_batch(aux_pair, pair_batch)
-                        else:
-                            y_orig_surf, y_orig_vol, aux_orig = train_model(
-                                geo_mesh,
-                                surf_mesh,
-                                vol_mesh,
-                                params,
-                                return_aux=True,
-                            )
-                            y_edit_surf = y_orig_surf
-                            y_edit_vol = y_orig_vol
-                            aux_edit = aux_orig
-                            aux_pair = aux_orig
+                        pair_batch = int(geo_mesh.shape[0])
+                        y_orig_surf, y_edit_surf = y_pair_surf.split(pair_batch, dim=0)
+                        y_orig_vol, y_edit_vol = y_pair_vol.split(pair_batch, dim=0)
+                        aux_orig, aux_edit = split_aux_batch(aux_pair, pair_batch)
 
                         y_orig_surf_f = y_orig_surf.float()
                         y_orig_vol_f = y_orig_vol.float()
                         y_edit_surf_f = y_edit_surf.float()
                         y_edit_vol_f = y_edit_vol.float()
 
-                        loss_supervised = (
+                        loss_supervised_main = (
                             combined_loss_fn(y_orig_surf_f, y_orig_vol_f, surf_data, vol_data)
                             if use_surface_supervision
                             else loss_fn(y_orig_vol_f, vol_data)
                         )
+                        loss_supervised_main = ensure_scalar_tensor(loss_supervised_main)
+                        loss_supervised = ensure_scalar_tensor(loss_supervised_main)
 
-                        stability_loss = y_orig_vol_f.new_zeros(())
-                        stability_surface = y_orig_vol_f.new_zeros(())
-                        stability_volume = y_orig_vol_f.new_zeros(())
-                        if use_surface_supervision:
-                            stability_surface = masked_smooth_l1(
-                                y_edit_surf_f,
-                                y_orig_surf_f.detach(),
-                                surf_unchanged_w,
-                                beta=loss_beta,
-                            )
-                            stability_loss = stability_loss + stability_surface
-                        stability_volume = masked_smooth_l1(
-                            y_edit_vol_f,
-                            y_orig_vol_f.detach(),
-                            vol_unchanged_w,
-                            beta=loss_beta,
+                        surf_response_map = (
+                            pointwise_response_norm(y_edit_surf_f, y_orig_surf_f.detach())
+                            if use_surface_supervision else surf_mesh.new_zeros(surf_mesh.shape[0], surf_mesh.shape[1], 1)
                         )
-                        stability_loss = stability_loss + stability_volume
+                        vol_response_map = pointwise_response_norm(y_edit_vol_f, y_orig_vol_f.detach())
+                        surf_base_response_map = (
+                            pointwise_response_norm(
+                                aux_edit["surface_base"].detach().float(),
+                                aux_orig["surface_base"].detach().float(),
+                            )
+                            if use_surface_supervision else surf_mesh.new_zeros(surf_mesh.shape[0], surf_mesh.shape[1], 1)
+                        )
+                        vol_base_response_map = pointwise_response_norm(
+                            aux_edit["volume_base"].detach().float(),
+                            aux_orig["volume_base"].detach().float(),
+                        )
+                        surf_adapter_response_map = (
+                            pointwise_response_norm(
+                                aux_edit["surface_residual"].float(),
+                                aux_orig["surface_residual"].detach().float(),
+                            )
+                            if use_surface_supervision else surf_mesh.new_zeros(surf_mesh.shape[0], surf_mesh.shape[1], 1)
+                        )
+                        vol_adapter_response_map = pointwise_response_norm(
+                            aux_edit["volume_residual"].float(),
+                            aux_orig["volume_residual"].detach().float(),
+                        )
+                        surf_residual_norm_map = (
+                            pointwise_feature_norm(aux_edit["surface_residual"].float())
+                            if use_surface_supervision else surf_mesh.new_zeros(surf_mesh.shape[0], surf_mesh.shape[1], 1)
+                        )
+                        vol_residual_norm_map = pointwise_feature_norm(aux_edit["volume_residual"].float())
 
                         changed_support_mass_surface = (
                             masked_mean(aux_edit["surface_support_mass"].float(), surf_changed_w)
                             if use_surface_supervision else y_orig_vol_f.new_zeros(())
                         )
+                        changed_support_mass_surface = ensure_scalar_tensor(changed_support_mass_surface)
                         changed_support_mass_volume = masked_mean(aux_edit["volume_support_mass"].float(), vol_changed_w)
+                        changed_support_mass_volume = ensure_scalar_tensor(changed_support_mass_volume)
                         unchanged_support_mass_surface = (
                             masked_mean(aux_edit["surface_support_mass"].float(), surf_unchanged_w)
                             if use_surface_supervision else y_orig_vol_f.new_zeros(())
                         )
+                        unchanged_support_mass_surface = ensure_scalar_tensor(unchanged_support_mass_surface)
                         unchanged_support_mass_volume = masked_mean(aux_edit["volume_support_mass"].float(), vol_unchanged_w)
+                        unchanged_support_mass_volume = ensure_scalar_tensor(unchanged_support_mass_volume)
                         changed_response_surface = (
-                            masked_response_norm(y_edit_surf_f, y_orig_surf_f.detach(), surf_changed_w)
+                            masked_mean(surf_response_map, surf_changed_w)
                             if use_surface_supervision else y_orig_vol_f.new_zeros(())
                         )
-                        changed_response_volume = masked_response_norm(y_edit_vol_f, y_orig_vol_f.detach(), vol_changed_w)
+                        changed_response_surface = ensure_scalar_tensor(changed_response_surface)
+                        changed_response_volume = masked_mean(vol_response_map, vol_changed_w)
+                        changed_response_volume = ensure_scalar_tensor(changed_response_volume)
                         unchanged_response_surface = (
-                            masked_response_norm(y_edit_surf_f, y_orig_surf_f.detach(), surf_unchanged_w)
+                            masked_mean(surf_response_map, surf_unchanged_w)
                             if use_surface_supervision else y_orig_vol_f.new_zeros(())
                         )
-                        unchanged_response_volume = masked_response_norm(y_edit_vol_f, y_orig_vol_f.detach(), vol_unchanged_w)
-
+                        unchanged_response_surface = ensure_scalar_tensor(unchanged_response_surface)
+                        unchanged_response_volume = masked_mean(vol_response_map, vol_unchanged_w)
+                        unchanged_response_volume = ensure_scalar_tensor(unchanged_response_volume)
+                        changed_residual_surface = (
+                            masked_mean(surf_residual_norm_map, surf_changed_w)
+                            if use_surface_supervision else y_orig_vol_f.new_zeros(())
+                        )
+                        changed_residual_surface = ensure_scalar_tensor(changed_residual_surface)
+                        changed_residual_volume = ensure_scalar_tensor(masked_mean(vol_residual_norm_map, vol_changed_w))
+                        unchanged_residual_surface = (
+                            masked_mean(surf_residual_norm_map, surf_unchanged_w)
+                            if use_surface_supervision else y_orig_vol_f.new_zeros(())
+                        )
+                        unchanged_residual_surface = ensure_scalar_tensor(unchanged_residual_surface)
+                        unchanged_residual_volume = ensure_scalar_tensor(masked_mean(vol_residual_norm_map, vol_unchanged_w))
+                        changed_base_response_surface = (
+                            masked_mean(surf_base_response_map, surf_changed_w)
+                            if use_surface_supervision else y_orig_vol_f.new_zeros(())
+                        )
+                        changed_base_response_surface = ensure_scalar_tensor(changed_base_response_surface)
+                        changed_base_response_volume = masked_mean(vol_base_response_map, vol_changed_w)
+                        changed_base_response_volume = ensure_scalar_tensor(changed_base_response_volume)
+                        unchanged_base_response_surface = (
+                            masked_mean(surf_base_response_map, surf_unchanged_w)
+                            if use_surface_supervision else y_orig_vol_f.new_zeros(())
+                        )
+                        unchanged_base_response_surface = ensure_scalar_tensor(unchanged_base_response_surface)
+                        unchanged_base_response_volume = masked_mean(vol_base_response_map, vol_unchanged_w)
+                        unchanged_base_response_volume = ensure_scalar_tensor(unchanged_base_response_volume)
                         ghost_loss = y_orig_vol_f.new_zeros(())
                         ghost_surface = y_orig_vol_f.new_zeros(())
                         ghost_volume = y_orig_vol_f.new_zeros(())
                         if ghost_weight > 0.0:
-                            # Penalize prediction-change spillover outside the edited locality.
                             if use_surface_supervision:
-                                ghost_surface = relative_locality_penalty(
-                                    unchanged_response_surface,
-                                    changed_response_surface,
-                                    target_ratio=ghost_target_ratio,
+                                surface_response_focus = locality_focus_loss(
+                                    surf_adapter_response_map,
+                                    surf_changed_w,
                                 )
-                                if ghost_absolute_weight > 0.0:
-                                    ghost_surface = ghost_surface + ghost_absolute_weight * unchanged_response_surface
-                                ghost_loss = ghost_loss + ghost_surface
-                            ghost_volume = relative_locality_penalty(
-                                unchanged_response_volume,
-                                changed_response_volume,
-                                target_ratio=ghost_target_ratio,
+                                surface_response_separation = locality_separation_loss(
+                                    surf_adapter_response_map,
+                                    surf_changed_w,
+                                    surf_unchanged_w,
+                                )
+                                ghost_surface = 0.5 * (surface_response_focus + surface_response_separation)
+                                ghost_surface = ensure_scalar_tensor(ghost_surface)
+                            volume_response_focus = locality_focus_loss(
+                                vol_adapter_response_map,
+                                vol_changed_w,
                             )
-                            if ghost_absolute_weight > 0.0:
-                                ghost_volume = ghost_volume + ghost_absolute_weight * unchanged_response_volume
-                            ghost_loss = ghost_loss + ghost_volume
-
-                        high_sparsity_loss = y_orig_vol_f.new_zeros(())
-                        if high_sparsity_weight > 0.0:
+                            volume_response_separation = locality_separation_loss(
+                                vol_adapter_response_map,
+                                vol_changed_w,
+                                vol_unchanged_w,
+                            )
+                            ghost_volume = 0.5 * (volume_response_focus + volume_response_separation)
+                            ghost_volume = ensure_scalar_tensor(ghost_volume)
+                            ghost_terms = [ghost_volume]
                             if use_surface_supervision:
-                                high_sparsity_loss = high_sparsity_loss + 0.5 * (
-                                    masked_group_sparsity(aux_orig["surface_high"], None)
-                                    + masked_group_sparsity(aux_edit["surface_high"], None)
+                                ghost_terms.insert(0, ghost_surface)
+                            ghost_loss = sum(ghost_terms) / float(len(ghost_terms))
+                        ghost_loss = ensure_scalar_tensor(ghost_loss)
+
+                        reliability_loss = y_orig_vol_f.new_zeros(())
+                        reliability_surface = y_orig_vol_f.new_zeros(())
+                        reliability_volume = y_orig_vol_f.new_zeros(())
+                        if reliability_weight_epoch > 0.0:
+                            if use_surface_supervision:
+                                reliability_surface = 0.5 * (
+                                    reliability_map_loss(
+                                        aux_edit["surface_support_mass"].float(),
+                                        surf_changed_w,
+                                        surf_unchanged_w,
+                                    )
+                                    + reliability_map_loss(
+                                        aux_edit["surface_evidence_mass"].float(),
+                                        surf_changed_w,
+                                        surf_unchanged_w,
+                                    )
                                 )
-                            high_sparsity_loss = high_sparsity_loss + 0.5 * (
-                                masked_group_sparsity(aux_orig["volume_high"], None)
-                                + masked_group_sparsity(aux_edit["volume_high"], None)
+                                reliability_surface = ensure_scalar_tensor(reliability_surface)
+                            reliability_volume = 0.5 * (
+                                reliability_map_loss(
+                                    aux_edit["volume_support_mass"].float(),
+                                    vol_changed_w,
+                                    vol_unchanged_w,
+                                )
+                                + reliability_map_loss(
+                                    aux_edit["volume_evidence_mass"].float(),
+                                    vol_changed_w,
+                                    vol_unchanged_w,
+                                )
                             )
+                            reliability_volume = ensure_scalar_tensor(reliability_volume)
+                            reliability_terms = [reliability_volume]
+                            if use_surface_supervision:
+                                reliability_terms.insert(0, reliability_surface)
+                            reliability_loss = sum(reliability_terms) / float(len(reliability_terms))
+                        reliability_loss = ensure_scalar_tensor(reliability_loss)
 
-                        collapse_support_penalty = y_orig_vol_f.new_zeros(())
-                        if collapse_support_weight > 0.0:
-                            collapse_support_penalty = F.relu(
-                                y_orig_vol_f.new_tensor(collapse_support_target)
-                                - mean_aux_scalar_pair(aux_orig, aux_edit, "mean_support_mass").to(device=device)
+                        changed_edit_displacement_surface = (
+                            masked_mean(
+                                surf_edit_disp_map,
+                                surf_changed_w,
                             )
+                            if use_surface_supervision else y_orig_vol_f.new_zeros(())
+                        )
+                        changed_edit_displacement_surface = ensure_scalar_tensor(changed_edit_displacement_surface)
+                        changed_edit_displacement_volume = masked_mean(
+                            vol_edit_disp_map,
+                            vol_changed_w,
+                        )
+                        changed_edit_displacement_volume = ensure_scalar_tensor(changed_edit_displacement_volume)
 
-                        collapse_evidence_penalty = y_orig_vol_f.new_zeros(())
-                        if collapse_evidence_weight > 0.0:
-                            collapse_evidence_penalty = F.relu(
-                                y_orig_vol_f.new_tensor(collapse_evidence_target)
-                                - mean_aux_scalar_pair(aux_orig, aux_edit, "mean_evidence_gate").to(device=device)
-                            )
-
-                        collapse_entropy_penalty = y_orig_vol_f.new_zeros(())
-                        if collapse_entropy_weight > 0.0:
-                            collapse_entropy_penalty = F.relu(
-                                mean_aux_scalar_pair(aux_orig, aux_edit, "mean_route_entropy").to(device=device)
-                                - y_orig_vol_f.new_tensor(collapse_entropy_target)
-                            )
-
-                        collapse_prevention_loss = (
-                            collapse_support_weight * collapse_support_penalty
-                            + collapse_evidence_weight * collapse_evidence_penalty
-                            + collapse_entropy_weight * collapse_entropy_penalty
+                        mean_support_mass_value = aux_query_mean(
+                            aux_pair,
+                            "surface_support_mass",
+                            "volume_support_mass",
+                        )
+                        mean_route_confidence_value = aux_query_mean(
+                            aux_pair,
+                            "surface_route_confidence",
+                            "volume_route_confidence",
+                        )
+                        mean_route_entropy_value = aux_query_mean(
+                            aux_pair,
+                            "surface_route_entropy",
+                            "volume_route_entropy",
+                        )
+                        mean_evidence_gate_value = aux_query_mean(
+                            aux_pair,
+                            "surface_evidence_mass",
+                            "volume_evidence_mass",
+                        )
+                        mean_raw_evidence_gate_value = aux_query_mean(
+                            aux_pair,
+                            "surface_raw_evidence_gate",
+                            "volume_raw_evidence_gate",
+                        )
+                        mean_route_spread_value = ensure_scalar_tensor(
+                            aux_pair.get("mean_route_spread", y_orig_vol_f.new_zeros(()))
                         )
 
                         with torch.no_grad():
@@ -1283,34 +1446,16 @@ def main(cfg: DictConfig):
                                 masked_mean(aux_edit["surface_evidence_mass"].float(), surf_changed_w)
                                 if use_surface_supervision else y_orig_vol_f.new_zeros(())
                             )
+                            changed_evidence_mass_surface = ensure_scalar_tensor(changed_evidence_mass_surface)
                             changed_evidence_mass_volume = masked_mean(aux_edit["volume_evidence_mass"].float(), vol_changed_w)
+                            changed_evidence_mass_volume = ensure_scalar_tensor(changed_evidence_mass_volume)
                             unchanged_evidence_mass_surface = (
                                 masked_mean(aux_edit["surface_evidence_mass"].float(), surf_unchanged_w)
                                 if use_surface_supervision else y_orig_vol_f.new_zeros(())
                             )
+                            unchanged_evidence_mass_surface = ensure_scalar_tensor(unchanged_evidence_mass_surface)
                             unchanged_evidence_mass_volume = masked_mean(aux_edit["volume_evidence_mass"].float(), vol_unchanged_w)
-
-                            changed_route_confidence_surface = (
-                                masked_mean(aux_edit["surface_route_confidence"].float(), surf_changed_w)
-                                if use_surface_supervision else y_orig_vol_f.new_zeros(())
-                            )
-                            changed_route_confidence_volume = masked_mean(aux_edit["volume_route_confidence"].float(), vol_changed_w)
-                            unchanged_route_confidence_surface = (
-                                masked_mean(aux_edit["surface_route_confidence"].float(), surf_unchanged_w)
-                                if use_surface_supervision else y_orig_vol_f.new_zeros(())
-                            )
-                            unchanged_route_confidence_volume = masked_mean(aux_edit["volume_route_confidence"].float(), vol_unchanged_w)
-
-                            changed_route_entropy_surface = (
-                                masked_mean(aux_edit["surface_route_entropy"].float(), surf_changed_w)
-                                if use_surface_supervision else y_orig_vol_f.new_zeros(())
-                            )
-                            changed_route_entropy_volume = masked_mean(aux_edit["volume_route_entropy"].float(), vol_changed_w)
-                            unchanged_route_entropy_surface = (
-                                masked_mean(aux_edit["surface_route_entropy"].float(), surf_unchanged_w)
-                                if use_surface_supervision else y_orig_vol_f.new_zeros(())
-                            )
-                            unchanged_route_entropy_volume = masked_mean(aux_edit["volume_route_entropy"].float(), vol_unchanged_w)
+                            unchanged_evidence_mass_volume = ensure_scalar_tensor(unchanged_evidence_mass_volume)
 
                         forward_t1 = default_timer()
 
@@ -1323,9 +1468,8 @@ def main(cfg: DictConfig):
                                 "y_edit_vol": y_edit_vol,
                                 "aux_pair": aux_pair,
                                 "loss_supervised": loss_supervised,
-                                "stability_loss": stability_loss,
                                 "ghost_loss": ghost_loss,
-                                "high_sparsity_loss": high_sparsity_loss,
+                                "reliability_loss": reliability_loss,
                             },
                             max_entries=6,
                         )
@@ -1342,65 +1486,11 @@ def main(cfg: DictConfig):
                             cleanup_after_invalid_step(optimizer, clear_cache=nonfinite_clear_cache)
                             continue
 
-                    loss_terms = OrderedDict(
-                        [
-                            ("supervised", loss_supervised),
-                            ("stability", stability_loss),
-                            ("ghost", ghost_loss),
-                            ("high_sparsity", high_sparsity_loss),
-                        ]
-                    )
-                    loss_base_weights = OrderedDict(
-                        [
-                            ("supervised", supervised_weight),
-                            ("stability", stability_weight),
-                            ("ghost", ghost_weight),
-                            ("high_sparsity", high_sparsity_weight),
-                        ]
-                    )
-                    current_loss_values = {
-                        name: float(term.detach().float().abs().item())
-                        for name, term in loss_terms.items()
+                    loss_terms = {
+                        "loss_supervised": loss_supervised,
+                        "loss_ghost": ghost_loss,
+                        "loss_reliability": reliability_loss,
                     }
-                    for name, value in current_loss_values.items():
-                        epoch_loss_term_sums[name] += value
-                    epoch_loss_term_count += 1
-
-                    if dynamic_loss_reweight_enabled and ep == 0 and global_step < dynamic_loss_reweight_start_steps:
-                        dynamic_loss_start_ema = update_ema_dict(
-                            dynamic_loss_start_ema,
-                            current_loss_values,
-                            dynamic_loss_reweight_momentum,
-                        )
-                        dynamic_loss_scales = calibrate_normalized_loss_scales(
-                            dynamic_loss_start_ema,
-                            loss_base_weights,
-                            min_scale=dynamic_loss_reweight_min_scale,
-                            max_scale=dynamic_loss_reweight_max_scale,
-                        )
-                        if run is not None and (global_step == 0 or global_step + 1 == dynamic_loss_reweight_start_steps):
-                            print(f"[DARM] dynamic loss scales at start: {dynamic_loss_scales}")
-                            wandb.log({f"dynamic_loss_scale/{name}": scale for name, scale in dynamic_loss_scales.items()}, step=global_step)
-
-                    if loss_balance_enabled and global_step < loss_balance_steps:
-                        loss_balance_ema = update_ema_dict(loss_balance_ema, current_loss_values, loss_balance_ema_momentum)
-                        ema_terms = {
-                            name: torch.tensor(value, device=device, dtype=torch.float32)
-                            for name, value in loss_balance_ema.items()
-                        }
-                        loss_balance_scales = calibrate_loss_scales(
-                            ema_terms,
-                            loss_base_weights,
-                            reference_name=loss_balance_reference,
-                            min_scale=loss_balance_min_scale,
-                            max_scale=loss_balance_max_scale,
-                        )
-                        if run is not None and (global_step == loss_balance_steps - 1 or global_step == 0):
-                            print(f"[DARM] calibrated loss scales: {loss_balance_scales}")
-                            wandb.log({f"loss_scale/{name}": scale for name, scale in loss_balance_scales.items()}, step=global_step)
-                    elif loss_balance_scales is None:
-                        loss_balance_scales = {name: 1.0 for name in loss_terms}
-
                     loss_term_problems = find_non_finite_problems(loss_terms, max_entries=6)
                     if loss_term_problems:
                         epoch_nonfinite_batches += 1
@@ -1415,14 +1505,44 @@ def main(cfg: DictConfig):
                         cleanup_after_invalid_step(optimizer, clear_cache=nonfinite_clear_cache)
                         continue
 
-                    combined_loss_scales = {name: 1.0 for name in loss_terms}
-                    for name in combined_loss_scales:
-                        combined_loss_scales[name] *= float(loss_balance_scales.get(name, 1.0))
-                        if dynamic_loss_scales is not None:
-                            combined_loss_scales[name] *= float(dynamic_loss_scales.get(name, 1.0))
+                    if should_reweight_epoch(ep, loss_reweight_epochs, loss_reweight_interval_epochs) and ep not in loss_reweight_done_epochs:
+                        current_loss_values = {
+                            name: float(term.detach().float().abs().item())
+                            for name, term in loss_terms.items()
+                        }
+                        for name, value in current_loss_values.items():
+                            reweight_accum[name] += value
+                        reweight_steps += 1
+                        averaged_loss_values = {
+                            name: reweight_accum[name] / float(max(reweight_steps, 1))
+                            for name in current_loss_values
+                        }
+                        loss_weight_scales = normalized_loss_scales(
+                            averaged_loss_values,
+                            base_loss_weights,
+                            reference_name=loss_reweight_reference,
+                            min_scale=loss_reweight_min_scale,
+                            max_scale=loss_reweight_max_scale,
+                            target_multipliers=target_loss_multipliers,
+                        )
+                        if reweight_steps >= loss_reweight_batches or batch_idx == len(train_loader) - 1:
+                            loss_reweight_done_epochs.add(ep)
+                            print(
+                                f"[DARM] epoch={ep + 1}: normalized loss scales over "
+                                f"{reweight_steps} calibration batches -> {loss_weight_scales}"
+                            )
+                            if run is not None:
+                                wandb.log(
+                                    {f"loss_scale/{name}": scale for name, scale in loss_weight_scales.items()},
+                                    step=global_step,
+                                )
 
-                    loss = weighted_loss_sum(loss_terms, loss_base_weights, combined_loss_scales)
-                    loss = loss + collapse_prevention_loss
+                    loss = (
+                        (supervised_weight * loss_weight_scales["loss_supervised"]) * loss_supervised
+                        + (ghost_weight * loss_weight_scales["loss_ghost"]) * ghost_loss
+                        + (reliability_weight_epoch * loss_weight_scales["loss_reliability"]) * reliability_loss
+                    )
+                    loss = ensure_scalar_tensor(loss)
 
                     if not torch.isfinite(loss):
                         epoch_nonfinite_batches += 1
@@ -1450,8 +1570,6 @@ def main(cfg: DictConfig):
                                 cleanup_after_invalid_step(optimizer, clear_cache=nonfinite_clear_cache)
                                 scaler.update()
                                 continue
-                        if backbone_trainable and backbone_grad_scale < 1.0:
-                            scale_backbone_gradients(model, backbone_grad_scale)
                         if gradient_norm is not None:
                             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
                         scaler.step(optimizer)
@@ -1474,8 +1592,6 @@ def main(cfg: DictConfig):
                                     raise RuntimeError("Encountered non-finite gradients during training.")
                                 cleanup_after_invalid_step(optimizer, clear_cache=nonfinite_clear_cache)
                                 continue
-                        if backbone_trainable and backbone_grad_scale < 1.0:
-                            scale_backbone_gradients(model, backbone_grad_scale)
                         if gradient_norm is not None:
                             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
                         optimizer.step()
@@ -1486,48 +1602,25 @@ def main(cfg: DictConfig):
                     batch_size_float = float(batch_size)
                     train_sample_count += batch_size
                     train_losses["loss"] += loss.detach().float() * batch_size_float
-                    train_losses["loss_supervised"] += loss_supervised.detach().float() * batch_size_float
-                    train_losses["loss_stability"] += stability_loss.detach().float() * batch_size_float
+                    train_losses["loss_supervised"] += loss_supervised_main.detach().float() * batch_size_float
                     train_losses["loss_ghost"] += ghost_loss.detach().float() * batch_size_float
-                    train_losses["loss_high_sparsity"] += high_sparsity_loss.detach().float() * batch_size_float
-                    train_losses["loss_collapse_prevention"] += collapse_prevention_loss.detach().float() * batch_size_float
-                    train_losses["loss_collapse_support"] += collapse_support_penalty.detach().float() * batch_size_float
-                    train_losses["loss_collapse_evidence"] += collapse_evidence_penalty.detach().float() * batch_size_float
-                    train_losses["loss_collapse_entropy"] += collapse_entropy_penalty.detach().float() * batch_size_float
-                    train_losses["loss_stability_surface"] += stability_surface.detach().float() * batch_size_float
-                    train_losses["loss_stability_volume"] += stability_volume.detach().float() * batch_size_float
+                    train_losses["loss_reliability"] += reliability_loss.detach().float() * batch_size_float
                     train_losses["loss_ghost_surface"] += ghost_surface.detach().float() * batch_size_float
                     train_losses["loss_ghost_volume"] += ghost_volume.detach().float() * batch_size_float
-                    mean_support_mass_orig = aux_scalar_mean(aux_orig, "mean_support_mass").detach()
-                    mean_support_mass_edit = aux_scalar_mean(aux_edit, "mean_support_mass").detach()
-                    mean_support_mass = 0.5 * (mean_support_mass_orig + mean_support_mass_edit)
-                    mean_route_confidence_orig = aux_scalar_mean(aux_orig, "mean_route_confidence").detach()
-                    mean_route_confidence_edit = aux_scalar_mean(aux_edit, "mean_route_confidence").detach()
-                    mean_route_confidence = 0.5 * (mean_route_confidence_orig + mean_route_confidence_edit)
-                    mean_route_entropy_orig = aux_scalar_mean(aux_orig, "mean_route_entropy").detach()
-                    mean_route_entropy_edit = aux_scalar_mean(aux_edit, "mean_route_entropy").detach()
-                    mean_route_entropy = 0.5 * (mean_route_entropy_orig + mean_route_entropy_edit)
-                    mean_evidence_gate_orig = aux_scalar_mean(aux_orig, "mean_evidence_gate").detach()
-                    mean_evidence_gate_edit = aux_scalar_mean(aux_edit, "mean_evidence_gate").detach()
-                    mean_evidence_gate = 0.5 * (mean_evidence_gate_orig + mean_evidence_gate_edit)
-                    mean_raw_evidence_gate_orig = aux_scalar_mean(aux_orig, "mean_raw_evidence_gate").detach()
-                    mean_raw_evidence_gate_edit = aux_scalar_mean(aux_edit, "mean_raw_evidence_gate").detach()
-                    mean_raw_evidence_gate = 0.5 * (mean_raw_evidence_gate_orig + mean_raw_evidence_gate_edit)
-                    train_losses["mean_support_mass_orig"] += mean_support_mass_orig * batch_size_float
-                    train_losses["mean_support_mass_edit"] += mean_support_mass_edit * batch_size_float
+                    train_losses["loss_reliability_surface"] += reliability_surface.detach().float() * batch_size_float
+                    train_losses["loss_reliability_volume"] += reliability_volume.detach().float() * batch_size_float
+                    mean_support_mass = mean_support_mass_value.detach().float()
+                    mean_route_confidence = mean_route_confidence_value.detach().float()
+                    mean_route_entropy = mean_route_entropy_value.detach().float()
+                    mean_evidence_gate = mean_evidence_gate_value.detach().float()
+                    mean_raw_evidence_gate = mean_raw_evidence_gate_value.detach().float()
+                    mean_route_spread = mean_route_spread_value.detach().float()
                     train_losses["mean_support_mass"] += mean_support_mass * batch_size_float
-                    train_losses["mean_route_confidence_orig"] += mean_route_confidence_orig * batch_size_float
-                    train_losses["mean_route_confidence_edit"] += mean_route_confidence_edit * batch_size_float
                     train_losses["mean_route_confidence"] += mean_route_confidence * batch_size_float
-                    train_losses["mean_route_entropy_orig"] += mean_route_entropy_orig * batch_size_float
-                    train_losses["mean_route_entropy_edit"] += mean_route_entropy_edit * batch_size_float
                     train_losses["mean_route_entropy"] += mean_route_entropy * batch_size_float
-                    train_losses["mean_evidence_gate_orig"] += mean_evidence_gate_orig * batch_size_float
-                    train_losses["mean_evidence_gate_edit"] += mean_evidence_gate_edit * batch_size_float
                     train_losses["mean_evidence_gate"] += mean_evidence_gate * batch_size_float
-                    train_losses["mean_raw_evidence_gate_orig"] += mean_raw_evidence_gate_orig * batch_size_float
-                    train_losses["mean_raw_evidence_gate_edit"] += mean_raw_evidence_gate_edit * batch_size_float
                     train_losses["mean_raw_evidence_gate"] += mean_raw_evidence_gate * batch_size_float
+                    train_losses["mean_route_spread"] += mean_route_spread * batch_size_float
                     train_losses["changed_support_mass_surface"] += changed_support_mass_surface.detach().float() * batch_size_float
                     train_losses["changed_support_mass_volume"] += changed_support_mass_volume.detach().float() * batch_size_float
                     train_losses["unchanged_support_mass_surface"] += unchanged_support_mass_surface.detach().float() * batch_size_float
@@ -1536,22 +1629,30 @@ def main(cfg: DictConfig):
                     train_losses["changed_response_volume"] += changed_response_volume.detach().float() * batch_size_float
                     train_losses["unchanged_response_surface"] += unchanged_response_surface.detach().float() * batch_size_float
                     train_losses["unchanged_response_volume"] += unchanged_response_volume.detach().float() * batch_size_float
+                    train_losses["changed_residual_surface"] += changed_residual_surface.detach().float() * batch_size_float
+                    train_losses["changed_residual_volume"] += changed_residual_volume.detach().float() * batch_size_float
+                    train_losses["unchanged_residual_surface"] += unchanged_residual_surface.detach().float() * batch_size_float
+                    train_losses["unchanged_residual_volume"] += unchanged_residual_volume.detach().float() * batch_size_float
+                    train_losses["changed_base_response_surface"] += changed_base_response_surface.detach().float() * batch_size_float
+                    train_losses["changed_base_response_volume"] += changed_base_response_volume.detach().float() * batch_size_float
+                    train_losses["unchanged_base_response_surface"] += unchanged_base_response_surface.detach().float() * batch_size_float
+                    train_losses["unchanged_base_response_volume"] += unchanged_base_response_volume.detach().float() * batch_size_float
                     train_losses["changed_evidence_mass_surface"] += changed_evidence_mass_surface.detach().float() * batch_size_float
                     train_losses["changed_evidence_mass_volume"] += changed_evidence_mass_volume.detach().float() * batch_size_float
                     train_losses["unchanged_evidence_mass_surface"] += unchanged_evidence_mass_surface.detach().float() * batch_size_float
                     train_losses["unchanged_evidence_mass_volume"] += unchanged_evidence_mass_volume.detach().float() * batch_size_float
-                    train_losses["changed_route_confidence_surface"] += changed_route_confidence_surface.detach().float() * batch_size_float
-                    train_losses["changed_route_confidence_volume"] += changed_route_confidence_volume.detach().float() * batch_size_float
-                    train_losses["unchanged_route_confidence_surface"] += unchanged_route_confidence_surface.detach().float() * batch_size_float
-                    train_losses["unchanged_route_confidence_volume"] += unchanged_route_confidence_volume.detach().float() * batch_size_float
-                    train_losses["changed_route_entropy_surface"] += changed_route_entropy_surface.detach().float() * batch_size_float
-                    train_losses["changed_route_entropy_volume"] += changed_route_entropy_volume.detach().float() * batch_size_float
-                    train_losses["unchanged_route_entropy_surface"] += unchanged_route_entropy_surface.detach().float() * batch_size_float
-                    train_losses["unchanged_route_entropy_volume"] += unchanged_route_entropy_volume.detach().float() * batch_size_float
+                    train_losses["changed_edit_displacement_surface"] += changed_edit_displacement_surface.detach().float() * batch_size_float
+                    train_losses["changed_edit_displacement_volume"] += changed_edit_displacement_volume.detach().float() * batch_size_float
 
                     with torch.no_grad():
-                        surface_loss = rel_l2_loss_fn(y_orig_surf_f, surf_data) if use_surface_supervision else torch.tensor(0.0, device=device)
+                        surface_loss = (
+                            rel_l2_loss_fn(y_orig_surf_f, surf_data)
+                            if use_surface_supervision
+                            else torch.tensor(0.0, device=device)
+                        )
                         volume_loss = rel_l2_loss_fn(y_orig_vol_f, vol_data)
+                        surface_loss = ensure_scalar_tensor(surface_loss)
+                        volume_loss = ensure_scalar_tensor(volume_loss)
                         train_losses["rel_l2_surf"] += surface_loss.detach().float() * batch_size_float
                         train_losses["rel_l2_vol"] += volume_loss.detach().float() * batch_size_float
                         train_losses["rel_l2"] += (surface_loss + volume_loss).detach().float() * batch_size_float
@@ -1564,7 +1665,10 @@ def main(cfg: DictConfig):
                                         pred_surf_train[..., channel_idx:channel_idx + 1],
                                         gt_surf_train[..., channel_idx:channel_idx + 1],
                                     )
-                                    train_losses[f"rel_l2_surf_{field_name}"] += channel_loss.detach().float() * batch_size_float
+                                    channel_loss = ensure_scalar_tensor(channel_loss)
+                                    train_losses[f"rel_l2_surf_{field_name}"] += (
+                                        channel_loss.detach().float() * batch_size_float
+                                    )
                             pred_vol_train = y_orig_vol_f * std_vol + mean_vol
                             gt_vol_train = vol_data * std_vol + mean_vol
                             for channel_idx, field_name in enumerate(fields["volume"]):
@@ -1572,7 +1676,10 @@ def main(cfg: DictConfig):
                                     pred_vol_train[..., channel_idx:channel_idx + 1],
                                     gt_vol_train[..., channel_idx:channel_idx + 1],
                                 )
-                                train_losses[f"rel_l2_vol_{field_name}"] += channel_loss.detach().float() * batch_size_float
+                                channel_loss = ensure_scalar_tensor(channel_loss)
+                                train_losses[f"rel_l2_vol_{field_name}"] += (
+                                    channel_loss.detach().float() * batch_size_float
+                                )
 
                     global_step += 1
                     if run is not None and log_every_n_steps > 0 and (
@@ -1581,33 +1688,19 @@ def main(cfg: DictConfig):
                         wandb.log(
                             {
                                 "train/batch_loss": float(loss.item()),
-                                "train/batch_supervised": float(loss_supervised.item()),
-                                "train/batch_stability": float(stability_loss.item()),
+                                "train/batch_supervised": float(loss_supervised_main.item()),
                                 "train/batch_ghost": float(ghost_loss.item()),
-                                "train/batch_high_sparsity": float(high_sparsity_loss.item()),
-                                "train/batch_collapse_prevention": float(collapse_prevention_loss.item()),
-                                "train/batch_collapse_support": float(collapse_support_penalty.item()),
-                                "train/batch_collapse_evidence": float(collapse_evidence_penalty.item()),
-                                "train/batch_collapse_entropy": float(collapse_entropy_penalty.item()),
-                                "train/batch_stability_surface": float(stability_surface.item()),
-                                "train/batch_stability_volume": float(stability_volume.item()),
+                                "train/batch_reliability": float(reliability_loss.item()),
                                 "train/batch_ghost_surface": float(ghost_surface.item()),
                                 "train/batch_ghost_volume": float(ghost_volume.item()),
-                                "train/batch_mean_support_mass_orig": float(mean_support_mass_orig.item()),
-                                "train/batch_mean_support_mass_edit": float(mean_support_mass_edit.item()),
+                                "train/batch_reliability_surface": float(reliability_surface.item()),
+                                "train/batch_reliability_volume": float(reliability_volume.item()),
                                 "train/batch_mean_support_mass": float(mean_support_mass.item()),
-                                "train/batch_mean_route_confidence_orig": float(mean_route_confidence_orig.item()),
-                                "train/batch_mean_route_confidence_edit": float(mean_route_confidence_edit.item()),
                                 "train/batch_mean_route_confidence": float(mean_route_confidence.item()),
-                                "train/batch_mean_route_entropy_orig": float(mean_route_entropy_orig.item()),
-                                "train/batch_mean_route_entropy_edit": float(mean_route_entropy_edit.item()),
                                 "train/batch_mean_route_entropy": float(mean_route_entropy.item()),
-                                "train/batch_mean_evidence_gate_orig": float(mean_evidence_gate_orig.item()),
-                                "train/batch_mean_evidence_gate_edit": float(mean_evidence_gate_edit.item()),
                                 "train/batch_mean_evidence_gate": float(mean_evidence_gate.item()),
-                                "train/batch_mean_raw_evidence_gate_orig": float(mean_raw_evidence_gate_orig.item()),
-                                "train/batch_mean_raw_evidence_gate_edit": float(mean_raw_evidence_gate_edit.item()),
                                 "train/batch_mean_raw_evidence_gate": float(mean_raw_evidence_gate.item()),
+                                "train/batch_mean_route_spread": float(mean_route_spread.item()),
                                 "train/batch_changed_support_mass_surface": float(changed_support_mass_surface.item()),
                                 "train/batch_changed_support_mass_volume": float(changed_support_mass_volume.item()),
                                 "train/batch_unchanged_support_mass_surface": float(unchanged_support_mass_surface.item()),
@@ -1616,20 +1709,25 @@ def main(cfg: DictConfig):
                                 "train/batch_changed_response_volume": float(changed_response_volume.item()),
                                 "train/batch_unchanged_response_surface": float(unchanged_response_surface.item()),
                                 "train/batch_unchanged_response_volume": float(unchanged_response_volume.item()),
+                                "train/batch_changed_residual_surface": float(changed_residual_surface.item()),
+                                "train/batch_changed_residual_volume": float(changed_residual_volume.item()),
+                                "train/batch_unchanged_residual_surface": float(unchanged_residual_surface.item()),
+                                "train/batch_unchanged_residual_volume": float(unchanged_residual_volume.item()),
+                                "train/batch_changed_base_response_surface": float(changed_base_response_surface.item()),
+                                "train/batch_changed_base_response_volume": float(changed_base_response_volume.item()),
+                                "train/batch_unchanged_base_response_surface": float(unchanged_base_response_surface.item()),
+                                "train/batch_unchanged_base_response_volume": float(unchanged_base_response_volume.item()),
                                 "train/batch_changed_evidence_mass_surface": float(changed_evidence_mass_surface.item()),
                                 "train/batch_changed_evidence_mass_volume": float(changed_evidence_mass_volume.item()),
                                 "train/batch_unchanged_evidence_mass_surface": float(unchanged_evidence_mass_surface.item()),
                                 "train/batch_unchanged_evidence_mass_volume": float(unchanged_evidence_mass_volume.item()),
-                                "train/batch_changed_route_confidence_surface": float(changed_route_confidence_surface.item()),
-                                "train/batch_changed_route_confidence_volume": float(changed_route_confidence_volume.item()),
-                                "train/batch_unchanged_route_confidence_surface": float(unchanged_route_confidence_surface.item()),
-                                "train/batch_unchanged_route_confidence_volume": float(unchanged_route_confidence_volume.item()),
-                                "train/batch_changed_route_entropy_surface": float(changed_route_entropy_surface.item()),
-                                "train/batch_changed_route_entropy_volume": float(changed_route_entropy_volume.item()),
-                                "train/batch_unchanged_route_entropy_surface": float(unchanged_route_entropy_surface.item()),
-                                "train/batch_unchanged_route_entropy_volume": float(unchanged_route_entropy_volume.item()),
-                                "train/stability_weight": stability_weight,
+                                "train/batch_changed_edit_displacement_surface": float(changed_edit_displacement_surface.item()),
+                                "train/batch_changed_edit_displacement_volume": float(changed_edit_displacement_volume.item()),
                                 "train/ghost_weight": ghost_weight,
+                                "train/reliability_weight": reliability_weight_epoch,
+                                "train/effective_supervised_weight": supervised_weight * loss_weight_scales["loss_supervised"],
+                                "train/effective_ghost_weight": ghost_weight * loss_weight_scales["loss_ghost"],
+                                "train/effective_reliability_weight": reliability_weight_epoch * loss_weight_scales["loss_reliability"],
                                 "lr": scheduler.get_last_lr()[0],
                                 "epoch": ep,
                             },
@@ -1660,12 +1758,9 @@ def main(cfg: DictConfig):
                     if oom_clear_cache:
                         cleanup_after_oom(optimizer)
                     free_gib = torch.cuda.mem_get_info(device=device)[0] / (1024 ** 3) if torch.cuda.is_available() else float("nan")
-                    current_forward_batch_size = (
-                        local_edit_forward_batch_size if local_edit_enabled else base_forward_batch_size
-                    )
                     print(
                         f"[OOM] epoch={ep + 1}/{config.epochs} batch={batch_idx + 1}/{len(train_loader)} "
-                        f"effective_forward_batch_size={current_forward_batch_size} "
+                        f"effective_forward_batch_size={local_edit_forward_batch_size} "
                         f"free_cuda_gib={free_gib:.2f} "
                         f"message={exc}"
                     )
@@ -1679,32 +1774,6 @@ def main(cfg: DictConfig):
 
             denom = max(int(train_sample_count), 1)
             train_losses_log = {key: float((value / float(denom)).detach().cpu().item()) for key, value in train_losses.items()}
-
-            if dynamic_loss_reweight_enabled and epoch_loss_term_count > 0 and (ep + 1) in dynamic_loss_reweight_epochs:
-                epoch_loss_averages = {
-                    name: value / float(epoch_loss_term_count)
-                    for name, value in epoch_loss_term_sums.items()
-                }
-                reweight_base_weights = OrderedDict(
-                    [
-                        ("supervised", supervised_weight),
-                        ("stability", stability_weight),
-                        ("ghost", ghost_weight),
-                        ("high_sparsity", high_sparsity_weight),
-                    ]
-                )
-                dynamic_loss_scales = calibrate_normalized_loss_scales(
-                    epoch_loss_averages,
-                    reweight_base_weights,
-                    min_scale=dynamic_loss_reweight_min_scale,
-                    max_scale=dynamic_loss_reweight_max_scale,
-                )
-                print(f"[DARM] dynamic loss scales after epoch {ep + 1}: {dynamic_loss_scales}")
-                if run is not None:
-                    wandb.log(
-                        {f"dynamic_loss_scale/{name}": scale for name, scale in dynamic_loss_scales.items()},
-                        step=global_step,
-                    )
 
             test_losses = evaluate_loader(
                 train_model,
@@ -1766,17 +1835,25 @@ def main(cfg: DictConfig):
             t2 = default_timer()
             print(
                 f"epoch: {ep}, t2-t1 (epoch time): {t2 - t1:.5f}, "
-                f"train loss: {train_losses_log['loss']:.5f}, test loss: {test_losses['loss']:.5f}, "
+                f"train total loss: {train_losses_log['loss']:.5f}, "
+                f"train supervised loss: {train_losses_log['loss_supervised']:.5f}, "
+                f"test supervised loss: {test_losses['loss']:.5f}, "
+                f"train rel_l2: {train_losses_log['rel_l2']:.5f}, "
+                f"test rel_l2: {test_losses['rel_l2']:.5f}, "
                 f"oom_batches: {epoch_oom_batches}, nonfinite_batches: {epoch_nonfinite_batches}"
             )
 
             if run is not None:
                 wandb_dict = {
                     "lr": scheduler.get_last_lr()[0],
-                    "train/stability_weight": stability_weight,
+                    "train/total_loss": train_losses_log["loss"],
+                    "train/supervised_loss": train_losses_log["loss_supervised"],
+                    "test/supervised_loss": test_losses["loss"],
                     "train/ghost_weight": ghost_weight,
-                    "train/ghost_target_ratio": ghost_target_ratio,
-                    "train/ghost_absolute_weight": ghost_absolute_weight,
+                    "train/reliability_weight": reliability_weight_epoch,
+                    "train/effective_supervised_weight": supervised_weight * loss_weight_scales["loss_supervised"],
+                    "train/effective_ghost_weight": ghost_weight * loss_weight_scales["loss_ghost"],
+                    "train/effective_reliability_weight": reliability_weight_epoch * loss_weight_scales["loss_reliability"],
                     "train/oom_batches_epoch": epoch_oom_batches,
                     "train/oom_batches_total": total_oom_batches,
                     "train/nonfinite_batches_epoch": epoch_nonfinite_batches,
@@ -1791,32 +1868,18 @@ def main(cfg: DictConfig):
                         "rel_l2_surf",
                         "rel_l2_vol",
                         "loss_supervised",
-                        "loss_stability",
                         "loss_ghost",
-                        "loss_high_sparsity",
-                        "loss_collapse_prevention",
-                        "loss_collapse_support",
-                        "loss_collapse_evidence",
-                        "loss_collapse_entropy",
-                        "loss_stability_surface",
-                        "loss_stability_volume",
+                        "loss_reliability",
                         "loss_ghost_surface",
                         "loss_ghost_volume",
-                        "mean_support_mass_orig",
-                        "mean_support_mass_edit",
+                        "loss_reliability_surface",
+                        "loss_reliability_volume",
                         "mean_support_mass",
-                        "mean_route_confidence_orig",
-                        "mean_route_confidence_edit",
                         "mean_route_confidence",
-                        "mean_route_entropy_orig",
-                        "mean_route_entropy_edit",
                         "mean_route_entropy",
-                        "mean_evidence_gate_orig",
-                        "mean_evidence_gate_edit",
                         "mean_evidence_gate",
-                        "mean_raw_evidence_gate_orig",
-                        "mean_raw_evidence_gate_edit",
                         "mean_raw_evidence_gate",
+                        "mean_route_spread",
                         "changed_support_mass_surface",
                         "changed_support_mass_volume",
                         "unchanged_support_mass_surface",
@@ -1825,18 +1888,20 @@ def main(cfg: DictConfig):
                         "changed_response_volume",
                         "unchanged_response_surface",
                         "unchanged_response_volume",
+                        "changed_residual_surface",
+                        "changed_residual_volume",
+                        "unchanged_residual_surface",
+                        "unchanged_residual_volume",
+                        "changed_base_response_surface",
+                        "changed_base_response_volume",
+                        "unchanged_base_response_surface",
+                        "unchanged_base_response_volume",
                         "changed_evidence_mass_surface",
                         "changed_evidence_mass_volume",
                         "unchanged_evidence_mass_surface",
                         "unchanged_evidence_mass_volume",
-                        "changed_route_confidence_surface",
-                        "changed_route_confidence_volume",
-                        "unchanged_route_confidence_surface",
-                        "unchanged_route_confidence_volume",
-                        "changed_route_entropy_surface",
-                        "changed_route_entropy_volume",
-                        "unchanged_route_entropy_surface",
-                        "unchanged_route_entropy_volume",
+                        "changed_edit_displacement_surface",
+                        "changed_edit_displacement_volume",
                     }
                 }
                 wandb_dict.update({f"train/{key}": value for key, value in train_log_values.items()})

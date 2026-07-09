@@ -2481,42 +2481,52 @@ def main():
     if "SMART_MASKED" in model_specs:
         masked_cfg = model_specs["SMART_MASKED"]["config"]
         masked_budget = int(getattr(masked_cfg, "secondary_view_geometry_points", getattr(masked_cfg, "view_geometry_points", sampling_budget)))
-        masked_rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(vtk_run_id), 919191, 2]))
-        masked_info = sample_gaussian_ball_mask_subset(
-            sampling_input_surf_coords,
-            masked_budget,
-            masked_rng,
-            std_fraction_of_largest_extent=float(getattr(masked_cfg, "gaussian_mask_std_fraction_of_largest_extent", 0.05)),
-            prob_at_1sigma=float(getattr(masked_cfg, "gaussian_mask_prob_at_1sigma", 0.33)),
-            min_survivors=int(getattr(masked_cfg, "gaussian_mask_min_survivors", 16384)),
-            return_metadata=True,
-        )
-        masked_base_idx = np.asarray(masked_info["base_idx"], dtype=np.int64)
-        masked_kept_idx = np.asarray(masked_info["kept_idx"], dtype=np.int64)
-        masked_points = sampling_input_surf_coords[masked_base_idx]
-        masked_center = np.asarray(masked_info["center_point"], dtype=np.float32).reshape(1, 3)
-        masked_vtk_path = out_root / f"drivaerml_test_run_{vtk_run_id}_smart_masked_view2_input_points_{int(masked_points.shape[0])}_with_removed.vtk"
-        write_polydata_vtk(
-            masked_vtk_path,
-            masked_points,
-            {
-                "kept_after_mask": np.asarray(masked_info["keep_mask"], dtype=np.float32),
-                "mask_remove_probability": np.asarray(masked_info["remove_probability"], dtype=np.float32),
-                "mask_distance_to_center": np.asarray(masked_info["distance_to_center"], dtype=np.float32),
-                "mask_center_flag": np.asarray(masked_info["center_flag"], dtype=np.float32),
-                "mask_sigma_radius": np.full((masked_points.shape[0],), float(masked_info["sigma_radius"]), dtype=np.float32),
-                "mask_center_xyz": np.repeat(masked_center, masked_points.shape[0], axis=0),
-            },
-        )
-        representative_view2_sampling_vtk_paths.append(str(masked_vtk_path))
-        masked_survivor_points = sampling_input_surf_coords[masked_kept_idx]
-        masked_survivor_vtk_path = out_root / f"drivaerml_test_run_{vtk_run_id}_smart_masked_view2_input_points_{int(masked_survivor_points.shape[0])}_survivors_only.vtk"
-        write_polydata_vtk(
-            masked_survivor_vtk_path,
-            masked_survivor_points,
-            {},
-        )
-        representative_view2_sampling_vtk_paths.append(str(masked_survivor_vtk_path))
+        masked_num_examples = 10
+        for masked_example_idx in range(masked_num_examples):
+            masked_rng = np.random.default_rng(
+                np.random.SeedSequence([args.seed, int(vtk_run_id), 919191, 2, int(masked_example_idx)])
+            )
+            masked_info = sample_gaussian_ball_mask_subset(
+                sampling_input_surf_coords,
+                masked_budget,
+                masked_rng,
+                std_fraction_of_largest_extent=float(getattr(masked_cfg, "gaussian_mask_std_fraction_of_largest_extent", 0.05)),
+                prob_at_1sigma=float(getattr(masked_cfg, "gaussian_mask_prob_at_1sigma", 0.33)),
+                min_survivors=int(getattr(masked_cfg, "gaussian_mask_min_survivors", 16384)),
+                return_metadata=True,
+            )
+            masked_base_idx = np.asarray(masked_info["base_idx"], dtype=np.int64)
+            masked_kept_idx = np.asarray(masked_info["kept_idx"], dtype=np.int64)
+            masked_points = sampling_input_surf_coords[masked_base_idx]
+            masked_center = np.asarray(masked_info["center_point"], dtype=np.float32).reshape(1, 3)
+            masked_vtk_path = out_root / (
+                f"drivaerml_test_run_{vtk_run_id}_smart_masked_view2_example_{masked_example_idx:02d}"
+                f"_input_points_{int(masked_points.shape[0])}_with_removed.vtk"
+            )
+            write_polydata_vtk(
+                masked_vtk_path,
+                masked_points,
+                {
+                    "kept_after_mask": np.asarray(masked_info["keep_mask"], dtype=np.float32),
+                    "mask_remove_probability": np.asarray(masked_info["remove_probability"], dtype=np.float32),
+                    "mask_distance_to_center": np.asarray(masked_info["distance_to_center"], dtype=np.float32),
+                    "mask_center_flag": np.asarray(masked_info["center_flag"], dtype=np.float32),
+                    "mask_sigma_radius": np.full((masked_points.shape[0],), float(masked_info["sigma_radius"]), dtype=np.float32),
+                    "mask_center_xyz": np.repeat(masked_center, masked_points.shape[0], axis=0),
+                },
+            )
+            representative_view2_sampling_vtk_paths.append(str(masked_vtk_path))
+            masked_survivor_points = sampling_input_surf_coords[masked_kept_idx]
+            masked_survivor_vtk_path = out_root / (
+                f"drivaerml_test_run_{vtk_run_id}_smart_masked_view2_example_{masked_example_idx:02d}"
+                f"_input_points_{int(masked_survivor_points.shape[0])}_survivors_only.vtk"
+            )
+            write_polydata_vtk(
+                masked_survivor_vtk_path,
+                masked_survivor_points,
+                {},
+            )
+            representative_view2_sampling_vtk_paths.append(str(masked_survivor_vtk_path))
 
     for mix_fraction in sine_mix_levels:
         sampling_rng = np.random.default_rng(

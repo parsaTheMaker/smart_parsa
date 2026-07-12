@@ -1,11 +1,11 @@
 import hydra
 from omegaconf import DictConfig
 
-from models.transolverpp import TransolverPP
+from models.mspt import MSPT
 from train_consistency_common import run_consistency_training
 
 
-class TransolverPPWithLatent(TransolverPP):
+class MSPTSATLOSS6(MSPT):
     def forward(self, geo, surf_query_pos, vol_query_pos, params=None, geo_log_density=None, return_latent=False):
         return super().forward(
             geo,
@@ -17,9 +17,9 @@ class TransolverPPWithLatent(TransolverPP):
         )
 
 
-@hydra.main(version_base="1.2", config_path="config", config_name="drivaerml_transolverpp_satloss3")
+@hydra.main(version_base="1.2", config_path="config", config_name="drivaerml_mspt_satloss6")
 def main(cfg: DictConfig):
-    run_consistency_training(cfg, model_ctor=TransolverPPWithLatent, model_requires_density=False)
+    run_consistency_training(cfg, model_ctor=MSPTSATLOSS6, model_requires_density=False)
 
 
 if __name__ == "__main__":

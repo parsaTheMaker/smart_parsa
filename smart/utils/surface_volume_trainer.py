@@ -110,6 +110,70 @@ def _parse_batch(batch, params_dim):
     return geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, geo_log_density
 
 
+def _move_to_device(value, device):
+    if torch.is_tensor(value):
+        return value.to(device, non_blocking=True)
+    if isinstance(value, dict):
+        return {key: _move_to_device(item, device) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_move_to_device(item, device) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_move_to_device(item, device) for item in value)
+    return value
+
+
+def _record_stream(value, stream):
+    if torch.is_tensor(value):
+        if value.is_cuda:
+            value.record_stream(stream)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _record_stream(item, stream)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _record_stream(item, stream)
+
+
+class CudaPrefetchLoader:
+    """Overlap host-to-device copies with the current training step."""
+
+    def __init__(self, loader, device):
+        self.loader = loader
+        self.device = device
+        self.enabled = device.type == "cuda" and torch.cuda.is_available()
+        self.stream = torch.cuda.Stream(device=device) if self.enabled else None
+
+    def __len__(self):
+        return len(self.loader)
+
+    def __iter__(self):
+        if not self.enabled:
+            yield from self.loader
+            return
+
+        loader_iter = iter(self.loader)
+        next_batch = None
+
+        def preload():
+            nonlocal next_batch
+            try:
+                batch = next(loader_iter)
+            except StopIteration:
+                next_batch = None
+                return
+            with torch.cuda.stream(self.stream):
+                next_batch = _move_to_device(batch, self.device)
+
+        preload()
+        while next_batch is not None:
+            torch.cuda.current_stream(device=self.device).wait_stream(self.stream)
+            batch = next_batch
+            _record_stream(batch, torch.cuda.current_stream(device=self.device))
+            preload()
+            yield batch
+
+
 def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_density=False):
     config = cfg.experiment
     wandb_config = cfg.wandb
@@ -152,6 +216,10 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
 
     train_loader = torch.utils.data.DataLoader(train_data, shuffle=True, **dl_common)
     test_loader = torch.utils.data.DataLoader(test_data, shuffle=False, **dl_common)
+    cuda_batch_prefetch = bool(getattr(config, "cuda_batch_prefetch", False)) and device.type == "cuda"
+    train_batch_source = CudaPrefetchLoader(train_loader, device) if cuda_batch_prefetch else train_loader
+    test_batch_source = CudaPrefetchLoader(test_loader, device) if cuda_batch_prefetch else test_loader
+    print(f"[dataloader] cuda_batch_prefetch={cuda_batch_prefetch}")
 
     mean_surf = stats[0][:surf_channels].to(device)
     std_surf = stats[1][:surf_channels].to(device)
@@ -176,8 +244,13 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
     model = model_cls(**merged_kwargs).to(device)
 
     resume_ckpt = str(getattr(config, "resume_ckpt", "")).strip()
+    init_ckpt = str(getattr(config, "init_ckpt", "")).strip()
     if resume_ckpt:
+        print(f"[init] Loading model weights from experiment.resume_ckpt={resume_ckpt}")
         load_partial_state_dict(model, resume_ckpt, device)
+    elif init_ckpt:
+        print(f"[init] Loading model weights from experiment.init_ckpt={init_ckpt}")
+        load_partial_state_dict(model, init_ckpt, device)
 
     print(f"Total parameters: {count_model_params(model)}")
     model_checkpoint_name = get_model_checkpoint_name(config)
@@ -196,11 +269,16 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
     try:
         for ep in tqdm(range(config.epochs), desc="Epochs", dynamic_ncols=True):
             t1 = default_timer()
+            # Propagate the epoch to datasets that use epoch-seeded point sampling.
+            if hasattr(train_data, "set_epoch"):
+                train_data.set_epoch(ep)
+            if hasattr(test_data, "set_epoch"):
+                test_data.set_epoch(0)
             train_losses = init_metric_dict(fields["surface"], fields["volume"])
             test_losses = init_metric_dict(fields["surface"], fields["volume"])
 
             model.train()
-            train_pbar = tqdm(train_loader, desc=f"Train {ep + 1}/{config.epochs}", leave=False, dynamic_ncols=True)
+            train_pbar = tqdm(train_batch_source, desc=f"Train {ep + 1}/{config.epochs}", leave=False, dynamic_ncols=True)
             for batch_idx, batch in enumerate(train_pbar):
                 geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, geo_log_density = _parse_batch(batch, params_dim)
                 geo_mesh = geo_mesh.to(device)
@@ -224,7 +302,14 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                             y_hat_surf, y_hat_vol = model(geo_mesh, surf_mesh, vol_mesh, params, geo_log_density=geo_log_density)
                         else:
                             y_hat_surf, y_hat_vol = model(geo_mesh, surf_mesh, vol_mesh, params)
-                        loss = combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data) if use_surface_supervision else loss_fn(y_hat_vol, vol_data)
+                        # Keep the large pointwise reductions in float32. A float16
+                        # sum over 65k query points can overflow and produce NaN
+                        # gradients even when the forward loss is finite.
+                        loss = (
+                            combined_loss_fn(y_hat_surf.float(), y_hat_vol.float(), surf_data.float(), vol_data.float())
+                            if use_surface_supervision
+                            else loss_fn(y_hat_vol.float(), vol_data.float())
+                        )
                     if not torch.isfinite(loss):
                         print(f"[warn] Non-finite training loss at epoch {ep} batch {batch_idx}; skipping optimizer step.")
                         optimizer.zero_grad(set_to_none=True)
@@ -243,7 +328,11 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                         y_hat_surf, y_hat_vol = model(geo_mesh, surf_mesh, vol_mesh, params, geo_log_density=geo_log_density)
                     else:
                         y_hat_surf, y_hat_vol = model(geo_mesh, surf_mesh, vol_mesh, params)
-                    loss = combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data) if use_surface_supervision else loss_fn(y_hat_vol, vol_data)
+                    loss = (
+                        combined_loss_fn(y_hat_surf.float(), y_hat_vol.float(), surf_data.float(), vol_data.float())
+                        if use_surface_supervision
+                        else loss_fn(y_hat_vol.float(), vol_data.float())
+                    )
                     if not torch.isfinite(loss):
                         print(f"[warn] Non-finite training loss at epoch {ep} batch {batch_idx}; skipping optimizer step.")
                         optimizer.zero_grad(set_to_none=True)
@@ -257,8 +346,8 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                 batch_size = surf_data.size(0)
                 train_losses["loss"] += loss.item() * batch_size
                 with torch.no_grad():
-                    surface_loss = rel_l2_loss_fn(y_hat_surf, surf_data) if use_surface_supervision else torch.tensor(0.0, device=device)
-                    volume_loss = rel_l2_loss_fn(y_hat_vol, vol_data)
+                    surface_loss = rel_l2_loss_fn(y_hat_surf.float(), surf_data.float()) if use_surface_supervision else torch.tensor(0.0, device=device)
+                    volume_loss = rel_l2_loss_fn(y_hat_vol.float(), vol_data.float())
                     train_losses["rel_l2_surf"] += surface_loss.item() * batch_size
                     train_losses["rel_l2_vol"] += volume_loss.item() * batch_size
                     train_losses["rel_l2"] += (surface_loss + volume_loss).item() * batch_size
@@ -283,7 +372,7 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                     train_pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
 
             model.eval()
-            test_pbar = tqdm(test_loader, desc=f"Eval  {ep + 1}/{config.epochs}", leave=False, dynamic_ncols=True)
+            test_pbar = tqdm(test_batch_source, desc=f"Eval  {ep + 1}/{config.epochs}", leave=False, dynamic_ncols=True)
             with torch.no_grad():
                 for batch in test_pbar:
                     geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, geo_log_density = _parse_batch(batch, params_dim)
@@ -321,14 +410,14 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
 
                     batch_size = surf_data.size(0)
                     if use_surface_supervision:
-                        batch_loss = combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data)
-                        surface_rel_l2 = rel_l2_loss_fn(y_hat_surf, surf_data)
+                        batch_loss = combined_loss_fn(y_hat_surf.float(), y_hat_vol.float(), surf_data.float(), vol_data.float())
+                        surface_rel_l2 = rel_l2_loss_fn(y_hat_surf.float(), surf_data.float())
                     else:
-                        batch_loss = loss_fn(y_hat_vol, vol_data)
+                        batch_loss = loss_fn(y_hat_vol.float(), vol_data.float())
                         surface_rel_l2 = torch.tensor(0.0, device=device)
                     test_losses["loss"] += batch_loss.item() * batch_size
 
-                    volume_rel_l2 = rel_l2_loss_fn(y_hat_vol, vol_data)
+                    volume_rel_l2 = rel_l2_loss_fn(y_hat_vol.float(), vol_data.float())
                     test_losses["rel_l2_surf"] += surface_rel_l2.item() * batch_size
                     test_losses["rel_l2_vol"] += volume_rel_l2.item() * batch_size
                     test_losses["rel_l2"] += (surface_rel_l2 + volume_rel_l2).item() * batch_size

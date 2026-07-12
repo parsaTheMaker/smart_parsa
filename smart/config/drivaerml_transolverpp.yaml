@@ -20,38 +20,38 @@ experiment:
   manifest_variant: "full"
 
   architecture:
-    latent_dim: 256
-    latent_geometry_points: 4096
-    subsampled_geometry_points: 65536
-    num_encoder_decoder_blocks: 6
-    num_heads: 8
-    pos_scale_factor: 100
-    slice_num: 64
+    n_layers: 4
+    n_hidden: 256
+    n_heads: 8
+    dropout: 0.1
     mlp_ratio: 2
-    use_checkpoint: False
-    token_chunk_size: 8192
-    use_gumbel_routing: False
+    slice_num: 32
+    geometry_points: 0
 
   optimizer: "adamw"
   loss_fn: "rel_l2"
   scheduler: "cosine"
-  scheduler_warumup_fraction: 0.2
   batch_size: 1
   epochs: 300
   learning_rate: 2.e-4
-  gradient_norm: 1.0
+  gradient_norm: null
   amp: True
   precision: "float16"
   log_every_n_steps: 10
   wandb_watch_model: False
+  init_ckpt: ""
   resume_ckpt: ""
+  resume_full_state: False
 
   dataset: "DrivAerML"
   data_path: "/mnt/ssdraid/parsa/drivaerml_preprocessed"
   num_workers: 8
   prefetch_factor: 4
   pin_memory: True
-  num_body_points: 0
+  cuda_batch_prefetch: True
+  # Match SMART vanilla: uniform, epoch-varying geometry views.
+  geometry_epoch_seeded_sampling: True
+  num_body_points: 65536
   num_surface_points: 65536
   num_volume_points: 65536
   scale_positions: False

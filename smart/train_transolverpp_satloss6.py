@@ -17,7 +17,7 @@ class TransolverPPWithLatent(TransolverPP):
         )
 
 
-@hydra.main(version_base="1.2", config_path="config", config_name="drivaerml_transolverpp_satloss3")
+@hydra.main(version_base="1.2", config_path="config", config_name="drivaerml_transolverpp_satloss6")
 def main(cfg: DictConfig):
     run_consistency_training(cfg, model_ctor=TransolverPPWithLatent, model_requires_density=False)
 

@@ -20,17 +20,13 @@ experiment:
   manifest_variant: "full"
 
   architecture:
-    latent_dim: 256
-    latent_geometry_points: 4096
-    subsampled_geometry_points: 65536
-    num_encoder_decoder_blocks: 6
-    num_heads: 8
-    pos_scale_factor: 100
-    slice_num: 64
+    n_layers: 4
+    n_hidden: 256
+    n_heads: 8
+    dropout: 0.1
     mlp_ratio: 2
-    use_checkpoint: False
-    token_chunk_size: 8192
-    use_gumbel_routing: False
+    slice_num: 32
+    geometry_points: 16384
     density_knn_k: 8
     density_neighbor_hops: 1
     density_estimator: "rk2"
@@ -38,11 +34,10 @@ experiment:
   optimizer: "adamw"
   loss_fn: "rel_l2"
   scheduler: "cosine"
-  scheduler_warumup_fraction: 0.2
   batch_size: 1
   epochs: 300
   learning_rate: 2.e-4
-  gradient_norm: 1.0
+  gradient_norm: null
   amp: True
   precision: "float16"
   log_every_n_steps: 10
@@ -58,7 +53,7 @@ experiment:
   density_knn_k: 8
   density_neighbor_hops: 1
   density_estimator: "rk2"
-  num_body_points: 0
+  num_body_points: 32768
   num_surface_points: 65536
   num_volume_points: 65536
   scale_positions: False

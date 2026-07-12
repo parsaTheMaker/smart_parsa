@@ -1,0 +1,80 @@
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+
+wandb:
+  project: "smart_drivaerml"
+  entity: "parsa-vatani99-technical-university-of-munich"
+
+experiment:
+  name: "DrivAerML_GAOT"
+  model_name: "GAOT"
+  model_tag: ""
+  random_seed: 42
+  manifest_variant: "full"
+
+  architecture:
+    # Reference GAOT-3D method with a resource-scaled latent grid for 24 GB GPUs.
+    latent_tokens: [32, 32, 16]
+    lifting_channels: 64
+    gno_radius: 0.033
+    gno_neighbor_strategy: "bidirectional"
+    gno_k_neighbors: 1
+    gno_scales: [1.0]
+    gno_encoder_scales: [0.5, 1.0, 2.0]
+    gno_decoder_scales: [1.0]
+    gno_embedding_method: "statistical"
+    gno_mlp_type: "linear"
+    projection_channels: 384
+    in_gno_channel_mlp_hidden_layers: [128, 128, 128]
+    out_gno_channel_mlp_hidden_layers: [128, 128]
+    transformer_patch_size: 2
+    transformer_hidden_size: 384
+    transformer_num_layers: 12
+    transformer_num_heads: 8
+    transformer_dropout: 0.0
+    transformer_positional_embedding: "rope"
+    use_geoembed: True
+    use_query_residual_head: True
+    query_residual_hidden: 256
+    query_residual_scale: 0.25
+    global_geometry_head: True
+    # Raw bounds used by AhmedMLDatasetV2 before its per-axis [0, 1] scaling.
+    # GAOT then applies the reference single shared physical normalization.
+    dataset_position_min: [-2.0, -1.499656, -0.805567]
+    dataset_position_max: [7.999937, 1.499946, 1.994567]
+
+  optimizer: "adamw"
+  loss_fn: "rel_l2"
+  scheduler: "cosine"
+  scheduler_warmup_fraction: 0.2
+  batch_size: 4
+  epochs: 300
+  learning_rate: 2.e-4
+  gradient_norm: null
+  amp: True
+  precision: "float16"
+  log_every_n_steps: 5
+  wandb_watch_model: False
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False
+
+  dataset: "DrivAerML"
+  data_path: "/mnt/ssdraid/parsa/drivaerml_preprocessed"
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: True
+  cuda_batch_prefetch: True
+  # Keep the same stochastic point-cloud protocol used by SMART vanilla.
+  geometry_epoch_seeded_sampling: True
+  num_body_points: 131072
+  num_surface_points: 65536
+  num_volume_points: 65536
+  scale_positions: False

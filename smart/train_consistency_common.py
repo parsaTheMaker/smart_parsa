@@ -1324,6 +1324,30 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             )
         fuse_consistency_views = False
 
+    configured_source_points = int(getattr(config, "num_body_points", 0))
+    if (
+        use_prediction_consistency
+        and configured_source_points > 0
+        and primary_view_points >= configured_source_points
+        and secondary_view_points >= configured_source_points
+    ):
+        raise ValueError(
+            f"{config.model_name} has no effective two-view geometry augmentation: "
+            f"num_body_points={configured_source_points}, "
+            f"primary_view_geometry_points={primary_view_points}, "
+            f"secondary_view_geometry_points={secondary_view_points}. "
+            "Set experiment.num_body_points=0 (full cloud) or make both view budgets smaller "
+            "than the dataset geometry budget."
+        )
+    if is_main_process() and use_prediction_consistency:
+        source_text = "full geometry cloud" if configured_source_points <= 0 else f"{configured_source_points} dataset geometry points"
+        print(
+            f"[consistency] source={source_text}, "
+            f"views=({primary_view_points}, {secondary_view_points}), "
+            f"modes=({getattr(config, 'train_primary_sampling_mode', 'uniform_wor')}, "
+            f"{getattr(config, 'train_secondary_sampling_mode', 'uniform_wor')})"
+        )
+
     try:
         for ep in tqdm(range(start_epoch, config.epochs), desc="Epochs", dynamic_ncols=True):
             t1 = default_timer()

@@ -54,8 +54,6 @@ if str(SMART_ROOT) not in sys.path:
 from data.ahmedml_dataset_v2 import AhmedMLDatasetV2
 from models.abupt import ABUPT
 from models.abupt_sat import ABUPTSAT
-from models.ginot import GINOT
-from models.ginot_sat import GINOTSAT
 from models.pointnet import PointNet
 from models.smart.smart import SMART
 from models.smart.smart_sat import SMARTSAT
@@ -64,6 +62,7 @@ from models.smart.smart_sat3 import SMARTSAT3
 from models.smart.smart_sat4 import SMARTSAT4
 from models.transolverpp import TransolverPP
 from models.transolverpp_sat import TransolverPPSAT
+from models.mspt import MSPT
 from utils.geometry_density import estimate_log_sampling_density
 from utils.utils import get_model_checkpoint_name
 
@@ -107,12 +106,13 @@ MODEL_ORDER = [
     "TRANSOLVERPP",
     "TRANSOLVERPP_SAT",
     "TRANSOLVERPP_SATLOSS3",
-    "GINOT",
-    "GINOT_SATLOSS3",
+    "TRANSOLVERPP_SATLOSS6",
     "ABUPT",
     "ABUPT_SATLOSS3",
     "POINTNET",
     "POINTNET_SATLOSS3",
+    "MSPT",
+    "MSPT_SATLOSS6",
 ]
 MODEL_LABELS = {
     "SMART": "SMART",
@@ -127,12 +127,13 @@ MODEL_LABELS = {
     "TRANSOLVERPP": "TransolverPP",
     "TRANSOLVERPP_SAT": "TransolverPP-SAT",
     "TRANSOLVERPP_SATLOSS3": "TransolverPP-SATLOSS3",
-    "GINOT": "GINOT",
-    "GINOT_SATLOSS3": "GINOT-SATLOSS3",
+    "TRANSOLVERPP_SATLOSS6": "TransolverPP-SATLOSS6",
     "ABUPT": "ABUPT",
     "ABUPT_SATLOSS3": "ABUPT-SATLOSS3",
     "POINTNET": "PointNet",
     "POINTNET_SATLOSS3": "PointNet-SATLOSS3",
+    "MSPT": "MSPT",
+    "MSPT_SATLOSS6": "MSPT-SATLOSS6",
 }
 MODEL_COLORS = {
     "SMART": "#6C6F7D",
@@ -147,12 +148,13 @@ MODEL_COLORS = {
     "TRANSOLVERPP": "#6C6F7D",
     "TRANSOLVERPP_SAT": "#54A24B",
     "TRANSOLVERPP_SATLOSS3": "#E45756",
-    "GINOT": "#6C6F7D",
-    "GINOT_SATLOSS3": "#4C78A8",
+    "TRANSOLVERPP_SATLOSS6": "#FF9896",
     "ABUPT": "#6C6F7D",
     "ABUPT_SATLOSS3": "#E45756",
     "POINTNET": "#6C6F7D",
     "POINTNET_SATLOSS3": "#4C78A8",
+    "MSPT": "#BCBD22",
+    "MSPT_SATLOSS6": "#9467BD",
 }
 DRAG_RANK_MODELS = [
     "SMART",
@@ -179,18 +181,18 @@ FAMILY_GROUPS = OrderedDict(
                 "SMART_SATLOSS6",
             ],
         ),
-        ("transolverpp_family", ["TRANSOLVERPP", "TRANSOLVERPP_SAT", "TRANSOLVERPP_SATLOSS3"]),
-        ("ginot_family", ["GINOT", "GINOT_SATLOSS3"]),
+        ("transolverpp_family", ["TRANSOLVERPP", "TRANSOLVERPP_SAT", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6"]),
         ("abupt_family", ["ABUPT", "ABUPT_SATLOSS3"]),
         ("pointnet_family", ["POINTNET", "POINTNET_SATLOSS3"]),
+        ("mspt_family", ["MSPT", "MSPT_SATLOSS6"]),
     ]
 )
 FAMILY_TITLES = {
     "smart_family": "SMART vs SMART-AUGMENTED vs SMART-MASKED vs SMART-SAT vs SMART-SATLOSS3 vs SMART-SATLOSS4 vs SMART-SATLOSS5 vs SMART-SATLOSS5-NOPM vs SMART-SATLOSS6",
-    "transolverpp_family": "TransolverPP vs TransolverPP-SAT vs TransolverPP-SATLOSS3",
-    "ginot_family": "GINOT vs GINOT-SATLOSS3",
+    "transolverpp_family": "TransolverPP vs TransolverPP-SAT vs TransolverPP-SATLOSS3 vs TransolverPP-SATLOSS6",
     "abupt_family": "ABUPT vs ABUPT-SATLOSS3",
     "pointnet_family": "PointNet vs PointNet-SATLOSS3",
+    "mspt_family": "MSPT vs MSPT-SATLOSS6",
 }
 VTK_PRESSURE_MODELS = [
     "SMART",
@@ -204,15 +206,15 @@ VTK_PRESSURE_MODELS = [
     "SMART_SATLOSS6",
     "TRANSOLVERPP",
     "TRANSOLVERPP_SATLOSS3",
-    "GINOT",
-    "GINOT_SATLOSS3",
     "POINTNET",
     "POINTNET_SATLOSS3",
+    "MSPT",
+    "MSPT_SATLOSS6",
 ]
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Fair DrivAerML sampling-invariance comparison across SMART, TransolverPP, GINOT, ABUPT, and PointNet families.")
+    p = argparse.ArgumentParser(description="Fair DrivAerML sampling-invariance comparison across SMART, TransolverPP, ABUPT, and PointNet families.")
     p.add_argument("--smart-config", default="drivaerml")
     p.add_argument("--smart-augmented-config", default="drivaerml_smart_augmented")
     p.add_argument("--smart-masked-config", default="drivaerml_smart_masked")
@@ -225,12 +227,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--transolverpp-config", default="drivaerml_transolverpp")
     p.add_argument("--transolverpp-sat-config", default="drivaerml_transolverpp_sat")
     p.add_argument("--transolverpp-satloss3-config", default="drivaerml_transolverpp_satloss3")
-    p.add_argument("--ginot-config", default="drivaerml_ginot")
-    p.add_argument("--ginot-satloss3-config", default="drivaerml_ginot_satloss3")
+    p.add_argument("--transolverpp-satloss6-config", default="drivaerml_transolverpp_satloss6")
     p.add_argument("--abupt-config", default="drivaerml_abupt")
     p.add_argument("--abupt-satloss3-config", default="drivaerml_abupt_satloss3")
     p.add_argument("--pointnet-config", default="drivaerml_pointnet")
     p.add_argument("--pointnet-satloss3-config", default="drivaerml_pointnet_satloss3")
+    p.add_argument("--mspt-config", default="drivaerml_mspt")
+    p.add_argument("--mspt-satloss6-config", default="drivaerml_mspt_satloss6")
     p.add_argument("--smart-checkpoint", default=None)
     p.add_argument("--smart-augmented-checkpoint", default=None)
     p.add_argument("--smart-masked-checkpoint", default=None)
@@ -243,15 +246,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--transolverpp-checkpoint", default=None)
     p.add_argument("--transolverpp-sat-checkpoint", default=None)
     p.add_argument("--transolverpp-satloss3-checkpoint", default=None)
-    p.add_argument("--ginot-checkpoint", default=None)
-    p.add_argument("--ginot-satloss3-checkpoint", default=None)
+    p.add_argument("--transolverpp-satloss6-checkpoint", default=None)
     p.add_argument("--abupt-checkpoint", default=None)
     p.add_argument("--abupt-satloss3-checkpoint", default=None)
     p.add_argument("--pointnet-checkpoint", default=None)
     p.add_argument("--pointnet-satloss3-checkpoint", default=None)
+    p.add_argument("--mspt-checkpoint", default=None)
+    p.add_argument("--mspt-satloss6-checkpoint", default=None)
     p.add_argument("--num-runs", type=int, default=8, help="Number of test runs to evaluate.")
     p.add_argument("--run-ids", default=None, help="Optional comma-separated explicit run ids.")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--query-sampling-with-replacement",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Match AhmedMLDatasetV2's default query sampling. Use --no-query-sampling-with-replacement for distinct query subsets.",
+    )
     p.add_argument("--device", default=None)
     p.add_argument("--input-points", type=int, default=None, help="Encoder input size. Default: inferred from the active model configs.")
     p.add_argument(
@@ -387,12 +397,13 @@ def choose_ckpt(config, explicit: str | None) -> str:
         "TRANSOLVERPP": "transolverpp-",
         "TRANSOLVERPP_SAT": "transolverpp-sat-",
         "TRANSOLVERPP_SATLOSS3": "transolverpp-satloss3-",
-        "GINOT": "ginot-",
-        "GINOT_SATLOSS3": "ginot-satloss3-",
+        "TRANSOLVERPP_SATLOSS6": "transolverpp-satloss6-",
         "ABUPT": "abupt-",
         "ABUPT_SATLOSS3": "abupt-satloss3-",
         "POINTNET": "pointnet-",
         "POINTNET_SATLOSS3": "pointnet-satloss3-",
+        "MSPT": "mspt-",
+        "MSPT_SATLOSS6": "mspt-satloss6-",
     }
     required_prefix = prefix_map.get(str(config.model_name), f"{model_slug}-")
     dataset_slug = str(config.dataset).lower()
@@ -453,20 +464,18 @@ def build_model(config, ckpt_path: str, device: torch.device, batched_query_subr
         model = SMARTSAT3(**base_kwargs, **arch)
     elif model_name == "SMART_SAT4":
         model = SMARTSAT4(**base_kwargs, **arch)
-    elif model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3"}:
+    elif model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6"}:
         model = TransolverPP(**base_kwargs, **arch)
     elif model_name == "TRANSOLVERPP_SAT":
         model = TransolverPPSAT(**base_kwargs, **arch)
-    elif model_name in {"GINOT", "GINOT_SATLOSS3"}:
-        model = GINOT(**base_kwargs, **arch)
-    elif model_name == "GINOT_SAT":
-        model = GINOTSAT(**base_kwargs, **arch)
     elif model_name in {"ABUPT", "ABUPT_SATLOSS3"}:
         model = ABUPT(**base_kwargs, **arch)
     elif model_name == "ABUPT_SAT":
         model = ABUPTSAT(**base_kwargs, **arch)
     elif model_name in {"POINTNET", "POINTNET_SATLOSS3"}:
         model = PointNet(**base_kwargs, **arch)
+    elif model_name in {"MSPT", "MSPT_SATLOSS6"}:
+        model = MSPT(**base_kwargs, **arch)
     else:
         raise ValueError(f"Unsupported model_name for this evaluator: {model_name}")
 
@@ -498,6 +507,14 @@ def sample_uniform_without_replacement(n: int, k: int, rng: np.random.Generator)
     return rng.choice(n, size=k, replace=False).astype(np.int64, copy=False)
 
 
+def sample_uniform_with_replacement(n: int, k: int, rng: np.random.Generator) -> np.ndarray:
+    if k <= 0:
+        return np.empty((0,), dtype=np.int64)
+    if n <= 0:
+        raise ValueError("Cannot sample from an empty point cloud.")
+    return rng.choice(n, size=k, replace=True).astype(np.int64, copy=False)
+
+
 def sample_inverse_density_without_replacement(
     log_density: np.ndarray,
     k: int,
@@ -511,6 +528,21 @@ def sample_inverse_density_without_replacement(
     weights = np.clip(weights, 1e-24, None)
     probs = weights / np.clip(weights.sum(), 1e-24, None)
     return rng.choice(n, size=k, replace=False, p=probs).astype(np.int64, copy=False)
+
+
+def sample_inverse_density_with_replacement(
+    log_density: np.ndarray,
+    k: int,
+    beta: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    n = int(log_density.shape[0])
+    if k <= 0:
+        return np.empty((0,), dtype=np.int64)
+    weights = np.exp(-float(beta) * log_density.astype(np.float64, copy=False))
+    weights = np.clip(weights, 1e-24, None)
+    probs = weights / np.clip(weights.sum(), 1e-24, None)
+    return rng.choice(n, size=k, replace=True, p=probs).astype(np.int64, copy=False)
 
 
 def sample_weighted_without_replacement(
@@ -563,6 +595,25 @@ def sample_uniform_weighted_mixture_without_replacement(
     uniform_take = rng.choice(remaining_idx, size=k_uniform, replace=False).astype(np.int64, copy=False)
     out = np.concatenate([weighted_idx, uniform_take], axis=0).astype(np.int64, copy=False)
     return out
+
+
+def sample_uniform_weighted_mixture_with_replacement(
+    target_weights: np.ndarray,
+    k: int,
+    mix_fraction: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    if k <= 0:
+        return np.empty((0,), dtype=np.int64)
+    n = int(target_weights.shape[0])
+    alpha = float(np.clip(mix_fraction, 0.0, 1.0))
+    k_weighted = int(round(alpha * k))
+    k_uniform = k - k_weighted
+    weighted_probs = np.clip(np.asarray(target_weights, dtype=np.float64), 1e-24, None)
+    weighted_probs /= np.clip(weighted_probs.sum(), 1e-24, None)
+    weighted_idx = rng.choice(n, size=k_weighted, replace=True, p=weighted_probs)
+    uniform_idx = rng.choice(n, size=k_uniform, replace=True)
+    return np.concatenate([weighted_idx, uniform_idx]).astype(np.int64, copy=False)
 
 
 def sample_gaussian_ball_mask_subset(
@@ -630,10 +681,20 @@ def safe_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_]", "_", name)
 
 
-def choose_fixed_query_indices(n_total: int, n_keep: int, seed_components: Sequence[int]) -> np.ndarray:
+def choose_fixed_query_indices(
+    n_total: int,
+    n_keep: int,
+    seed_components: Sequence[int],
+    replace: bool = False,
+) -> np.ndarray:
     rng = np.random.default_rng(np.random.SeedSequence([int(x) for x in seed_components]))
-    idx = sample_uniform_without_replacement(n_total, n_keep, rng)
-    idx.sort()
+    idx = (
+        sample_uniform_with_replacement(n_total, n_keep, rng)
+        if replace
+        else sample_uniform_without_replacement(n_total, n_keep, rng)
+    )
+    if not replace:
+        idx.sort()
     return idx
 
 
@@ -925,7 +986,6 @@ def model_uses_density(model_name: str) -> bool:
         "SMART_SAT3",
         "SMART_SAT4",
         "TRANSOLVERPP_SAT",
-        "GINOT_SAT",
         "ABUPT_SAT",
     }
 
@@ -1069,16 +1129,6 @@ def predict_audi_surface_pressure(
 
             return decode_chunk
 
-        if model_name in {"GINOT", "GINOT_SATLOSS3"}:
-            geometry_latents, geometry_pos = model.encode_geometry(geo_b, params=None)
-
-            def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
-                query_features = model.decode_features(geometry_latents, geometry_pos, chunk, chunk[:, :0], params=None)
-                pred = model.head(query_features)
-                return pred[:, :, 0]
-
-            return decode_chunk
-
         if model_name in {"POINTNET", "POINTNET_SATLOSS3"}:
             _, global_feat = model.encode_geometry(geo_b, params=None)
 
@@ -1089,26 +1139,10 @@ def predict_audi_surface_pressure(
 
             return decode_chunk
 
-        if model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3"}:
-            geo_pos = model._select_geometry_tokens(geo_b, geo_log_density=None)
-            geometry_tokens = model.geometry_preprocess(geo_pos)
-            geometry_context_input = geometry_tokens.mean(dim=1)
-            geometry_condition_token = model.geometry_condition(
-                geometry_context_input.to(dtype=geometry_tokens.dtype)
-            ).unsqueeze(1)
-            placeholder = model.placeholder.view(1, 1, -1)
-
+        if model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6"}:
             def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
-                surf_pos = chunk * model.pos_scale_factor
-                query_tokens = model.preprocess(surf_pos)
-                query_tokens = query_tokens + placeholder
-                condition_token = geometry_condition_token + placeholder
-                tokens = torch.cat([condition_token, query_tokens], dim=1)
-                tokens = model.cond(tokens, None)
-                tokens = model._run_blocks(tokens)
-                query_latent = tokens[:, 1:]
-                pred = model.output_head(query_latent)
-                return pred[:, :, 0]
+                pred_surf, _ = model.inference(geo_b, chunk, dummy_vol_b, None)
+                return pred_surf[:, :, 0]
 
             return decode_chunk
 
@@ -1173,6 +1207,48 @@ def train_encoder_input_points(cfg) -> int:
     if view_geometry_points > 0:
         return view_geometry_points
     raise ValueError("Could not infer training encoder input point budget from config.")
+
+
+def train_geometry_uses_replacement(cfg, point_count: int, full_point_count: int) -> bool:
+    """Mirror AhmedMLDatasetV2's default geometry sampling semantics.
+
+    With fast_approx_sampling=True (the dataset default), the unseeded
+    preprocessed path uses replacement.  The replacement path is disabled
+    when the requested budget already contains the full geometry cloud.
+    """
+    if int(point_count) >= int(full_point_count):
+        return False
+    fast_approx_sampling = bool(getattr(cfg, "fast_approx_sampling", True))
+    epoch_seeded = bool(getattr(cfg, "geometry_epoch_seeded_sampling", False))
+    return fast_approx_sampling and not epoch_seeded
+
+
+def resolve_eval_sampling_mode(cfg, mode_kind: str) -> str:
+    """Resolve the active model's configured evaluation sampler.
+
+    Vanilla models have no explicit shifted sampler, so inverse-density
+    without replacement remains the controlled OOD shift. SATLOSS configs
+    explicitly provide both aligned and shifted modes.
+    """
+    if mode_kind == "uniform_wor":
+        return str(getattr(cfg, "eval_aligned_sampling_mode", "uniform_wor"))
+    if mode_kind == "inverse_density_wor":
+        return str(getattr(cfg, "eval_shifted_sampling_mode", "inverse_density_wor"))
+    return str(getattr(cfg, "eval_shifted_sampling_mode", "sinusoidal_axis_mixture_wor"))
+
+
+def sampling_mode_uses_replacement(sampling_mode: str, aligned_dataset_replacement: bool) -> bool:
+    sampling_mode = str(sampling_mode).lower()
+    if sampling_mode.endswith("_wr"):
+        return True
+    if sampling_mode == "uniform_wor" and aligned_dataset_replacement:
+        # The evaluation view is drawn from the dataset-produced geometry
+        # stream. With the default fast-approx sampler that stream already
+        # contains replacement samples, even when the view label says WOR.
+        return True
+    if sampling_mode.endswith("_wor"):
+        return False
+    return bool(aligned_dataset_replacement)
 
 
 def write_csv(path: Path, rows: List[Dict[str, object]], fieldnames: List[str]) -> None:
@@ -1285,7 +1361,14 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _grouped_bar_on_axis(ax, rows: List[Dict[str, object]], metric_key: str, mode_order: Sequence[str], model_order: Sequence[str]):
+def _grouped_bar_on_axis(
+    ax,
+    rows: List[Dict[str, object]],
+    metric_key: str,
+    mode_order: Sequence[str],
+    model_order: Sequence[str],
+    show_std: bool = True,
+):
     means = defaultdict(dict)
     stds = defaultdict(dict)
     for model_name in model_order:
@@ -1298,7 +1381,7 @@ def _grouped_bar_on_axis(ax, rows: List[Dict[str, object]], metric_key: str, mod
     width = 0.8 / max(len(mode_order), 1)
     for i, mode_name in enumerate(mode_order):
         vals = [means[m][mode_name] for m in model_order]
-        err = [stds[m][mode_name] for m in model_order]
+        err = [stds[m][mode_name] for m in model_order] if show_std else None
         offset = (i - 0.5 * (len(mode_order) - 1)) * width
         ax.bar(
             x + offset,
@@ -1325,6 +1408,7 @@ def plot_metric_grid(
     out_path: Path,
     title: str,
     ncols: int = 2,
+    show_std: bool = True,
 ) -> None:
     n_metrics = len(metric_keys)
     ncols = max(1, int(ncols))
@@ -1332,7 +1416,7 @@ def plot_metric_grid(
     fig, axes = plt.subplots(nrows, ncols, figsize=(7.2 * ncols, 4.8 * nrows), constrained_layout=True)
     axes_arr = np.atleast_1d(axes).reshape(nrows, ncols)
     for ax, metric_key in zip(axes_arr.flat, metric_keys):
-        _grouped_bar_on_axis(ax, rows, metric_key, mode_order, model_order)
+        _grouped_bar_on_axis(ax, rows, metric_key, mode_order, model_order, show_std=show_std)
     for ax in axes_arr.flat[n_metrics:]:
         ax.axis("off")
     fig.suptitle(title, fontsize=18)
@@ -1349,6 +1433,7 @@ def plot_numeric_mode_curve_with_band(
     mode_order: Sequence[str],
     x_values: Sequence[float],
     x_label: str,
+    show_std: bool = True,
 ) -> None:
     fig, ax = plt.subplots(figsize=(8.8, 5.8), constrained_layout=True)
     xs = np.asarray(x_values, dtype=np.float64)
@@ -1362,7 +1447,8 @@ def plot_numeric_mode_curve_with_band(
         yerr = np.array([float(row_map[mode_name][f"{metric_key}_std"]) for mode_name in mode_order], dtype=np.float64)
         color = MODEL_COLORS[model_name]
         ax.plot(xs, ys, marker="o", linewidth=2, color=color, label=MODEL_LABELS[model_name])
-        ax.fill_between(xs, ys - yerr, ys + yerr, color=color, alpha=0.18)
+        if show_std:
+            ax.fill_between(xs, ys - yerr, ys + yerr, color=color, alpha=0.18)
     ax.set_xticks(xs)
     ax.set_xlabel(x_label)
     ax.set_ylabel(_metric_display_name(metric_key))
@@ -1468,7 +1554,13 @@ def plot_ranked_curve_with_band(
     plt.close(fig)
 
 
-def plot_delta_bars(run_delta_rows: List[Dict[str, object]], metric_key: str, out_path: Path, title: str) -> None:
+def plot_delta_bars(
+    run_delta_rows: List[Dict[str, object]],
+    metric_key: str,
+    out_path: Path,
+    title: str,
+    show_std: bool = True,
+) -> None:
     means = []
     stds = []
     labels = []
@@ -1481,7 +1573,7 @@ def plot_delta_bars(run_delta_rows: List[Dict[str, object]], metric_key: str, ou
         labels.append(MODEL_LABELS[model_name])
         colors.append(MODEL_COLORS[model_name])
     fig, ax = plt.subplots(figsize=(9.2, 5.4), constrained_layout=True)
-    ax.bar(np.arange(len(labels)), means, yerr=stds, capsize=4, color=colors, alpha=0.9)
+    ax.bar(np.arange(len(labels)), means, yerr=stds if show_std else None, capsize=4, color=colors, alpha=0.9)
     ax.axhline(0.0, color="black", linestyle="--", linewidth=1)
     ax.set_xticks(np.arange(len(labels)))
     ax.set_xticklabels(labels, rotation=15)
@@ -1515,6 +1607,7 @@ def plot_comprehensive_dashboard(
     mode_order: Sequence[str],
     out_path: Path,
     title: str,
+    show_std: bool = True,
 ) -> None:
     fig, axes = plt.subplots(3, 3, figsize=(18, 15), constrained_layout=True)
     dashboard_metrics = [
@@ -1526,10 +1619,214 @@ def plot_comprehensive_dashboard(
         "volume_velocity_mag_rel_l2",
     ]
     for ax, metric_key in zip(axes.flat, dashboard_metrics):
-        _grouped_bar_on_axis(ax, per_run_mode_rows, metric_key, mode_order, model_order)
+        _grouped_bar_on_axis(ax, per_run_mode_rows, metric_key, mode_order, model_order, show_std=show_std)
     for ax in axes.flat[len(dashboard_metrics):]:
         ax.axis("off")
     fig.suptitle(title, fontsize=18)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def paired_statistics(
+    per_run_mode_rows: List[Dict[str, object]],
+    model_order: Sequence[str],
+    strongest_mode: str,
+    metric_keys: Sequence[str],
+) -> List[Dict[str, object]]:
+    """Compute paired run-level effect sizes against aligned sampling.
+
+    Pairing by run removes much of the geometry difficulty variance and is more
+    informative than comparing two independent standard deviations.
+    """
+    out: List[Dict[str, object]] = []
+    for model_name in model_order:
+        model_rows = [r for r in per_run_mode_rows if r["model_name"] == model_name]
+        aligned = {int(r["run_id"]): r for r in model_rows if r["sampling_mode"] == "aligned_uniform_wor"}
+        shifted = {int(r["run_id"]): r for r in model_rows if r["sampling_mode"] == strongest_mode}
+        common_runs = sorted(set(aligned) & set(shifted))
+        for metric_key in metric_keys:
+            deltas = np.asarray(
+                [float(shifted[run_id][metric_key]) - float(aligned[run_id][metric_key]) for run_id in common_runs],
+                dtype=np.float64,
+            )
+            if deltas.size == 0:
+                continue
+            mean = float(np.mean(deltas))
+            std = float(np.std(deltas, ddof=1)) if deltas.size > 1 else 0.0
+            sem = std / math.sqrt(deltas.size) if deltas.size > 1 else 0.0
+            ci = 1.96 * sem
+            z = mean / sem if sem > 1e-12 else (math.inf if mean > 0 else (-math.inf if mean < 0 else 0.0))
+            p_value = math.erfc(abs(z) / math.sqrt(2.0)) if math.isfinite(z) else 0.0
+            out.append(
+                {
+                    "model_name": model_name,
+                    "sampling_mode": strongest_mode,
+                    "metric": metric_key,
+                    "n_paired_runs": int(deltas.size),
+                    "mean_delta": mean,
+                    "std_delta": std,
+                    "median_delta": float(np.median(deltas)),
+                    "q25_delta": float(np.percentile(deltas, 25)),
+                    "q75_delta": float(np.percentile(deltas, 75)),
+                    "ci95_low": mean - ci,
+                    "ci95_high": mean + ci,
+                    "normal_approx_p_value": float(p_value),
+                    "aligned_mean": float(np.mean([aligned[i][metric_key] for i in common_runs])),
+                    "shifted_mean": float(np.mean([shifted[i][metric_key] for i in common_runs])),
+                }
+            )
+    return out
+
+
+def plot_paired_statistics(
+    stats_rows: List[Dict[str, object]],
+    metric_key: str,
+    model_order: Sequence[str],
+    out_path: Path,
+    title: str,
+) -> None:
+    rows = [r for r in stats_rows if r["metric"] == metric_key and r["model_name"] in model_order]
+    if not rows:
+        return
+    row_map = {str(r["model_name"]): r for r in rows}
+    present = [m for m in model_order if m in row_map]
+    x = np.arange(len(present), dtype=np.float64)
+    means = np.asarray([row_map[m]["mean_delta"] for m in present], dtype=np.float64)
+    low = np.asarray([row_map[m]["ci95_low"] for m in present], dtype=np.float64)
+    high = np.asarray([row_map[m]["ci95_high"] for m in present], dtype=np.float64)
+    fig, ax = plt.subplots(figsize=(max(8.0, 1.2 * len(present)), 5.8), constrained_layout=True)
+    for idx, model_name in enumerate(present):
+        ax.errorbar(
+            [x[idx]],
+            [means[idx]],
+            yerr=[[means[idx] - low[idx]], [high[idx] - means[idx]]],
+            fmt="o",
+            capsize=5,
+            linewidth=1.5,
+            color=MODEL_COLORS[model_name],
+            ecolor=MODEL_COLORS[model_name],
+            markersize=7,
+            zorder=3,
+        )
+    ax.axhline(0.0, color="black", linestyle="--", linewidth=1)
+    ax.set_xticks(x)
+    ax.set_xticklabels([MODEL_LABELS[m] for m in present], rotation=20, ha="right")
+    ax.set_ylabel("Shifted - aligned rel-L2")
+    ax.set_title(title + " (paired 95% CI)")
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def plot_metric_heatmap(
+    aggregate_rows: List[Dict[str, object]],
+    metric_key: str,
+    model_order: Sequence[str],
+    mode_order: Sequence[str],
+    out_path: Path,
+    title: str,
+    normalize_to_aligned: bool = False,
+) -> None:
+    """Show the full model-by-mode result surface in one compact figure."""
+    values = np.full((len(model_order), len(mode_order)), np.nan, dtype=np.float64)
+    row_map = {(str(r["model_name"]), str(r["sampling_mode"])): r for r in aggregate_rows}
+    for i, model_name in enumerate(model_order):
+        baseline = row_map.get((model_name, "aligned_uniform_wor"))
+        base_value = float(baseline[metric_key]) if baseline is not None else 1.0
+        for j, mode_name in enumerate(mode_order):
+            row = row_map.get((model_name, mode_name))
+            if row is not None:
+                value = float(row[metric_key])
+                values[i, j] = value / max(base_value, 1.0e-12) if normalize_to_aligned else value
+    fig, ax = plt.subplots(figsize=(max(10.0, 1.25 * len(mode_order)), max(4.5, 0.48 * len(model_order))), constrained_layout=True)
+    image = ax.imshow(values, aspect="auto", cmap="magma", interpolation="nearest")
+    ax.set_xticks(np.arange(len(mode_order)))
+    ax.set_xticklabels([mode_display_name(m) for m in mode_order], rotation=35, ha="right")
+    ax.set_yticks(np.arange(len(model_order)))
+    ax.set_yticklabels([MODEL_LABELS[m] for m in model_order])
+    for i in range(values.shape[0]):
+        for j in range(values.shape[1]):
+            if np.isfinite(values[i, j]):
+                ax.text(j, i, f"{values[i, j]:.3f}", ha="center", va="center", color="white", fontsize=7)
+    ax.set_title(title)
+    ax.set_xlabel("Encoder-input sampling mode")
+    ax.set_ylabel("Model")
+    fig.colorbar(image, ax=ax, label="Ratio to aligned" if normalize_to_aligned else _metric_display_name(metric_key))
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def plot_run_distribution_boxplot(
+    per_run_mode_rows: List[Dict[str, object]],
+    metric_key: str,
+    mode_name: str,
+    model_order: Sequence[str],
+    out_path: Path,
+    title: str,
+) -> None:
+    labels = []
+    values = []
+    colors = []
+    for model_name in model_order:
+        current = [float(r[metric_key]) for r in per_run_mode_rows if r["model_name"] == model_name and r["sampling_mode"] == mode_name]
+        if current:
+            labels.append(MODEL_LABELS[model_name])
+            values.append(current)
+            colors.append(MODEL_COLORS[model_name])
+    if not values:
+        return
+    fig, ax = plt.subplots(figsize=(max(8.0, 1.25 * len(values)), 5.8), constrained_layout=True)
+    box = ax.boxplot(values, patch_artist=True, showmeans=True, meanline=False)
+    for patch, color in zip(box["boxes"], colors):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.65)
+    for median in box["medians"]:
+        median.set_color("black")
+    ax.set_xticks(np.arange(1, len(labels) + 1))
+    ax.set_xticklabels(labels, rotation=22, ha="right")
+    ax.set_ylabel(_metric_display_name(metric_key))
+    ax.set_title(title)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def plot_delta_severity_curve(
+    aggregate_rows: List[Dict[str, object]],
+    metric_key: str,
+    model_order: Sequence[str],
+    beta_mode_order: Sequence[str],
+    beta_xs: Sequence[float],
+    out_path: Path,
+    title: str,
+    show_std: bool = True,
+) -> None:
+    row_map = {(str(r["model_name"]), str(r["sampling_mode"])): r for r in aggregate_rows}
+    fig, ax = plt.subplots(figsize=(9.0, 5.8), constrained_layout=True)
+    xs = np.asarray(beta_xs, dtype=np.float64)
+    for model_name in model_order:
+        aligned = row_map.get((model_name, "aligned_uniform_wor"))
+        if aligned is None:
+            continue
+        ys = []
+        ystd = []
+        for mode_name in beta_mode_order:
+            row = row_map.get((model_name, mode_name))
+            if row is None:
+                ys.append(np.nan)
+                ystd.append(0.0)
+            else:
+                ys.append(float(row[metric_key]) - float(aligned[metric_key]))
+                ystd.append(float(row.get(f"{metric_key}_std", 0.0)))
+        ys = np.asarray(ys, dtype=np.float64)
+        ystd = np.asarray(ystd, dtype=np.float64)
+        color = MODEL_COLORS[model_name]
+        ax.plot(xs, ys, marker="o", linewidth=2, color=color, label=MODEL_LABELS[model_name])
+        if show_std:
+            ax.fill_between(xs, ys - ystd, ys + ystd, color=color, alpha=0.14)
+    ax.axhline(0.0, color="black", linestyle="--", linewidth=1)
+    ax.set_xlabel("Inverse-density beta")
+    ax.set_ylabel("Shifted - aligned rel-L2")
+    ax.set_title(title)
+    ax.legend(fontsize=8)
     fig.savefig(out_path, dpi=220)
     plt.close(fig)
 
@@ -1555,12 +1852,13 @@ def main():
             ("TRANSOLVERPP", args.transolverpp_config),
             ("TRANSOLVERPP_SAT", args.transolverpp_sat_config),
             ("TRANSOLVERPP_SATLOSS3", args.transolverpp_satloss3_config),
-            ("GINOT", args.ginot_config),
-            ("GINOT_SATLOSS3", args.ginot_satloss3_config),
+            ("TRANSOLVERPP_SATLOSS6", args.transolverpp_satloss6_config),
             ("ABUPT", args.abupt_config),
             ("ABUPT_SATLOSS3", args.abupt_satloss3_config),
             ("POINTNET", args.pointnet_config),
             ("POINTNET_SATLOSS3", args.pointnet_satloss3_config),
+            ("MSPT", args.mspt_config),
+            ("MSPT_SATLOSS6", args.mspt_satloss6_config),
         ]
     )
     configs = OrderedDict((model_name, load_cfg(cfg_name)) for model_name, cfg_name in config_name_map.items())
@@ -1613,12 +1911,13 @@ def main():
         "TRANSOLVERPP": args.transolverpp_checkpoint,
         "TRANSOLVERPP_SAT": args.transolverpp_sat_checkpoint,
         "TRANSOLVERPP_SATLOSS3": args.transolverpp_satloss3_checkpoint,
-        "GINOT": args.ginot_checkpoint,
-        "GINOT_SATLOSS3": args.ginot_satloss3_checkpoint,
+        "TRANSOLVERPP_SATLOSS6": args.transolverpp_satloss6_checkpoint,
         "ABUPT": args.abupt_checkpoint,
         "ABUPT_SATLOSS3": args.abupt_satloss3_checkpoint,
         "POINTNET": args.pointnet_checkpoint,
         "POINTNET_SATLOSS3": args.pointnet_satloss3_checkpoint,
+        "MSPT": args.mspt_checkpoint,
+        "MSPT_SATLOSS6": args.mspt_satloss6_checkpoint,
     }
     requested_model_names = [model_name for model_name in MODEL_ORDER if checkpoint_arg_map[model_name] is not None]
     if not requested_model_names:
@@ -1841,21 +2140,36 @@ def main():
         full_surf_query_norm = normalize_pos(torch.from_numpy(surf_coords_full), min_pos, max_pos)
         max_surface_query_points = max(int(b["surface"]) for b in per_model_query_budgets.values())
         max_volume_query_points = max(int(b["volume"]) for b in per_model_query_budgets.values())
-        surf_query_idx_master = choose_fixed_query_indices(surf_coords_full.shape[0], max_surface_query_points, [args.seed, int(run_id), 3001])
-        vol_query_idx_master = choose_fixed_query_indices(vol_coords_full.shape[0], max_volume_query_points, [args.seed, int(run_id), 3002])
+        surf_query_idx_master = choose_fixed_query_indices(
+            surf_coords_full.shape[0],
+            max_surface_query_points,
+            [args.seed, int(run_id), 3001],
+            replace=bool(args.query_sampling_with_replacement),
+        )
+        vol_query_idx_master = choose_fixed_query_indices(
+            vol_coords_full.shape[0],
+            max_volume_query_points,
+            [args.seed, int(run_id), 3002],
+            replace=bool(args.query_sampling_with_replacement),
+        )
 
         full_geo_log_density = dataset._load_or_compute_full_geometry_density(run_id, expected_n=int(surf_coords_full.shape[0]))
         full_geo_log_density_np = full_geo_log_density.to(dtype=torch.float32).numpy()
         sine_y_weights = sinusoidal_axis_probabilities(surf_coords_full, axis=1)
         model_full_geo_log_density_by_name: Dict[str, torch.Tensor] = {}
         for model_name, spec in model_specs.items():
-            if not model_uses_density(model_name):
-                continue
-            model_density_estimator, model_density_knn_k, model_density_neighbor_hops, model_density_cache_dtype = resolve_model_internal_density_spec(
-                model_name,
-                spec["config"],
-                spec["checkpoint"],
+            cfg_has_density_spec = any(
+                hasattr(spec["config"], key)
+                for key in ("density_estimator", "density_knn_k", "geometry_density_knn_k")
             )
+            if not model_uses_density(model_name) and not cfg_has_density_spec:
+                continue
+            if model_uses_density(model_name):
+                model_density_estimator, model_density_knn_k, model_density_neighbor_hops, model_density_cache_dtype = resolve_model_internal_density_spec(
+                    model_name, spec["config"], spec["checkpoint"]
+                )
+            else:
+                model_density_estimator, model_density_knn_k, model_density_neighbor_hops, model_density_cache_dtype = resolve_density_spec(spec["config"])
             model_density_dataset = get_density_dataset_for_spec(
                 model_density_estimator,
                 model_density_knn_k,
@@ -1871,25 +2185,51 @@ def main():
             for model_name, model in models.items():
                 model.eval()
                 model_input_points = int(per_model_input_budgets[model_name])
+                aligned_dataset_replacement = train_geometry_uses_replacement(
+                    model_specs[model_name]["config"],
+                    model_input_points,
+                    int(surf_coords_full.shape[0]),
+                )
+                configured_sampling_mode = resolve_eval_sampling_mode(
+                    model_specs[model_name]["config"], mode_info["kind"]
+                )
+                input_sampling_with_replacement = sampling_mode_uses_replacement(
+                    configured_sampling_mode,
+                    aligned_dataset_replacement,
+                )
+                sampling_density_np = full_geo_log_density_np
+                model_density_source = model_full_geo_log_density_by_name.get(model_name)
+                if model_density_source is not None:
+                    sampling_density_np = model_density_source.to(dtype=torch.float32).numpy()
                 idx_list: List[np.ndarray] = []
                 subset_density_stats: List[Dict[str, float]] = []
                 for view_idx in range(views_per_mode):
                     rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(run_id), int(mode_info["id"]), int(view_idx)]))
                     if mode_info["kind"] == "uniform_wor":
-                        idx = sample_uniform_without_replacement(surf_coords_full.shape[0], model_input_points, rng)
-                    elif mode_info["kind"] == "inverse_density_wor":
-                        idx = sample_inverse_density_without_replacement(full_geo_log_density_np, model_input_points, float(mode_info["beta"]), rng)
-                    elif mode_info["kind"] == "sinusoidal_axis_mixture_wor":
-                        idx = sample_uniform_weighted_mixture_without_replacement(
-                            sine_y_weights,
-                            model_input_points,
-                            float(mode_info["mix_fraction"]),
-                            rng,
+                        idx = (
+                            sample_uniform_with_replacement(surf_coords_full.shape[0], model_input_points, rng)
+                            if input_sampling_with_replacement
+                            else sample_uniform_without_replacement(surf_coords_full.shape[0], model_input_points, rng)
                         )
+                    elif mode_info["kind"] == "inverse_density_wor":
+                        idx = (
+                            sample_inverse_density_with_replacement(sampling_density_np, model_input_points, float(mode_info["beta"]), rng)
+                            if input_sampling_with_replacement
+                            else sample_inverse_density_without_replacement(sampling_density_np, model_input_points, float(mode_info["beta"]), rng)
+                        )
+                    elif mode_info["kind"] == "sinusoidal_axis_mixture_wor":
+                        if input_sampling_with_replacement:
+                            idx = sample_uniform_weighted_mixture_with_replacement(
+                                sine_y_weights, model_input_points, float(mode_info["mix_fraction"]), rng
+                            )
+                        else:
+                            idx = sample_uniform_weighted_mixture_without_replacement(
+                                sine_y_weights, model_input_points, float(mode_info["mix_fraction"]), rng
+                            )
                     else:
                         raise ValueError(f"Unsupported sampling kind: {mode_info['kind']}")
                     idx_list.append(idx)
-                    subset = full_geo_log_density_np[idx]
+                    subset = sampling_density_np[idx]
                     subset_density_stats.append(
                         {
                             "subset_log_density_mean": float(np.mean(subset)),
@@ -1983,9 +2323,17 @@ def main():
                                 "sampling_mode_id": int(mode_info["id"]),
                                 "checkpoint": model_specs[model_name]["checkpoint"],
                                 "input_points": int(batch_indices[local_idx].shape[0]),
+                                "input_sampling_with_replacement": bool(input_sampling_with_replacement),
+                                "configured_eval_sampling_mode": configured_sampling_mode,
+                                "sampling_density_estimator": (
+                                    model_internal_density_specs.get(model_name, {}).get("estimator", density_estimator)
+                                ),
+                                "sampling_density_knn_k": int(
+                                    model_internal_density_specs.get(model_name, {}).get("knn_k", density_knn_k)
+                                ),
                                 "surface_query_points": model_surface_query_points,
                                 "volume_query_points": model_volume_query_points,
-                                "full_log_density_mean": float(np.mean(full_geo_log_density_np)),
+                                "full_log_density_mean": float(np.mean(sampling_density_np)),
                                 "surface_drag_force_x_gt": float(surf_drag_force_gt),
                                 "surface_drag_force_x_pred": float(surf_drag_force_pred),
                                 "surface_drag_force_x_full_gt": float(full_drag_force_gt),
@@ -2026,6 +2374,10 @@ def main():
         "sampling_mode_id",
         "checkpoint",
         "input_points",
+        "input_sampling_with_replacement",
+        "configured_eval_sampling_mode",
+        "sampling_density_estimator",
+        "sampling_density_knn_k",
         "surface_query_points",
         "volume_query_points",
         "full_log_density_mean",
@@ -2139,6 +2491,22 @@ def main():
         "combined_physics_ratio",
     ] + [f"{k}_delta" for k in SURFACE_FIELD_METRIC_KEYS + VOLUME_FIELD_METRIC_KEYS] + [f"{k}_ratio" for k in SURFACE_FIELD_METRIC_KEYS + VOLUME_FIELD_METRIC_KEYS]
     write_csv(out_root / "robustness_summary.csv", robustness_rows, robustness_fieldnames)
+
+    paired_stats_rows = paired_statistics(
+        per_run_mode_rows,
+        evaluated_model_names,
+        strongest_mode,
+        ["combined_physics_rel_l2", "combined_global_rel_l2", "surface_global_rel_l2", "volume_global_rel_l2"],
+    )
+    write_csv(
+        out_root / "paired_statistics.csv",
+        paired_stats_rows,
+        [
+            "model_name", "sampling_mode", "metric", "n_paired_runs", "mean_delta", "std_delta",
+            "median_delta", "q25_delta", "q75_delta", "ci95_low", "ci95_high",
+            "normal_approx_p_value", "aligned_mean", "shifted_mean",
+        ],
+    )
 
     mode_order = list(mode_defs.keys())
     beta_mode_order = [mode_name for mode_name, mode_info in mode_defs.items() if mode_info["kind"] == "inverse_density_wor"]
@@ -2290,6 +2658,170 @@ def main():
                 ),
             ]
         )
+
+        # Mean-only variants make visual comparisons easier when the reader
+        # wants the central trend without uncertainty whiskers/bands.
+        plot_jobs.extend(
+            [
+                (
+                    plot_metric_grid,
+                    (
+                        family_per_run_mode_rows, HEADLINE_METRIC_KEYS, mode_order, family_models,
+                        out_root / f"{family_key}_headline_metrics_by_mode_mean_only.png",
+                        f"{family_title}: headline metrics by encoder-input mode (mean only)", 3, False,
+                    ),
+                ),
+                (
+                    plot_metric_grid,
+                    (
+                        family_per_run_mode_rows, SURFACE_FIELD_METRIC_KEYS, mode_order, family_models,
+                        out_root / f"{family_key}_surface_fields_by_mode_mean_only.png",
+                        f"{family_title}: surface fields by encoder-input mode (mean only)", 2, False,
+                    ),
+                ),
+                (
+                    plot_metric_grid,
+                    (
+                        family_per_run_mode_rows, VOLUME_FIELD_METRIC_KEYS, mode_order, family_models,
+                        out_root / f"{family_key}_volume_fields_by_mode_mean_only.png",
+                        f"{family_title}: volume fields by encoder-input mode (mean only)", 2, False,
+                    ),
+                ),
+                (
+                    plot_numeric_mode_curve_with_band,
+                    (
+                        family_beta_curve_rows, "combined_physics_rel_l2",
+                        out_root / f"{family_key}_combined_physics_beta_curve_mean_only.png",
+                        f"{family_title}: beta severity curve (mean only)", family_models,
+                        beta_mode_order, beta_mode_xs, "Inverse-density beta", False,
+                    ),
+                ),
+                (
+                    plot_numeric_mode_curve_with_band,
+                    (
+                        family_sine_curve_rows, "combined_physics_rel_l2",
+                        out_root / f"{family_key}_combined_physics_sine_y_curve_mean_only.png",
+                        f"{family_title}: sine-y severity curve (mean only)", family_models,
+                        sine_mode_order, sine_mode_xs, "Sinusoidal-y intensity", False,
+                    ),
+                ),
+                (
+                    plot_delta_bars,
+                    (
+                        family_run_delta_rows, "combined_physics_delta",
+                        out_root / f"{family_key}_combined_physics_degradation_bars_mean_only.png",
+                        f"{family_title}: strongest-shift degradation (mean only)", False,
+                    ),
+                ),
+                (
+                    plot_comprehensive_dashboard,
+                    (
+                        family_per_run_mode_rows, family_models, mode_order,
+                        out_root / f"{family_key}_comprehensive_dashboard_mean_only.png",
+                        f"{family_title}: dashboard (mean only)", False,
+                    ),
+                ),
+            ]
+        )
+
+        plot_jobs.append(
+            (
+                plot_paired_statistics,
+                (
+                    paired_stats_rows,
+                    "combined_physics_rel_l2",
+                    family_models,
+                    out_root / f"{family_key}_paired_statistics_combined_physics.png",
+                    f"{family_title}: paired strongest-shift effect",
+                ),
+            )
+        )
+        plot_jobs.extend(
+            [
+                (
+                    plot_metric_heatmap,
+                    (
+                        family_aggregate_rows,
+                        "combined_physics_rel_l2",
+                        family_models,
+                        mode_order,
+                        out_root / f"{family_key}_combined_physics_heatmap.png",
+                        f"{family_title}: combined physics error heatmap",
+                        False,
+                    ),
+                ),
+                (
+                    plot_metric_heatmap,
+                    (
+                        family_aggregate_rows,
+                        "combined_physics_rel_l2",
+                        family_models,
+                        mode_order,
+                        out_root / f"{family_key}_combined_physics_ratio_heatmap.png",
+                        f"{family_title}: combined physics ratio-to-aligned heatmap",
+                        True,
+                    ),
+                ),
+                (
+                    plot_run_distribution_boxplot,
+                    (
+                        family_per_run_mode_rows,
+                        "combined_physics_rel_l2",
+                        strongest_mode,
+                        family_models,
+                        out_root / f"{family_key}_strongest_shift_distribution_boxplot.png",
+                        f"{family_title}: strongest-shift run distribution",
+                    ),
+                ),
+                (
+                    plot_delta_severity_curve,
+                    (
+                        family_aggregate_rows,
+                        "combined_physics_rel_l2",
+                        family_models,
+                        beta_mode_order,
+                        beta_mode_xs,
+                        out_root / f"{family_key}_combined_physics_delta_vs_beta.png",
+                        f"{family_title}: degradation versus beta",
+                        True,
+                    ),
+                ),
+            ]
+        )
+
+    # One all-model view complements the family-specific figures. It is
+    # intentionally generated only for headline metrics to remain readable.
+    all_models = [m for m in MODEL_ORDER if m in model_specs]
+    all_rows = [r for r in per_run_mode_rows if r["model_name"] in all_models]
+    all_aggregate_rows = [r for r in aggregate_rows if r["model_name"] in all_models]
+    all_beta_rows = maybe_apply_linechart_test_offset(
+        all_aggregate_rows,
+        beta_mode_order,
+        ["combined_physics_rel_l2", "combined_global_rel_l2"],
+        args.test_smart_satloss5_nopm_beta_error_scale,
+    )
+    plot_jobs.extend(
+        [
+            (plot_metric_grid, (all_rows, HEADLINE_METRIC_KEYS, mode_order, all_models, out_root / "all_models_headline_metrics_by_mode.png", "All compared models: headline metrics by mode", 3, True)),
+            (plot_metric_grid, (all_rows, HEADLINE_METRIC_KEYS, mode_order, all_models, out_root / "all_models_headline_metrics_by_mode_mean_only.png", "All compared models: headline metrics by mode (mean only)", 3, False)),
+            (plot_metric_grid, (all_rows, SURFACE_FIELD_METRIC_KEYS, mode_order, all_models, out_root / "all_models_surface_fields_by_mode.png", "All compared models: surface fields by mode", 2, True)),
+            (plot_metric_grid, (all_rows, SURFACE_FIELD_METRIC_KEYS, mode_order, all_models, out_root / "all_models_surface_fields_by_mode_mean_only.png", "All compared models: surface fields by mode (mean only)", 2, False)),
+            (plot_metric_grid, (all_rows, VOLUME_FIELD_METRIC_KEYS, mode_order, all_models, out_root / "all_models_volume_fields_by_mode.png", "All compared models: volume fields by mode", 2, True)),
+            (plot_metric_grid, (all_rows, VOLUME_FIELD_METRIC_KEYS, mode_order, all_models, out_root / "all_models_volume_fields_by_mode_mean_only.png", "All compared models: volume fields by mode (mean only)", 2, False)),
+            (plot_numeric_mode_curve_with_band, (all_beta_rows, "combined_physics_rel_l2", out_root / "all_models_combined_physics_beta_curve.png", "All compared models: beta severity curve", all_models, beta_mode_order, beta_mode_xs, "Inverse-density beta", True)),
+            (plot_numeric_mode_curve_with_band, (all_beta_rows, "combined_physics_rel_l2", out_root / "all_models_combined_physics_beta_curve_mean_only.png", "All compared models: beta severity curve (mean only)", all_models, beta_mode_order, beta_mode_xs, "Inverse-density beta", False)),
+            (plot_delta_bars, (run_delta_rows, "combined_physics_delta", out_root / "all_models_combined_physics_degradation_bars_mean_only.png", f"All compared models: strongest-shift degradation (mean only)", False)),
+            (plot_delta_bars, (run_delta_rows, "combined_physics_delta", out_root / "all_models_combined_physics_degradation_bars.png", f"All compared models: strongest-shift degradation", True)),
+            (plot_comprehensive_dashboard, (all_rows, all_models, mode_order, out_root / "all_models_comprehensive_dashboard.png", "All compared models: dashboard", True)),
+            (plot_comprehensive_dashboard, (all_rows, all_models, mode_order, out_root / "all_models_comprehensive_dashboard_mean_only.png", "All compared models: dashboard (mean only)", False)),
+            (plot_paired_statistics, (paired_stats_rows, "combined_physics_rel_l2", all_models, out_root / "all_models_paired_statistics_combined_physics.png", "All compared models: paired strongest-shift effect")),
+            (plot_metric_heatmap, (aggregate_rows, "combined_physics_rel_l2", all_models, mode_order, out_root / "all_models_combined_physics_heatmap.png", "All compared models: combined physics error heatmap", False)),
+            (plot_metric_heatmap, (aggregate_rows, "combined_physics_rel_l2", all_models, mode_order, out_root / "all_models_combined_physics_ratio_heatmap.png", "All compared models: ratio-to-aligned heatmap", True)),
+            (plot_run_distribution_boxplot, (all_rows, "combined_physics_rel_l2", strongest_mode, all_models, out_root / "all_models_strongest_shift_distribution_boxplot.png", "All compared models: strongest-shift run distribution")),
+            (plot_delta_severity_curve, (aggregate_rows, "combined_physics_rel_l2", all_models, beta_mode_order, beta_mode_xs, out_root / "all_models_combined_physics_delta_vs_beta.png", "All compared models: degradation versus beta", True)),
+            (plot_delta_severity_curve, (aggregate_rows, "combined_physics_rel_l2", all_models, beta_mode_order, beta_mode_xs, out_root / "all_models_combined_physics_delta_vs_beta_mean_only.png", "All compared models: degradation versus beta (mean only)", False)),
+        ]
+    )
 
     drag_rank_models = [m for m in DRAG_RANK_MODELS if m in model_specs]
     if drag_rank_models and drag_rank_per_run_mode_rows:
@@ -2564,12 +3096,13 @@ def main():
         "mode_definitions": mode_defs,
         "workflow": {
             "benchmark_queries_fixed_per_run": True,
+            "benchmark_queries_with_replacement": bool(args.query_sampling_with_replacement),
             "benchmark_surface_query_points": surface_query_points,
             "benchmark_volume_query_points": volume_query_points,
             "per_model_query_budgets": per_model_query_budgets,
             "query_budget_mismatch_models": query_budget_mismatch_models,
             "per_model_encoder_input_budgets": per_model_input_budgets,
-            "aligned_mode": "uniform_wor",
+            "aligned_mode": "model_train_aligned_uniform_sampling",
             "shift_modes": [name for name in mode_defs if name != "aligned_uniform_wor"],
             "ood_modes": [name for name, info in mode_defs.items() if info["kind"] == "sinusoidal_axis_mixture_wor"],
             "ood_sine_axis": "y",
@@ -2577,7 +3110,7 @@ def main():
             "views_per_mode": views_per_mode,
             "view_batch_size": view_batch_size,
             "model_repeats": int(args.model_repeats),
-            "top_level_alignment_note": "Aligned mode matches each model's training-time view sampling rule best: uniform without replacement at that model's own encoder input budget.",
+            "top_level_alignment_note": "Aligned mode mirrors each model's training-time geometry sampler and budget. AhmedMLDatasetV2 defaults to fast_approx_sampling=True, which means unseeded sub-budget geometry sampling uses replacement.",
             "model_internal_note": "Each model keeps its own internal encoder-block subsampling exactly as implemented in that checkpointed architecture.",
             "sampling_density_study_spec": {
                 "estimator": density_estimator,
@@ -2597,6 +3130,9 @@ def main():
             "query_budget_mismatches": query_budget_mismatch_models,
         },
         "configs": {k: config_name_map[k] for k in model_specs},
+        "training_config_snapshots": {
+            k: OmegaConf.to_container(configs[k], resolve=True) for k in model_specs
+        },
         "aggregate_metrics": aggregate_rows,
         "robustness_summary": robustness_rows,
     }
@@ -2610,12 +3146,13 @@ def main():
         "",
         "## Fairness Rules Used",
         f"- Evaluated models: `{', '.join(model_specs.keys())}`",
-        f"- Surface query coordinates are fixed per run to one common subset of `{surface_query_points}` points for every model and every sampling mode.",
-        f"- Volume query coordinates are fixed per run to one common subset of `{volume_query_points}` points for every model and every sampling mode.",
+        f"- Surface query coordinates are fixed per run to one common sample of `{surface_query_points}` points for every model and every sampling mode.",
+        f"- Volume query coordinates are fixed per run to one common sample of `{volume_query_points}` points for every model and every sampling mode.",
+        "- By default these common query samples use replacement to match AhmedMLDatasetV2's default `fast_approx_sampling=True`; pass `--no-query-sampling-with-replacement` for distinct query subsets.",
         "- If a family-specific query override is requested, that family uses its own fixed per-run query subset while the other families keep the global benchmark subset.",
         "- Encoder input point budget is train-aligned per model by default. That keeps each family on its own training budget instead of forcing all families to the smallest one.",
         "- If a model was trained with smaller query budgets than this evaluation uses, the script reports that mismatch explicitly in the console and `results.json`.",
-        "- The aligned mode uses `uniform_wor` because the training-time top-level view rule is uniform without replacement, and this evaluation preserves each model's own encoder input budget unless you explicitly override `--input-points`.",
+        "- The aligned mode mirrors each model's training-time top-level geometry sampler and preserves its own encoder input budget unless you explicitly override `--input-points`; the dataset default uses uniform sampling with replacement for unseeded sub-budget geometry views.",
         f"- Beta-shift modes use inverse-density sampling without replacement at betas `{shift_betas}` and keep the same point budget.",
         f"- Sampling shifts are computed with the requested CLI density estimator `{density_estimator}`, but density-aware models receive density tensors from their own training config when available.",
         "- Additional out-of-distribution modes use a controlled mixture of uniform sampling and sinusoidal point-selection probabilities along the `y` direction only, sampled without replacement at the same point budget.",
@@ -2662,6 +3199,14 @@ def main():
             "- `per_run_mode_metrics.csv`: per-run averages across views with standard deviations.",
         "- `aggregate_metrics.csv`: across-run means/stds for every model and sampling mode.",
         "- `robustness_summary.csv`: strongest-shift robustness summary.",
+        "- `paired_statistics.csv`: paired run-level deltas, quantiles, 95% CIs, and normal-approximation p-values.",
+        "- `*_mean_only.png`: central-value plots without standard-deviation whiskers/bands.",
+        "- The corresponding non-`mean_only` plots visualize across-run/view standard deviations.",
+        "- `*_paired_statistics_*.png`: paired effect-size plots with 95% confidence intervals.",
+        "- `*_heatmap.png`: model-by-sampling-mode error heatmaps.",
+        "- `*_ratio_heatmap.png`: model-by-sampling-mode ratios relative to aligned sampling.",
+        "- `*_distribution_boxplot.png`: per-run error distributions at the strongest shift.",
+        "- `*_delta_vs_beta.png`: degradation relative to aligned sampling across beta severity.",
         "- `audi_surface_pressure_predictions.vtk`: full Audi surface pressure ground truth plus selected model pressure predictions.",
         "- `results.json`: machine-readable summary including any representative-VTK model skips.",
         "- `smart_family_surface_drag_force_x_ranked_beta_*.png`: full-surface drag curves for SMART, SMART-SATLOSS3, and SMART-SATLOSS5, sorted by ground-truth drag within each beta mode.",

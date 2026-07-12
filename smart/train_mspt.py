@@ -1,13 +1,13 @@
 import hydra
 from omegaconf import DictConfig
 
-from models.ginot import GINOT
+from models.mspt import MSPT
 from utils.surface_volume_trainer import run_surface_volume_training
 
 
-@hydra.main(version_base="1.2", config_path="config", config_name="drivaerml_ginot")
+@hydra.main(version_base="1.2", config_path="config", config_name="drivaerml_mspt")
 def main(cfg: DictConfig):
-    run_surface_volume_training(cfg, GINOT, accepts_geo_log_density=False)
+    run_surface_volume_training(cfg, MSPT, accepts_geo_log_density=False)
 
 
 if __name__ == "__main__":

@@ -9,30 +9,37 @@ hydra:
     dir: .
 
 wandb:
-  project: "smart"
+  project: "smart_drivaerml"
   entity: "parsa-vatani99-technical-university-of-munich"
 
 experiment:
-  name: "DrivAerML_GINOT"
-  model_name: "GINOT"
+  name: "DrivAerML_MSPT"
+  model_name: "MSPT"
   model_tag: ""
   random_seed: 42
   manifest_variant: "full"
 
   architecture:
-    latent_dim: 256
-    latent_geometry_points: 4096
-    local_geometry_points: 4096
-    local_group_k: 16
-    subsampled_geometry_points: 32768
-    num_encoder_decoder_blocks: 6
-    num_heads: 8
-    pos_scale_factor: 100
+    # SMART-matched capacity and official MSPT defaults where applicable.
+    num_blocks: 4
+    n_hidden: 192
+    num_heads: 4
+    dropout: 0.1
+    activation: "gelu"
+    mlp_ratio: 1
+    V: 128
+    Q: 1
+    attn_pool: "mean"
+    chunking_mode: "balltree"
+    use_rope: False
+    rope_base: 10000.0
+    use_flash_attn: False
+    use_checkpoint: True
 
   optimizer: "adamw"
   loss_fn: "rel_l2"
   scheduler: "cosine"
-  scheduler_warumup_fraction: 0.2
+  scheduler_warmup_fraction: 0.2
   batch_size: 1
   epochs: 300
   learning_rate: 2.e-4
@@ -40,14 +47,20 @@ experiment:
   amp: True
   precision: "float16"
   log_every_n_steps: 10
+  wandb_watch_model: False
+  init_ckpt: ""
   resume_ckpt: ""
+  resume_full_state: False
 
   dataset: "DrivAerML"
   data_path: "/mnt/ssdraid/parsa/drivaerml_preprocessed"
   num_workers: 8
   prefetch_factor: 4
   pin_memory: True
-  num_body_points: 0
+  cuda_batch_prefetch: True
+  # Match SMART vanilla: uniform, epoch-varying geometry views.
+  geometry_epoch_seeded_sampling: True
+  num_body_points: 65536
   num_surface_points: 65536
   num_volume_points: 65536
   scale_positions: False

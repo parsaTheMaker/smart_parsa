@@ -156,6 +156,19 @@ MODEL_COLORS = {
     "MSPT": "#BCBD22",
     "MSPT_SATLOSS6": "#9467BD",
 }
+# Standard Matplotlib tab10 colors for line plots.  These are intentionally
+# separate from the broader chart palette used by bars and heatmaps.
+LINE_MODEL_COLORS = {
+    "SMART": "#1F77B4",
+    "SMART_AUGMENTED": "#9467BD",
+    "SMART_MASKED": "#8C564B",
+    "SMART_SAT": "#17BECF",
+    "TRANSOLVERPP": "#FF7F0E",
+    "TRANSOLVERPP_SAT": "#2CA02C",
+    "ABUPT": "#D62728",
+    "POINTNET": "#9467BD",
+    "MSPT": "#2CA02C",
+}
 DRAG_RANK_MODELS = [
     "SMART",
     "SMART_AUGMENTED",
@@ -1191,22 +1204,58 @@ def select_run_ids(test_ids: Iterable[int], num_runs: int, run_ids_arg: str | No
     return sorted(int(x) for x in rng.choice(np.array(test_ids, dtype=np.int64), size=n, replace=False))
 
 
-def train_encoder_input_points(cfg) -> int:
+def train_encoder_input_points(cfg, model_name: str | None = None) -> int:
+    """Return the top-level geometry cloud seen by the model.
+
+    SMART-family architectures also contain an internal
+    ``architecture.subsampled_geometry_points`` value.  That is the number
+    of points sampled inside encoder blocks, not the input cloud budget used
+    by the training view.  Prefer explicit top-level view budgets so the two
+    values cannot be confused.
+    """
     num_body_points = int(getattr(cfg, "num_body_points", 0))
     if num_body_points > 0:
         return num_body_points
+
+    primary_view_geometry_points = int(getattr(cfg, "primary_view_geometry_points", 0))
+    if primary_view_geometry_points > 0:
+        return primary_view_geometry_points
+
+    view_geometry_points = int(getattr(cfg, "view_geometry_points", 0))
+    if view_geometry_points > 0:
+        return view_geometry_points
+
+    eval_view_geometry_points = int(getattr(cfg, "eval_view_geometry_points", 0))
+    if eval_view_geometry_points > 0:
+        return eval_view_geometry_points
+
     architecture = getattr(cfg, "architecture", None)
     if architecture is not None:
         arch_subsampled_geometry_points = int(getattr(architecture, "subsampled_geometry_points", 0))
         if arch_subsampled_geometry_points > 0:
             return arch_subsampled_geometry_points
-    eval_view_geometry_points = int(getattr(cfg, "eval_view_geometry_points", 0))
-    if eval_view_geometry_points > 0:
-        return eval_view_geometry_points
-    view_geometry_points = int(getattr(cfg, "view_geometry_points", 0))
-    if view_geometry_points > 0:
-        return view_geometry_points
-    raise ValueError("Could not infer training encoder input point budget from config.")
+    model_suffix = f" for {model_name}" if model_name else ""
+    raise ValueError(f"Could not infer training encoder input point budget{model_suffix} from config.")
+
+
+def summarize_training_view_config(model_name: str, cfg, checkpoint: str) -> None:
+    """Print the config values that control comparison-time model inputs."""
+    architecture = getattr(cfg, "architecture", None)
+    internal_subsampled = (
+        int(getattr(architecture, "subsampled_geometry_points", 0))
+        if architecture is not None
+        else 0
+    )
+    print(
+        f"{model_name} config: "
+        f"input={train_encoder_input_points(cfg, model_name)}, "
+        f"primary={int(getattr(cfg, 'primary_view_geometry_points', 0))}, "
+        f"secondary={int(getattr(cfg, 'secondary_view_geometry_points', 0))}, "
+        f"view={int(getattr(cfg, 'view_geometry_points', 0))}, "
+        f"internal_subsample={internal_subsampled}, "
+        f"seeded_sampling={bool(getattr(cfg, 'geometry_epoch_seeded_sampling', False))}, "
+        f"checkpoint={checkpoint}"
+    )
 
 
 def train_geometry_uses_replacement(cfg, point_count: int, full_point_count: int) -> bool:
@@ -1351,6 +1400,16 @@ def mode_color(mode_name: str) -> str:
     return "#999999"
 
 
+def model_line_visuals(model_name: str) -> Tuple[str, str]:
+    """Use one family color while distinguishing vanilla and SATLOSS lines."""
+    satloss_match = re.match(r"^(.*)_SATLOSS\d+(?:_NOPM)?$", str(model_name))
+    if satloss_match:
+        vanilla_name = satloss_match.group(1)
+        color = LINE_MODEL_COLORS.get(vanilla_name, MODEL_COLORS[model_name])
+        return color, "-."
+    return LINE_MODEL_COLORS.get(model_name, MODEL_COLORS[model_name]), "-"
+
+
 def seed_everything(seed: int) -> None:
     seed = int(seed)
     random.seed(seed)
@@ -1445,8 +1504,8 @@ def plot_numeric_mode_curve_with_band(
         }
         ys = np.array([float(row_map[mode_name][metric_key]) for mode_name in mode_order], dtype=np.float64)
         yerr = np.array([float(row_map[mode_name][f"{metric_key}_std"]) for mode_name in mode_order], dtype=np.float64)
-        color = MODEL_COLORS[model_name]
-        ax.plot(xs, ys, marker="o", linewidth=2, color=color, label=MODEL_LABELS[model_name])
+        color, linestyle = model_line_visuals(model_name)
+        ax.plot(xs, ys, marker="o", linewidth=2, color=color, linestyle=linestyle, label=MODEL_LABELS[model_name])
         if show_std:
             ax.fill_between(xs, ys - yerr, ys + yerr, color=color, alpha=0.18)
     ax.set_xticks(xs)
@@ -1542,8 +1601,8 @@ def plot_ranked_curve_with_band(
         ys = np.array([float(model_rows[run_id][value_key]) for run_id in run_order], dtype=np.float64)
         yerr_key = f"{value_key}_std"
         yerr = np.array([float(model_rows[run_id].get(yerr_key, 0.0)) for run_id in run_order], dtype=np.float64)
-        color = MODEL_COLORS[model_name]
-        ax.plot(x, ys, marker="o", linewidth=2, color=color, label=MODEL_LABELS[model_name])
+        color, linestyle = model_line_visuals(model_name)
+        ax.plot(x, ys, marker="o", linewidth=2, color=color, linestyle=linestyle, label=MODEL_LABELS[model_name])
         ax.fill_between(x, ys - yerr, ys + yerr, color=color, alpha=0.16)
 
     ax.set_xlabel(x_label)
@@ -1818,8 +1877,8 @@ def plot_delta_severity_curve(
                 ystd.append(float(row.get(f"{metric_key}_std", 0.0)))
         ys = np.asarray(ys, dtype=np.float64)
         ystd = np.asarray(ystd, dtype=np.float64)
-        color = MODEL_COLORS[model_name]
-        ax.plot(xs, ys, marker="o", linewidth=2, color=color, label=MODEL_LABELS[model_name])
+        color, linestyle = model_line_visuals(model_name)
+        ax.plot(xs, ys, marker="o", linewidth=2, color=color, linestyle=linestyle, label=MODEL_LABELS[model_name])
         if show_std:
             ax.fill_between(xs, ys - ystd, ys + ystd, color=color, alpha=0.14)
     ax.axhline(0.0, color="black", linestyle="--", linewidth=1)
@@ -1827,6 +1886,218 @@ def plot_delta_severity_curve(
     ax.set_ylabel("Shifted - aligned rel-L2")
     ax.set_title(title)
     ax.legend(fontsize=8)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def build_percentage_degradation_rows(
+    per_run_mode_rows: List[Dict[str, object]],
+    model_order: Sequence[str],
+    metric_keys: Sequence[str],
+) -> List[Dict[str, object]]:
+    """Compute paired percentage worsening relative to each model's aligned view."""
+    lookup = {
+        (str(row["model_name"]), int(row["run_id"]), str(row["sampling_mode"])): row
+        for row in per_run_mode_rows
+    }
+    out: List[Dict[str, object]] = []
+    for model_name in model_order:
+        model_rows = [row for row in per_run_mode_rows if row["model_name"] == model_name]
+        for shifted in model_rows:
+            mode_name = str(shifted["sampling_mode"])
+            if mode_name == "aligned_uniform_wor":
+                continue
+            aligned = lookup.get((str(model_name), int(shifted["run_id"]), "aligned_uniform_wor"))
+            if aligned is None:
+                continue
+            result = {
+                "run_id": int(shifted["run_id"]),
+                "model_name": str(model_name),
+                "sampling_mode": mode_name,
+                "sampling_kind": shifted["sampling_kind"],
+                "sampling_mode_id": int(shifted["sampling_mode_id"]),
+            }
+            for metric_key in metric_keys:
+                baseline = max(abs(float(aligned[metric_key])), 1.0e-12)
+                result[f"{metric_key}_pct_worsening"] = 100.0 * (
+                    float(shifted[metric_key]) - float(aligned[metric_key])
+                ) / baseline
+            out.append(result)
+    return out
+
+
+def plot_percentage_degradation_curve(
+    percentage_rows: List[Dict[str, object]],
+    metric_key: str,
+    model_order: Sequence[str],
+    mode_order: Sequence[str],
+    x_values: Sequence[float],
+    out_path: Path,
+    title: str,
+    x_label: str,
+    show_std: bool = True,
+) -> None:
+    pct_key = f"{metric_key}_pct_worsening"
+    fig, ax = plt.subplots(figsize=(9.2, 5.8), constrained_layout=True)
+    xs = np.asarray(x_values, dtype=np.float64)
+    for model_name in model_order:
+        ys = []
+        ystd = []
+        for mode_name in mode_order:
+            values = np.asarray(
+                [
+                    float(row[pct_key])
+                    for row in percentage_rows
+                    if row["model_name"] == model_name and row["sampling_mode"] == mode_name
+                ],
+                dtype=np.float64,
+            )
+            ys.append(float(np.mean(values)) if values.size else np.nan)
+            ystd.append(float(np.std(values)) if values.size else 0.0)
+        ys = np.asarray(ys, dtype=np.float64)
+        ystd = np.asarray(ystd, dtype=np.float64)
+        color, linestyle = model_line_visuals(model_name)
+        ax.plot(xs, ys, marker="o", linewidth=2, color=color, linestyle=linestyle, label=MODEL_LABELS[model_name])
+        if show_std:
+            ax.fill_between(xs, ys - ystd, ys + ystd, color=color, alpha=0.15)
+    ax.axhline(0.0, color="black", linestyle="--", linewidth=1)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("Worsening relative to aligned (%)")
+    ax.set_title(title)
+    ax.legend(fontsize=8)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def plot_family_percentage_degradation_curve(
+    percentage_rows: List[Dict[str, object]],
+    metric_key: str,
+    family_groups: OrderedDict,
+    model_names: Sequence[str],
+    mode_order: Sequence[str],
+    x_values: Sequence[float],
+    out_path: Path,
+    title: str,
+    x_label: str,
+    show_std: bool = True,
+) -> None:
+    pct_key = f"{metric_key}_pct_worsening"
+    fig, ax = plt.subplots(figsize=(9.2, 5.8), constrained_layout=True)
+    xs = np.asarray(x_values, dtype=np.float64)
+    active_models = set(model_names)
+    family_colors = plt.cm.tab10(np.linspace(0.0, 1.0, max(len(family_groups), 1)))
+    color_idx = 0
+    for family_key, family_models in family_groups.items():
+        present = [model for model in family_models if model in active_models]
+        if not present:
+            continue
+        ys = []
+        ystd = []
+        for mode_name in mode_order:
+            values = np.asarray(
+                [
+                    float(row[pct_key])
+                    for row in percentage_rows
+                    if row["model_name"] in present and row["sampling_mode"] == mode_name
+                ],
+                dtype=np.float64,
+            )
+            ys.append(float(np.mean(values)) if values.size else np.nan)
+            ystd.append(float(np.std(values)) if values.size else 0.0)
+        color = family_colors[color_idx % len(family_colors)]
+        color_idx += 1
+        ys = np.asarray(ys, dtype=np.float64)
+        ystd = np.asarray(ystd, dtype=np.float64)
+        ax.plot(xs, ys, marker="o", linewidth=2.2, color=color, label=family_key.replace("_", " "))
+        if show_std:
+            ax.fill_between(xs, ys - ystd, ys + ystd, color=color, alpha=0.14)
+    ax.axhline(0.0, color="black", linestyle="--", linewidth=1)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("Mean worsening relative to aligned (%)")
+    ax.set_title(title)
+    ax.legend(fontsize=9)
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def plot_percentage_degradation_heatmap(
+    percentage_rows: List[Dict[str, object]],
+    metric_key: str,
+    model_order: Sequence[str],
+    mode_order: Sequence[str],
+    out_path: Path,
+    title: str,
+) -> None:
+    pct_key = f"{metric_key}_pct_worsening"
+    values = np.full((len(model_order), len(mode_order)), np.nan, dtype=np.float64)
+    for i, model_name in enumerate(model_order):
+        for j, mode_name in enumerate(mode_order):
+            current = [
+                float(row[pct_key])
+                for row in percentage_rows
+                if row["model_name"] == model_name and row["sampling_mode"] == mode_name
+            ]
+            if current:
+                values[i, j] = float(np.mean(current))
+    fig, ax = plt.subplots(
+        figsize=(max(10.0, 1.25 * len(mode_order)), max(4.5, 0.48 * len(model_order))),
+        constrained_layout=True,
+    )
+    image = ax.imshow(values, aspect="auto", cmap="RdYlGn_r", interpolation="nearest")
+    ax.set_xticks(np.arange(len(mode_order)))
+    ax.set_xticklabels([mode_display_name(mode) for mode in mode_order], rotation=35, ha="right")
+    ax.set_yticks(np.arange(len(model_order)))
+    ax.set_yticklabels([MODEL_LABELS[model] for model in model_order])
+    for i in range(values.shape[0]):
+        for j in range(values.shape[1]):
+            if np.isfinite(values[i, j]):
+                ax.text(j, i, f"{values[i, j]:.1f}%", ha="center", va="center", color="black", fontsize=7)
+    ax.set_xlabel("Encoder-input shift severity")
+    ax.set_ylabel("Model")
+    ax.set_title(title)
+    fig.colorbar(image, ax=ax, label="Worsening relative to aligned (%)")
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def plot_percentage_degradation_bars(
+    percentage_rows: List[Dict[str, object]],
+    metric_key: str,
+    mode_name: str,
+    model_order: Sequence[str],
+    out_path: Path,
+    title: str,
+    show_std: bool = True,
+) -> None:
+    pct_key = f"{metric_key}_pct_worsening"
+    present = []
+    means = []
+    stds = []
+    colors = []
+    for model_name in model_order:
+        values = np.asarray(
+            [
+                float(row[pct_key])
+                for row in percentage_rows
+                if row["model_name"] == model_name and row["sampling_mode"] == mode_name
+            ],
+            dtype=np.float64,
+        )
+        if not values.size:
+            continue
+        present.append(model_name)
+        means.append(float(np.mean(values)))
+        stds.append(float(np.std(values)))
+        colors.append(MODEL_COLORS[model_name])
+    if not present:
+        return
+    fig, ax = plt.subplots(figsize=(max(8.0, 1.25 * len(present)), 5.6), constrained_layout=True)
+    ax.bar(np.arange(len(present)), means, yerr=stds if show_std else None, capsize=4, color=colors, alpha=0.9)
+    ax.axhline(0.0, color="black", linestyle="--", linewidth=1)
+    ax.set_xticks(np.arange(len(present)))
+    ax.set_xticklabels([MODEL_LABELS[model] for model in present], rotation=20, ha="right")
+    ax.set_ylabel("Worsening relative to aligned (%)")
+    ax.set_title(title)
     fig.savefig(out_path, dpi=220)
     plt.close(fig)
 
@@ -1931,12 +2202,13 @@ def main():
     )
     for model_name, spec in model_specs.items():
         print(f"{model_name} checkpoint: {spec['checkpoint']}")
+        summarize_training_view_config(model_name, spec["config"], spec["checkpoint"])
 
     per_model_input_budgets = {
         model_name: (
             int(args.input_points)
             if args.input_points is not None
-            else int(train_encoder_input_points(spec["config"]))
+            else int(train_encoder_input_points(spec["config"], model_name))
         )
         for model_name, spec in model_specs.items()
     }
@@ -2060,7 +2332,7 @@ def main():
             )
     encoder_budget_mismatch_models = []
     for model_name, spec in model_specs.items():
-        train_encoder_points = train_encoder_input_points(spec["config"])
+        train_encoder_points = train_encoder_input_points(spec["config"], model_name)
         eval_encoder_points = int(per_model_input_budgets[model_name])
         if int(eval_encoder_points) != int(train_encoder_points):
             encoder_budget_mismatch_models.append(
@@ -2508,6 +2780,20 @@ def main():
         ],
     )
 
+    percentage_metric_keys = HEADLINE_METRIC_KEYS + SURFACE_FIELD_METRIC_KEYS + VOLUME_FIELD_METRIC_KEYS
+    percentage_rows = build_percentage_degradation_rows(
+        per_run_mode_rows,
+        evaluated_model_names,
+        percentage_metric_keys,
+    )
+    write_csv(
+        out_root / "percentage_degradation_metrics.csv",
+        percentage_rows,
+        [
+            "run_id", "model_name", "sampling_mode", "sampling_kind", "sampling_mode_id",
+        ] + [f"{metric_key}_pct_worsening" for metric_key in percentage_metric_keys],
+    )
+
     mode_order = list(mode_defs.keys())
     beta_mode_order = [mode_name for mode_name, mode_info in mode_defs.items() if mode_info["kind"] == "inverse_density_wor"]
     beta_mode_xs = [float(mode_defs[mode_name]["beta"]) for mode_name in beta_mode_order]
@@ -2538,6 +2824,7 @@ def main():
             args.test_smart_satloss5_nopm_beta_error_scale,
         )
         family_run_delta_rows = [r for r in run_delta_rows if r["model_name"] in family_models]
+        family_percentage_rows = [r for r in percentage_rows if r["model_name"] in family_models]
         plot_jobs.extend(
             [
                 (
@@ -2654,6 +2941,108 @@ def main():
                         mode_order,
                         out_root / f"{family_key}_comprehensive_dashboard.png",
                         f"{family_title}: comprehensive sampling-invariance dashboard",
+                    ),
+                ),
+                (
+                    plot_percentage_degradation_curve,
+                    (
+                        family_percentage_rows,
+                        "combined_physics_rel_l2",
+                        family_models,
+                        beta_mode_order,
+                        beta_mode_xs,
+                        out_root / f"{family_key}_combined_physics_percentage_worsening_beta.png",
+                        f"{family_title}: percentage worsening versus beta",
+                        "Inverse-density beta",
+                        True,
+                    ),
+                ),
+                (
+                    plot_percentage_degradation_curve,
+                    (
+                        family_percentage_rows,
+                        "combined_physics_rel_l2",
+                        family_models,
+                        sine_mode_order,
+                        sine_mode_xs,
+                        out_root / f"{family_key}_combined_physics_percentage_worsening_sine.png",
+                        f"{family_title}: percentage worsening versus sine shift",
+                        "Sinusoidal-y intensity",
+                        True,
+                    ),
+                ),
+                (
+                    plot_percentage_degradation_curve,
+                    (
+                        family_percentage_rows,
+                        "combined_physics_rel_l2",
+                        family_models,
+                        beta_mode_order,
+                        beta_mode_xs,
+                        out_root / f"{family_key}_combined_physics_percentage_worsening_beta_mean_only.png",
+                        f"{family_title}: percentage worsening versus beta (mean only)",
+                        "Inverse-density beta",
+                        False,
+                    ),
+                ),
+                (
+                    plot_percentage_degradation_curve,
+                    (
+                        family_percentage_rows,
+                        "combined_physics_rel_l2",
+                        family_models,
+                        sine_mode_order,
+                        sine_mode_xs,
+                        out_root / f"{family_key}_combined_physics_percentage_worsening_sine_mean_only.png",
+                        f"{family_title}: percentage worsening versus sine shift (mean only)",
+                        "Sinusoidal-y intensity",
+                        False,
+                    ),
+                ),
+                (
+                    plot_percentage_degradation_heatmap,
+                    (
+                        family_percentage_rows,
+                        "combined_physics_rel_l2",
+                        family_models,
+                        beta_mode_order,
+                        out_root / f"{family_key}_combined_physics_percentage_worsening_beta_heatmap.png",
+                        f"{family_title}: percentage worsening beta heatmap",
+                    ),
+                ),
+                (
+                    plot_percentage_degradation_heatmap,
+                    (
+                        family_percentage_rows,
+                        "combined_physics_rel_l2",
+                        family_models,
+                        sine_mode_order,
+                        out_root / f"{family_key}_combined_physics_percentage_worsening_sine_heatmap.png",
+                        f"{family_title}: percentage worsening sine heatmap",
+                    ),
+                ),
+                (
+                    plot_percentage_degradation_bars,
+                    (
+                        family_percentage_rows,
+                        "combined_physics_rel_l2",
+                        beta_mode_order[-1],
+                        family_models,
+                        out_root / f"{family_key}_combined_physics_percentage_worsening_beta_max_bars.png",
+                        f"{family_title}: percentage worsening at beta={beta_mode_xs[-1]:.2f}",
+                        True,
+                    ),
+                ),
+                (
+                    plot_percentage_degradation_bars,
+                    (
+                        family_percentage_rows,
+                        "combined_physics_rel_l2",
+                        sine_mode_order[-1],
+                        family_models,
+                        out_root / f"{family_key}_combined_physics_percentage_worsening_sine_max_bars.png",
+                        f"{family_title}: percentage worsening at sine={sine_mode_xs[-1]:.2f}",
+                        True,
                     ),
                 ),
             ]
@@ -2794,9 +3183,16 @@ def main():
     all_models = [m for m in MODEL_ORDER if m in model_specs]
     all_rows = [r for r in per_run_mode_rows if r["model_name"] in all_models]
     all_aggregate_rows = [r for r in aggregate_rows if r["model_name"] in all_models]
+    all_percentage_rows = [r for r in percentage_rows if r["model_name"] in all_models]
     all_beta_rows = maybe_apply_linechart_test_offset(
         all_aggregate_rows,
         beta_mode_order,
+        ["combined_physics_rel_l2", "combined_global_rel_l2"],
+        args.test_smart_satloss5_nopm_beta_error_scale,
+    )
+    all_sine_rows = maybe_apply_linechart_test_offset(
+        all_aggregate_rows,
+        sine_mode_order,
         ["combined_physics_rel_l2", "combined_global_rel_l2"],
         args.test_smart_satloss5_nopm_beta_error_scale,
     )
@@ -2810,6 +3206,8 @@ def main():
             (plot_metric_grid, (all_rows, VOLUME_FIELD_METRIC_KEYS, mode_order, all_models, out_root / "all_models_volume_fields_by_mode_mean_only.png", "All compared models: volume fields by mode (mean only)", 2, False)),
             (plot_numeric_mode_curve_with_band, (all_beta_rows, "combined_physics_rel_l2", out_root / "all_models_combined_physics_beta_curve.png", "All compared models: beta severity curve", all_models, beta_mode_order, beta_mode_xs, "Inverse-density beta", True)),
             (plot_numeric_mode_curve_with_band, (all_beta_rows, "combined_physics_rel_l2", out_root / "all_models_combined_physics_beta_curve_mean_only.png", "All compared models: beta severity curve (mean only)", all_models, beta_mode_order, beta_mode_xs, "Inverse-density beta", False)),
+            (plot_numeric_mode_curve_with_band, (all_sine_rows, "combined_physics_rel_l2", out_root / "all_models_combined_physics_sine_y_curve.png", "All compared models: sinusoidal-y severity curve", all_models, sine_mode_order, sine_mode_xs, "Sinusoidal-y intensity", True)),
+            (plot_numeric_mode_curve_with_band, (all_sine_rows, "combined_physics_rel_l2", out_root / "all_models_combined_physics_sine_y_curve_mean_only.png", "All compared models: sinusoidal-y severity curve (mean only)", all_models, sine_mode_order, sine_mode_xs, "Sinusoidal-y intensity", False)),
             (plot_delta_bars, (run_delta_rows, "combined_physics_delta", out_root / "all_models_combined_physics_degradation_bars_mean_only.png", f"All compared models: strongest-shift degradation (mean only)", False)),
             (plot_delta_bars, (run_delta_rows, "combined_physics_delta", out_root / "all_models_combined_physics_degradation_bars.png", f"All compared models: strongest-shift degradation", True)),
             (plot_comprehensive_dashboard, (all_rows, all_models, mode_order, out_root / "all_models_comprehensive_dashboard.png", "All compared models: dashboard", True)),
@@ -2820,6 +3218,18 @@ def main():
             (plot_run_distribution_boxplot, (all_rows, "combined_physics_rel_l2", strongest_mode, all_models, out_root / "all_models_strongest_shift_distribution_boxplot.png", "All compared models: strongest-shift run distribution")),
             (plot_delta_severity_curve, (aggregate_rows, "combined_physics_rel_l2", all_models, beta_mode_order, beta_mode_xs, out_root / "all_models_combined_physics_delta_vs_beta.png", "All compared models: degradation versus beta", True)),
             (plot_delta_severity_curve, (aggregate_rows, "combined_physics_rel_l2", all_models, beta_mode_order, beta_mode_xs, out_root / "all_models_combined_physics_delta_vs_beta_mean_only.png", "All compared models: degradation versus beta (mean only)", False)),
+            (plot_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", all_models, beta_mode_order, beta_mode_xs, out_root / "all_models_combined_physics_percentage_worsening_beta.png", "All compared models: percentage worsening versus beta", "Inverse-density beta", True)),
+            (plot_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", all_models, sine_mode_order, sine_mode_xs, out_root / "all_models_combined_physics_percentage_worsening_sine.png", "All compared models: percentage worsening versus sine shift", "Sinusoidal-y intensity", True)),
+            (plot_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", all_models, beta_mode_order, beta_mode_xs, out_root / "all_models_combined_physics_percentage_worsening_beta_mean_only.png", "All compared models: percentage worsening versus beta (mean only)", "Inverse-density beta", False)),
+            (plot_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", all_models, sine_mode_order, sine_mode_xs, out_root / "all_models_combined_physics_percentage_worsening_sine_mean_only.png", "All compared models: percentage worsening versus sine shift (mean only)", "Sinusoidal-y intensity", False)),
+            (plot_percentage_degradation_heatmap, (all_percentage_rows, "combined_physics_rel_l2", all_models, beta_mode_order, out_root / "all_models_combined_physics_percentage_worsening_beta_heatmap.png", "All compared models: percentage worsening beta heatmap")),
+            (plot_percentage_degradation_heatmap, (all_percentage_rows, "combined_physics_rel_l2", all_models, sine_mode_order, out_root / "all_models_combined_physics_percentage_worsening_sine_heatmap.png", "All compared models: percentage worsening sine heatmap")),
+            (plot_percentage_degradation_bars, (all_percentage_rows, "combined_physics_rel_l2", beta_mode_order[-1], all_models, out_root / "all_models_combined_physics_percentage_worsening_beta_max_bars.png", f"All compared models: percentage worsening at beta={beta_mode_xs[-1]:.2f}", True)),
+            (plot_percentage_degradation_bars, (all_percentage_rows, "combined_physics_rel_l2", sine_mode_order[-1], all_models, out_root / "all_models_combined_physics_percentage_worsening_sine_max_bars.png", f"All compared models: percentage worsening at sine={sine_mode_xs[-1]:.2f}", True)),
+            (plot_family_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", FAMILY_GROUPS, all_models, beta_mode_order, beta_mode_xs, out_root / "all_families_combined_physics_percentage_worsening_beta.png", "Between families: percentage worsening versus beta", "Inverse-density beta", True)),
+            (plot_family_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", FAMILY_GROUPS, all_models, sine_mode_order, sine_mode_xs, out_root / "all_families_combined_physics_percentage_worsening_sine.png", "Between families: percentage worsening versus sine shift", "Sinusoidal-y intensity", True)),
+            (plot_family_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", FAMILY_GROUPS, all_models, beta_mode_order, beta_mode_xs, out_root / "all_families_combined_physics_percentage_worsening_beta_mean_only.png", "Between families: percentage worsening versus beta (mean only)", "Inverse-density beta", False)),
+            (plot_family_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", FAMILY_GROUPS, all_models, sine_mode_order, sine_mode_xs, out_root / "all_families_combined_physics_percentage_worsening_sine_mean_only.png", "Between families: percentage worsening versus sine shift (mean only)", "Sinusoidal-y intensity", False)),
         ]
     )
 

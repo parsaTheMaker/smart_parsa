@@ -1261,12 +1261,27 @@ def summarize_training_view_config(model_name: str, cfg, checkpoint: str) -> Non
 def train_geometry_uses_replacement(cfg, point_count: int, full_point_count: int) -> bool:
     """Mirror AhmedMLDatasetV2's default geometry sampling semantics.
 
+    Explicit two-view consistency configs do not use AhmedMLDatasetV2's
+    sub-budget geometry sampler for their model input.  They load the full
+    geometry cloud and then sample view 1 in ``train_consistency_common``;
+    therefore the configured primary sampler (normally ``uniform_wor``)
+    controls replacement.
+
     With fast_approx_sampling=True (the dataset default), the unseeded
     preprocessed path uses replacement.  The replacement path is disabled
     when the requested budget already contains the full geometry cloud.
     """
     if int(point_count) >= int(full_point_count):
         return False
+
+    has_explicit_view_sampler = any(
+        int(getattr(cfg, key, 0)) > 0
+        for key in ("primary_view_geometry_points", "view_geometry_points")
+    )
+    if has_explicit_view_sampler:
+        primary_sampling_mode = str(getattr(cfg, "train_primary_sampling_mode", "uniform_wor")).lower()
+        return primary_sampling_mode.endswith("_wr")
+
     fast_approx_sampling = bool(getattr(cfg, "fast_approx_sampling", True))
     epoch_seeded = bool(getattr(cfg, "geometry_epoch_seeded_sampling", False))
     return fast_approx_sampling and not epoch_seeded
@@ -3520,7 +3535,7 @@ def main():
             "views_per_mode": views_per_mode,
             "view_batch_size": view_batch_size,
             "model_repeats": int(args.model_repeats),
-            "top_level_alignment_note": "Aligned mode mirrors each model's training-time geometry sampler and budget. AhmedMLDatasetV2 defaults to fast_approx_sampling=True, which means unseeded sub-budget geometry sampling uses replacement.",
+            "top_level_alignment_note": "Aligned mode mirrors each model's training-time geometry sampler and budget. Explicit two-view configs follow train_primary_sampling_mode; single-view configs follow AhmedMLDatasetV2 geometry sampling semantics.",
             "model_internal_note": "Each model keeps its own internal encoder-block subsampling exactly as implemented in that checkpointed architecture.",
             "sampling_density_study_spec": {
                 "estimator": density_estimator,

@@ -82,7 +82,6 @@ experiment:
   consistency_warmup_epochs: 20
   fuse_consistency_views: True
 
-  use_gradnorm: False
   use_learned_task_weighting: True
   task_weight_lr: 5.e-4
   task_weight_init_logits: [0.0, 0.0, 0.0]

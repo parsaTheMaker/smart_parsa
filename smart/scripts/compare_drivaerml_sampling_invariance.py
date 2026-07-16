@@ -95,8 +95,9 @@ HEADLINE_METRIC_KEYS = [
 
 MODEL_ORDER = [
     "SMART",
-    "SMART_AUGMENTED",
-    "SMART_MASKED",
+    "SMART_DOWNSAMPLE",
+    "SMART_GAUSSIAN_BALL_MASKED",
+    "SMART_BOX_MASKED",
     "SMART_SAT",
     "SMART_SATLOSS3",
     "SMART_SATLOSS4",
@@ -116,8 +117,9 @@ MODEL_ORDER = [
 ]
 MODEL_LABELS = {
     "SMART": "SMART",
-    "SMART_AUGMENTED": "SMART-AUGMENTED",
-    "SMART_MASKED": "SMART-MASKED",
+    "SMART_DOWNSAMPLE": "SMART-DOWNSAMPLE",
+    "SMART_GAUSSIAN_BALL_MASKED": "SMART-GAUSSIAN-BALL-MASKED",
+    "SMART_BOX_MASKED": "SMART-BOX-MASKED",
     "SMART_SAT": "SMART-SAT",
     "SMART_SATLOSS3": "SMART-SATLOSS3",
     "SMART_SATLOSS4": "SMART-SATLOSS4",
@@ -137,8 +139,9 @@ MODEL_LABELS = {
 }
 MODEL_COLORS = {
     "SMART": "#6C6F7D",
-    "SMART_AUGMENTED": "#B279A2",
-    "SMART_MASKED": "#8C6BB1",
+    "SMART_DOWNSAMPLE": "#B279A2",
+    "SMART_GAUSSIAN_BALL_MASKED": "#8C6BB1",
+    "SMART_BOX_MASKED": "#E377C2",
     "SMART_SAT": "#4C78A8",
     "SMART_SATLOSS3": "#F58518",
     "SMART_SATLOSS4": "#72B7B2",
@@ -160,8 +163,9 @@ MODEL_COLORS = {
 # separate from the broader chart palette used by bars and heatmaps.
 LINE_MODEL_COLORS = {
     "SMART": "#1F77B4",
-    "SMART_AUGMENTED": "#9467BD",
-    "SMART_MASKED": "#8C564B",
+    "SMART_DOWNSAMPLE": "#9467BD",
+    "SMART_GAUSSIAN_BALL_MASKED": "#8C564B",
+    "SMART_BOX_MASKED": "#E377C2",
     "SMART_SAT": "#17BECF",
     "TRANSOLVERPP": "#FF7F0E",
     "TRANSOLVERPP_SAT": "#2CA02C",
@@ -171,8 +175,8 @@ LINE_MODEL_COLORS = {
 }
 DRAG_RANK_MODELS = [
     "SMART",
-    "SMART_AUGMENTED",
-    "SMART_MASKED",
+    "SMART_DOWNSAMPLE",
+    "SMART_GAUSSIAN_BALL_MASKED",
     "SMART_SATLOSS3",
     "SMART_SATLOSS5",
     "SMART_SATLOSS5_NOPM",
@@ -184,8 +188,9 @@ FAMILY_GROUPS = OrderedDict(
             "smart_family",
             [
                 "SMART",
-                "SMART_AUGMENTED",
-                "SMART_MASKED",
+                "SMART_DOWNSAMPLE",
+                "SMART_GAUSSIAN_BALL_MASKED",
+                "SMART_BOX_MASKED",
                 "SMART_SAT",
                 "SMART_SATLOSS3",
                 "SMART_SATLOSS4",
@@ -201,7 +206,7 @@ FAMILY_GROUPS = OrderedDict(
     ]
 )
 FAMILY_TITLES = {
-    "smart_family": "SMART vs SMART-AUGMENTED vs SMART-MASKED vs SMART-SAT vs SMART-SATLOSS3 vs SMART-SATLOSS4 vs SMART-SATLOSS5 vs SMART-SATLOSS5-NOPM vs SMART-SATLOSS6",
+    "smart_family": "SMART vs SMART-DOWNSAMPLE vs SMART-GAUSSIAN-BALL-MASKED vs SMART-BOX-MASKED vs SMART-SAT vs SMART-SATLOSS3 vs SMART-SATLOSS4 vs SMART-SATLOSS5 vs SMART-SATLOSS5-NOPM vs SMART-SATLOSS6",
     "transolverpp_family": "TransolverPP vs TransolverPP-SAT vs TransolverPP-SATLOSS3 vs TransolverPP-SATLOSS6",
     "abupt_family": "ABUPT vs ABUPT-SATLOSS3",
     "pointnet_family": "PointNet vs PointNet-SATLOSS3",
@@ -209,8 +214,9 @@ FAMILY_TITLES = {
 }
 VTK_PRESSURE_MODELS = [
     "SMART",
-    "SMART_AUGMENTED",
-    "SMART_MASKED",
+    "SMART_DOWNSAMPLE",
+    "SMART_GAUSSIAN_BALL_MASKED",
+    "SMART_BOX_MASKED",
     "SMART_SAT",
     "SMART_SATLOSS3",
     "SMART_SATLOSS4",
@@ -229,8 +235,19 @@ VTK_PRESSURE_MODELS = [
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Fair DrivAerML sampling-invariance comparison across SMART, TransolverPP, ABUPT, and PointNet families.")
     p.add_argument("--smart-config", default="drivaerml")
-    p.add_argument("--smart-augmented-config", default="drivaerml_smart_augmented")
-    p.add_argument("--smart-masked-config", default="drivaerml_smart_masked")
+    p.add_argument(
+        "--smart-downsample-config",
+        "--smart-augmented-config",
+        dest="smart_downsample_config",
+        default="drivaerml_smart_downsample",
+    )
+    p.add_argument(
+        "--smart-gaussian-ball-masked-config",
+        "--smart-masked-config",
+        dest="smart_gaussian_ball_masked_config",
+        default="drivaerml_smart_gaussian_ball_masked",
+    )
+    p.add_argument("--smart-box-masked-config", default="drivaerml_smart_box_masked")
     p.add_argument("--smart-sat-config", default="drivaerml_sat")
     p.add_argument("--smart-satloss3-config", default="drivaerml_satloss3")
     p.add_argument("--smart-satloss4-config", default="drivaerml_satloss4")
@@ -248,8 +265,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mspt-config", default="drivaerml_mspt")
     p.add_argument("--mspt-satloss6-config", default="drivaerml_mspt_satloss6")
     p.add_argument("--smart-checkpoint", default=None)
-    p.add_argument("--smart-augmented-checkpoint", default=None)
-    p.add_argument("--smart-masked-checkpoint", default=None)
+    p.add_argument(
+        "--smart-downsample-checkpoint",
+        "--smart-augmented-checkpoint",
+        dest="smart_downsample_checkpoint",
+        default=None,
+    )
+    p.add_argument(
+        "--smart-gaussian-ball-masked-checkpoint",
+        "--smart-masked-checkpoint",
+        dest="smart_gaussian_ball_masked_checkpoint",
+        default=None,
+    )
+    p.add_argument("--smart-box-masked-checkpoint", default=None)
     p.add_argument("--smart-sat-checkpoint", default=None)
     p.add_argument("--smart-satloss3-checkpoint", default=None)
     p.add_argument("--smart-satloss4-checkpoint", default=None)
@@ -399,8 +427,9 @@ def choose_ckpt(config, explicit: str | None) -> str:
     model_slug = str(config.model_name).lower().replace("_", "-")
     prefix_map = {
         "SMART": "smart-smart-",
-        "SMART_AUGMENTED": "smart-augmented-",
-        "SMART_MASKED": "smart-masked-",
+        "SMART_DOWNSAMPLE": "smart-downsample-",
+        "SMART_GAUSSIAN_BALL_MASKED": "smart-gaussian-ball-masked-",
+        "SMART_BOX_MASKED": "smart-box-masked-",
         "SMART_SAT": "smart-sat-",
         "SMART_SATLOSS3": "smart-satloss3-",
         "SMART_SATLOSS4": "smart-satloss4-",
@@ -460,8 +489,9 @@ def build_model(config, ckpt_path: str, device: torch.device, batched_query_subr
     }
     if model_name in {
         "SMART",
-        "SMART_AUGMENTED",
-        "SMART_MASKED",
+        "SMART_DOWNSAMPLE",
+        "SMART_GAUSSIAN_BALL_MASKED",
+        "SMART_BOX_MASKED",
         "SMART_SATLOSS3",
         "SMART_SATLOSS4",
         "SMART_SATLOSS5",
@@ -683,6 +713,53 @@ def sample_gaussian_ball_mask_subset(
         "center_flag": center_flag,
         "sigma_radius": float(sigma),
         "center_point": center.astype(np.float32, copy=False),
+    }
+
+
+def sample_box_mask_subset(
+    coords_xyz: np.ndarray,
+    base_budget: int,
+    rng: np.random.Generator,
+    *,
+    std_fraction_of_largest_extent: float,
+) -> Dict[str, np.ndarray | float | int]:
+    """Sample a base view and remove an axis-aligned box of side 2 sigma."""
+    n = int(coords_xyz.shape[0])
+    if base_budget <= 0 or base_budget >= n:
+        base_idx = np.arange(n, dtype=np.int64)
+    else:
+        base_idx = sample_uniform_without_replacement(n, int(base_budget), rng)
+
+    subset = np.asarray(coords_xyz[base_idx], dtype=np.float64)
+    if subset.shape[0] == 0:
+        raise RuntimeError("Box mask subset sampling produced no candidate points.")
+
+    center_idx = int(rng.integers(0, subset.shape[0]))
+    center = subset[center_idx]
+    largest_extent = float(np.max(np.max(subset, axis=0) - np.min(subset, axis=0)))
+    sigma = max(float(std_fraction_of_largest_extent) * largest_extent, 1.0e-12)
+    half_side = sigma
+    remove_mask = np.all(np.abs(subset - center[None, :]) <= half_side, axis=1)
+    keep_mask = ~remove_mask
+    if not np.any(keep_mask):
+        raise RuntimeError("Box mask subset sampling removed every point.")
+
+    box_min = center - half_side
+    box_max = center + half_side
+    center_flag = np.zeros((subset.shape[0],), dtype=np.float32)
+    center_flag[center_idx] = 1.0
+    return {
+        "base_idx": np.asarray(base_idx, dtype=np.int64),
+        "kept_idx": np.asarray(base_idx[keep_mask], dtype=np.int64),
+        "keep_mask": keep_mask.astype(np.float32, copy=False),
+        "box_inside_flag": remove_mask.astype(np.float32, copy=False),
+        "center_flag": center_flag,
+        "distance_to_center": np.linalg.norm(subset - center[None, :], axis=1).astype(np.float32),
+        "sigma_radius": float(sigma),
+        "box_side_length": float(2.0 * sigma),
+        "center_point": center.astype(np.float32, copy=False),
+        "box_min": box_min.astype(np.float32, copy=False),
+        "box_max": box_max.astype(np.float32, copy=False),
     }
 
 
@@ -1113,7 +1190,7 @@ def predict_audi_surface_pressure(
         return pred_surf
 
     def _build_surface_decoder():
-        if model_name in {"SMART", "SMART_AUGMENTED", "SMART_MASKED", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5", "SMART_SATLOSS5_NOPM", "SMART_SATLOSS6"}:
+        if model_name in {"SMART", "SMART_DOWNSAMPLE", "SMART_GAUSSIAN_BALL_MASKED", "SMART_BOX_MASKED", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5", "SMART_SATLOSS5_NOPM", "SMART_SATLOSS6"}:
             intermediate_latent_geometries, latent_geo_pos = model.encode(geo_b, None)
 
             def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
@@ -2127,8 +2204,9 @@ def main():
     config_name_map = OrderedDict(
         [
             ("SMART", args.smart_config),
-            ("SMART_AUGMENTED", args.smart_augmented_config),
-            ("SMART_MASKED", args.smart_masked_config),
+            ("SMART_DOWNSAMPLE", args.smart_downsample_config),
+            ("SMART_GAUSSIAN_BALL_MASKED", args.smart_gaussian_ball_masked_config),
+            ("SMART_BOX_MASKED", args.smart_box_masked_config),
             ("SMART_SAT", args.smart_sat_config),
             ("SMART_SATLOSS3", args.smart_satloss3_config),
             ("SMART_SATLOSS4", args.smart_satloss4_config),
@@ -2186,8 +2264,9 @@ def main():
 
     checkpoint_arg_map = {
         "SMART": args.smart_checkpoint,
-        "SMART_AUGMENTED": args.smart_augmented_checkpoint,
-        "SMART_MASKED": args.smart_masked_checkpoint,
+        "SMART_DOWNSAMPLE": args.smart_downsample_checkpoint,
+        "SMART_GAUSSIAN_BALL_MASKED": args.smart_gaussian_ball_masked_checkpoint,
+        "SMART_BOX_MASKED": args.smart_box_masked_checkpoint,
         "SMART_SAT": args.smart_sat_checkpoint,
         "SMART_SATLOSS3": args.smart_satloss3_checkpoint,
         "SMART_SATLOSS4": args.smart_satloss4_checkpoint,
@@ -3426,18 +3505,18 @@ def main():
         sampling_histogram_paths.append(str(overlay_linear_path))
 
     representative_view2_sampling_vtk_paths: List[str] = []
-    if "SMART_AUGMENTED" in model_specs:
-        augmented_cfg = model_specs["SMART_AUGMENTED"]["config"]
-        augmented_budget = int(getattr(augmented_cfg, "secondary_view_geometry_points", getattr(augmented_cfg, "view_geometry_points", sampling_budget)))
-        augmented_rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(vtk_run_id), 919191, 1]))
-        augmented_idx = sample_uniform_without_replacement(sampling_input_surf_coords.shape[0], augmented_budget, augmented_rng)
-        augmented_vtk_path = out_root / f"drivaerml_test_run_{vtk_run_id}_smart_augmented_view2_input_points_{augmented_budget}.vtk"
-        write_polydata_vtk(augmented_vtk_path, sampling_input_surf_coords[augmented_idx], {})
-        representative_view2_sampling_vtk_paths.append(str(augmented_vtk_path))
+    if "SMART_DOWNSAMPLE" in model_specs:
+        downsample_cfg = model_specs["SMART_DOWNSAMPLE"]["config"]
+        downsample_budget = int(getattr(downsample_cfg, "secondary_view_geometry_points", getattr(downsample_cfg, "view_geometry_points", sampling_budget)))
+        downsample_rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(vtk_run_id), 919191, 1]))
+        downsample_idx = sample_uniform_without_replacement(sampling_input_surf_coords.shape[0], downsample_budget, downsample_rng)
+        downsample_vtk_path = out_root / f"drivaerml_test_run_{vtk_run_id}_smart_downsample_view2_input_points_{downsample_budget}.vtk"
+        write_polydata_vtk(downsample_vtk_path, sampling_input_surf_coords[downsample_idx], {})
+        representative_view2_sampling_vtk_paths.append(str(downsample_vtk_path))
 
-    if "SMART_MASKED" in model_specs:
-        masked_cfg = model_specs["SMART_MASKED"]["config"]
-        masked_budget = int(getattr(masked_cfg, "secondary_view_geometry_points", getattr(masked_cfg, "view_geometry_points", sampling_budget)))
+    if "SMART_GAUSSIAN_BALL_MASKED" in model_specs:
+        gaussian_cfg = model_specs["SMART_GAUSSIAN_BALL_MASKED"]["config"]
+        gaussian_budget = int(getattr(gaussian_cfg, "secondary_view_geometry_points", getattr(gaussian_cfg, "view_geometry_points", sampling_budget)))
         masked_num_examples = 10
         for masked_example_idx in range(masked_num_examples):
             masked_rng = np.random.default_rng(
@@ -3445,11 +3524,11 @@ def main():
             )
             masked_info = sample_gaussian_ball_mask_subset(
                 sampling_input_surf_coords,
-                masked_budget,
+                gaussian_budget,
                 masked_rng,
-                std_fraction_of_largest_extent=float(getattr(masked_cfg, "gaussian_mask_std_fraction_of_largest_extent", 0.05)),
-                prob_at_1sigma=float(getattr(masked_cfg, "gaussian_mask_prob_at_1sigma", 0.33)),
-                min_survivors=int(getattr(masked_cfg, "gaussian_mask_min_survivors", 16384)),
+                std_fraction_of_largest_extent=float(getattr(gaussian_cfg, "gaussian_mask_std_fraction_of_largest_extent", 0.05)),
+                prob_at_1sigma=float(getattr(gaussian_cfg, "gaussian_mask_prob_at_1sigma", 0.33)),
+                min_survivors=int(getattr(gaussian_cfg, "gaussian_mask_min_survivors", 16384)),
                 return_metadata=True,
             )
             masked_base_idx = np.asarray(masked_info["base_idx"], dtype=np.int64)
@@ -3457,7 +3536,7 @@ def main():
             masked_points = sampling_input_surf_coords[masked_base_idx]
             masked_center = np.asarray(masked_info["center_point"], dtype=np.float32).reshape(1, 3)
             masked_vtk_path = out_root / (
-                f"drivaerml_test_run_{vtk_run_id}_smart_masked_view2_example_{masked_example_idx:02d}"
+                f"drivaerml_test_run_{vtk_run_id}_smart_gaussian_ball_masked_view2_example_{masked_example_idx:02d}"
                 f"_input_points_{int(masked_points.shape[0])}_with_removed.vtk"
             )
             write_polydata_vtk(
@@ -3475,7 +3554,7 @@ def main():
             representative_view2_sampling_vtk_paths.append(str(masked_vtk_path))
             masked_survivor_points = sampling_input_surf_coords[masked_kept_idx]
             masked_survivor_vtk_path = out_root / (
-                f"drivaerml_test_run_{vtk_run_id}_smart_masked_view2_example_{masked_example_idx:02d}"
+                f"drivaerml_test_run_{vtk_run_id}_smart_gaussian_ball_masked_view2_example_{masked_example_idx:02d}"
                 f"_input_points_{int(masked_survivor_points.shape[0])}_survivors_only.vtk"
             )
             write_polydata_vtk(
@@ -3484,6 +3563,61 @@ def main():
                 {},
             )
             representative_view2_sampling_vtk_paths.append(str(masked_survivor_vtk_path))
+
+    if "SMART_BOX_MASKED" in model_specs:
+        box_cfg = model_specs["SMART_BOX_MASKED"]["config"]
+        box_budget = int(getattr(box_cfg, "secondary_view_geometry_points", getattr(box_cfg, "view_geometry_points", sampling_budget)))
+        box_num_examples = 10
+        for box_example_idx in range(box_num_examples):
+            box_rng = np.random.default_rng(
+                np.random.SeedSequence([args.seed, int(vtk_run_id), 919191, 3, int(box_example_idx)])
+            )
+            box_info = sample_box_mask_subset(
+                sampling_input_surf_coords,
+                box_budget,
+                box_rng,
+                std_fraction_of_largest_extent=float(getattr(box_cfg, "gaussian_mask_std_fraction_of_largest_extent", 0.05)),
+            )
+            box_base_idx = np.asarray(box_info["base_idx"], dtype=np.int64)
+            box_kept_idx = np.asarray(box_info["kept_idx"], dtype=np.int64)
+            box_points = sampling_input_surf_coords[box_base_idx]
+            box_center = np.asarray(box_info["center_point"], dtype=np.float32).reshape(1, 3)
+            box_min = np.asarray(box_info["box_min"], dtype=np.float32).reshape(1, 3)
+            box_max = np.asarray(box_info["box_max"], dtype=np.float32).reshape(1, 3)
+            box_vtk_path = out_root / (
+                f"drivaerml_test_run_{vtk_run_id}_smart_box_masked_view2_example_{box_example_idx:02d}"
+                f"_input_points_{int(box_points.shape[0])}_with_removed.vtk"
+            )
+            write_polydata_vtk(
+                box_vtk_path,
+                box_points,
+                {
+                    "kept_after_mask": np.asarray(box_info["keep_mask"], dtype=np.float32),
+                    "box_inside_flag": np.asarray(box_info["box_inside_flag"], dtype=np.float32),
+                    "box_center_flag": np.asarray(box_info["center_flag"], dtype=np.float32),
+                    "box_distance_to_center": np.asarray(box_info["distance_to_center"], dtype=np.float32),
+                    "box_sigma_radius": np.full((box_points.shape[0],), float(box_info["sigma_radius"]), dtype=np.float32),
+                    "box_side_length": np.full((box_points.shape[0],), float(box_info["box_side_length"]), dtype=np.float32),
+                    "box_center_xyz": np.repeat(box_center, box_points.shape[0], axis=0),
+                    "box_min_xyz": np.repeat(box_min, box_points.shape[0], axis=0),
+                    "box_max_xyz": np.repeat(box_max, box_points.shape[0], axis=0),
+                },
+            )
+            representative_view2_sampling_vtk_paths.append(str(box_vtk_path))
+            box_survivor_points = sampling_input_surf_coords[box_kept_idx]
+            box_survivor_vtk_path = out_root / (
+                f"drivaerml_test_run_{vtk_run_id}_smart_box_masked_view2_example_{box_example_idx:02d}"
+                f"_input_points_{int(box_survivor_points.shape[0])}_survivors_only.vtk"
+            )
+            survivor_box_data = {
+                "box_center_xyz": np.repeat(box_center, box_survivor_points.shape[0], axis=0),
+                "box_min_xyz": np.repeat(box_min, box_survivor_points.shape[0], axis=0),
+                "box_max_xyz": np.repeat(box_max, box_survivor_points.shape[0], axis=0),
+                "box_sigma_radius": np.full((box_survivor_points.shape[0],), float(box_info["sigma_radius"]), dtype=np.float32),
+                "box_side_length": np.full((box_survivor_points.shape[0],), float(box_info["box_side_length"]), dtype=np.float32),
+            }
+            write_polydata_vtk(box_survivor_vtk_path, box_survivor_points, survivor_box_data)
+            representative_view2_sampling_vtk_paths.append(str(box_survivor_vtk_path))
 
     for mix_fraction in sine_mix_levels:
         sampling_rng = np.random.default_rng(

@@ -13,8 +13,8 @@ wandb:
   entity: "parsa-vatani99-technical-university-of-munich"
 
 experiment:
-  name: "DrivAerML_SMART_GAUSSIAN_BALL_MASKED"
-  model_name: "SMART_GAUSSIAN_BALL_MASKED"
+  name: "DrivAerML_SMART_BOX_MASKED"
+  model_name: "SMART_BOX_MASKED"
   model_tag: ""
   random_seed: 42
   manifest_variant: "full"
@@ -64,7 +64,7 @@ experiment:
   eval_shifted_view_geometry_points: 131072
 
   train_primary_sampling_mode: "uniform_wor"
-  train_secondary_sampling_mode: "gaussian_ball_mask"
+  train_secondary_sampling_mode: "box_mask"
   eval_aligned_sampling_mode: "uniform_wor"
   eval_shifted_sampling_mode: "uniform_wor"
   inverse_density_beta: 0.0

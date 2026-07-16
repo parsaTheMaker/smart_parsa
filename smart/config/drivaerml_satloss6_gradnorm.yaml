@@ -1,0 +1,17 @@
+defaults:
+  - drivaerml_satloss6
+  - _self_
+
+experiment:
+  name: "DrivAerML_SMART_SATLOSS6_GRADNORM"
+  model_name: "SMART_SATLOSS6_GRADNORM"
+  task_weighting_method: "gradnorm_external"
+  epochs: 200
+  use_learned_task_weighting: False
+  config_task_base_weights: [0.15, 0.15, 0.70]
+  external_gradnorm_lr: 1.e-4
+  external_gradnorm_alpha: 0.0
+  external_gradnorm_initial_losses_decay: 1.0
+  external_gradnorm_update_after_step: 64
+  external_gradnorm_update_every: 1
+  external_gradnorm_min_weights: [0.15, 0.15, 0.10]

@@ -1,0 +1,11 @@
+defaults:
+  - drivaerml_satloss6
+  - _self_
+
+experiment:
+  name: "DrivAerML_SMART_SATLOSS6_CONFIG_LAYER"
+  model_name: "SMART_SATLOSS6_CONFIG_LAYER"
+  task_weighting_method: "config_layer"
+  epochs: 200
+  use_learned_task_weighting: False
+  config_task_base_weights: [0.15, 0.15, 0.70]

@@ -303,7 +303,7 @@ class AhmedMLDatasetV2(Dataset):
     def _load_full_geometry_mesh(self, run_id):
         if self.preprocessed_mode:
             surf_coords = np.load(self._run_dir(run_id) / "surface_coords.npy", mmap_mode="r")
-            geo_mesh = torch.from_numpy(np.asarray(surf_coords, dtype=np.float32))
+            geo_mesh = torch.from_numpy(np.array(surf_coords, dtype=np.float32, copy=True))
             return self._normalize_pos(geo_mesh, self.min_pos, self.max_pos)
 
         with h5py.File(self._boundary_h5_path(run_id), "r") as hb:
@@ -959,13 +959,13 @@ class AhmedMLDatasetV2(Dataset):
         vol_idx_t = self._sample_idx(nv, self.volume_points)
 
         if use_full_geo:
-            geo_mesh = torch.from_numpy(np.asarray(surf_coords, dtype=np.float32))
+            geo_mesh = torch.from_numpy(np.array(surf_coords, dtype=np.float32, copy=True))
         else:
             geo_idx = geo_idx_t.numpy().astype(np.int64, copy=False)
             geo_mesh = torch.from_numpy(np.asarray(surf_coords[geo_idx], dtype=np.float32))
 
         if use_full_surf:
-            surf_mesh = torch.from_numpy(np.asarray(surf_coords, dtype=np.float32))
+            surf_mesh = torch.from_numpy(np.array(surf_coords, dtype=np.float32, copy=True))
             surf_data = torch.from_numpy(
                 np.concatenate(
                     [

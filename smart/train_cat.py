@@ -375,6 +375,9 @@ def main(cfg: DictConfig):
                     with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=True):
                         loss, loss_s, loss_v, rel, rel_s, rel_v, channel_specs, aux = compute_loss(stage, model, stage_batch, loss_fn, rel_l2, s_fields, vol_signals)
                     scaler.scale(loss).backward()
+                    if gradient_norm is not None:
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
                     scaler.step(optimizer)
                     scaler.update()
                     scheduler.step()

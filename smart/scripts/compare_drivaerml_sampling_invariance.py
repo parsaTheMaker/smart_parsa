@@ -104,6 +104,10 @@ MODEL_ORDER = [
     "SMART_SATLOSS5",
     "SMART_SATLOSS5_NOPM",
     "SMART_SATLOSS6",
+    "SMART_SATLOSS6_FIXEDSUM",
+    "SMART_SATLOSS6_GRADNORM",
+    "SMART_SATLOSS6_CONFIG_FULL",
+    "SMART_SATLOSS6_CONFIG_LAYER",
     "TRANSOLVERPP",
     "TRANSOLVERPP_SAT",
     "TRANSOLVERPP_SATLOSS3",
@@ -126,6 +130,10 @@ MODEL_LABELS = {
     "SMART_SATLOSS5": "SMART-SATLOSS5",
     "SMART_SATLOSS5_NOPM": "SMART-SATLOSS5-NOPM",
     "SMART_SATLOSS6": "SMART-SATLOSS6",
+    "SMART_SATLOSS6_FIXEDSUM": "SMART-SATLOSS6-FIXEDSUM",
+    "SMART_SATLOSS6_GRADNORM": "SMART-SATLOSS6-GRADNORM",
+    "SMART_SATLOSS6_CONFIG_FULL": "SMART-SATLOSS6-ConFIG-FULL",
+    "SMART_SATLOSS6_CONFIG_LAYER": "SMART-SATLOSS6-ConFIG-LAYER",
     "TRANSOLVERPP": "TransolverPP",
     "TRANSOLVERPP_SAT": "TransolverPP-SAT",
     "TRANSOLVERPP_SATLOSS3": "TransolverPP-SATLOSS3",
@@ -148,6 +156,10 @@ MODEL_COLORS = {
     "SMART_SATLOSS5": "#E45756",
     "SMART_SATLOSS5_NOPM": "#9D755D",
     "SMART_SATLOSS6": "#54A24B",
+    "SMART_SATLOSS6_FIXEDSUM": "#2CA02C",
+    "SMART_SATLOSS6_GRADNORM": "#FF7F0E",
+    "SMART_SATLOSS6_CONFIG_FULL": "#9467BD",
+    "SMART_SATLOSS6_CONFIG_LAYER": "#17BECF",
     "TRANSOLVERPP": "#6C6F7D",
     "TRANSOLVERPP_SAT": "#54A24B",
     "TRANSOLVERPP_SATLOSS3": "#E45756",
@@ -181,6 +193,10 @@ DRAG_RANK_MODELS = [
     "SMART_SATLOSS5",
     "SMART_SATLOSS5_NOPM",
     "SMART_SATLOSS6",
+    "SMART_SATLOSS6_FIXEDSUM",
+    "SMART_SATLOSS6_GRADNORM",
+    "SMART_SATLOSS6_CONFIG_FULL",
+    "SMART_SATLOSS6_CONFIG_LAYER",
 ]
 FAMILY_GROUPS = OrderedDict(
     [
@@ -197,6 +213,19 @@ FAMILY_GROUPS = OrderedDict(
                 "SMART_SATLOSS5",
                 "SMART_SATLOSS5_NOPM",
                 "SMART_SATLOSS6",
+                "SMART_SATLOSS6_FIXEDSUM",
+                "SMART_SATLOSS6_GRADNORM",
+                "SMART_SATLOSS6_CONFIG_FULL",
+                "SMART_SATLOSS6_CONFIG_LAYER",
+            ],
+        ),
+        (
+            "smart_satloss6_weighting_family",
+            [
+                "SMART_SATLOSS6_FIXEDSUM",
+                "SMART_SATLOSS6_GRADNORM",
+                "SMART_SATLOSS6_CONFIG_FULL",
+                "SMART_SATLOSS6_CONFIG_LAYER",
             ],
         ),
         ("transolverpp_family", ["TRANSOLVERPP", "TRANSOLVERPP_SAT", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6"]),
@@ -206,7 +235,8 @@ FAMILY_GROUPS = OrderedDict(
     ]
 )
 FAMILY_TITLES = {
-    "smart_family": "SMART vs SMART-DOWNSAMPLE vs SMART-GAUSSIAN-BALL-MASKED vs SMART-BOX-MASKED vs SMART-SAT vs SMART-SATLOSS3 vs SMART-SATLOSS4 vs SMART-SATLOSS5 vs SMART-SATLOSS5-NOPM vs SMART-SATLOSS6",
+    "smart_family": "SMART vs SMART-DOWNSAMPLE vs SMART-GAUSSIAN-BALL-MASKED vs SMART-BOX-MASKED vs SMART-SAT vs SMART-SATLOSS3 vs SMART-SATLOSS4 vs SMART-SATLOSS5 vs SMART-SATLOSS5-NOPM vs SMART-SATLOSS6 vs SATLOSS6 weighting variants",
+    "smart_satloss6_weighting_family": "SMART-SATLOSS6-FIXEDSUM vs SMART-SATLOSS6-GRADNORM vs SMART-SATLOSS6-ConFIG-FULL vs SMART-SATLOSS6-ConFIG-LAYER",
     "transolverpp_family": "TransolverPP vs TransolverPP-SAT vs TransolverPP-SATLOSS3 vs TransolverPP-SATLOSS6",
     "abupt_family": "ABUPT vs ABUPT-SATLOSS3",
     "pointnet_family": "PointNet vs PointNet-SATLOSS3",
@@ -223,6 +253,10 @@ VTK_PRESSURE_MODELS = [
     "SMART_SATLOSS5",
     "SMART_SATLOSS5_NOPM",
     "SMART_SATLOSS6",
+    "SMART_SATLOSS6_FIXEDSUM",
+    "SMART_SATLOSS6_GRADNORM",
+    "SMART_SATLOSS6_CONFIG_FULL",
+    "SMART_SATLOSS6_CONFIG_LAYER",
     "TRANSOLVERPP",
     "TRANSOLVERPP_SATLOSS3",
     "POINTNET",
@@ -254,6 +288,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smart-satloss5-config", default="drivaerml_satloss5")
     p.add_argument("--smart-satloss5-nopm-config", default="drivaerml_satloss5_nopm")
     p.add_argument("--smart-satloss6-config", default="drivaerml_satloss6")
+    p.add_argument("--smart-satloss6-fixedsum-config", default="drivaerml_satloss6_fixedsum")
+    p.add_argument("--smart-satloss6-gradnorm-config", default="drivaerml_satloss6_gradnorm")
+    p.add_argument("--smart-satloss6-config-full-config", default="drivaerml_satloss6_config_full")
+    p.add_argument("--smart-satloss6-config-layer-config", default="drivaerml_satloss6_config")
     p.add_argument("--transolverpp-config", default="drivaerml_transolverpp")
     p.add_argument("--transolverpp-sat-config", default="drivaerml_transolverpp_sat")
     p.add_argument("--transolverpp-satloss3-config", default="drivaerml_transolverpp_satloss3")
@@ -284,6 +322,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smart-satloss5-checkpoint", default=None)
     p.add_argument("--smart-satloss5-nopm-checkpoint", default=None)
     p.add_argument("--smart-satloss6-checkpoint", default=None)
+    p.add_argument("--smart-satloss6-fixedsum-checkpoint", default=None)
+    p.add_argument("--smart-satloss6-gradnorm-checkpoint", default=None)
+    p.add_argument("--smart-satloss6-config-full-checkpoint", default=None)
+    p.add_argument("--smart-satloss6-config-layer-checkpoint", default=None)
     p.add_argument("--transolverpp-checkpoint", default=None)
     p.add_argument("--transolverpp-sat-checkpoint", default=None)
     p.add_argument("--transolverpp-satloss3-checkpoint", default=None)
@@ -349,11 +391,31 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def load_cfg(name: str):
+def load_cfg(name: str, _stack: Tuple[str, ...] = ()):
+    """Load the experiment section with the same local defaults inheritance as Hydra."""
+    if name in _stack:
+        chain = " -> ".join((*_stack, name))
+        raise ValueError(f"Circular config defaults detected: {chain}")
+
     path = SMART_ROOT / "config" / f"{name}.yaml"
     if not path.is_file():
         raise FileNotFoundError(f"Config not found: {path}")
-    return OmegaConf.load(path).experiment
+
+    root = OmegaConf.load(path)
+    merged_experiment = OmegaConf.create()
+    for default in root.get("defaults", []):
+        if not isinstance(default, str):
+            continue
+        if default == "_self_" or default.startswith("override "):
+            continue
+        default_name = default.rsplit("/", 1)[-1]
+        merged_experiment = OmegaConf.merge(
+            merged_experiment,
+            load_cfg(default_name, (*_stack, name)),
+        )
+
+    current_experiment = root.get("experiment", OmegaConf.create())
+    return OmegaConf.merge(merged_experiment, current_experiment)
 
 
 def resolve_density_spec(cfg) -> Tuple[str, int, int, str]:
@@ -436,6 +498,10 @@ def choose_ckpt(config, explicit: str | None) -> str:
         "SMART_SATLOSS5": "smart-satloss5-",
         "SMART_SATLOSS5_NOPM": "smart-satloss5-nopm-",
         "SMART_SATLOSS6": "smart-satloss6-",
+        "SMART_SATLOSS6_FIXEDSUM": "smart-satloss6-fixedsum-",
+        "SMART_SATLOSS6_GRADNORM": "smart-satloss6-gradnorm-",
+        "SMART_SATLOSS6_CONFIG_FULL": "smart-satloss6-config-full-",
+        "SMART_SATLOSS6_CONFIG_LAYER": "smart-satloss6-config-layer-",
         "TRANSOLVERPP": "transolverpp-",
         "TRANSOLVERPP_SAT": "transolverpp-sat-",
         "TRANSOLVERPP_SATLOSS3": "transolverpp-satloss3-",
@@ -497,6 +563,10 @@ def build_model(config, ckpt_path: str, device: torch.device, batched_query_subr
         "SMART_SATLOSS5",
         "SMART_SATLOSS5_NOPM",
         "SMART_SATLOSS6",
+        "SMART_SATLOSS6_FIXEDSUM",
+        "SMART_SATLOSS6_GRADNORM",
+        "SMART_SATLOSS6_CONFIG_FULL",
+        "SMART_SATLOSS6_CONFIG_LAYER",
     }:
         model = SMART(**base_kwargs, **arch)
     elif model_name == "SMART_SAT":
@@ -1190,7 +1260,21 @@ def predict_audi_surface_pressure(
         return pred_surf
 
     def _build_surface_decoder():
-        if model_name in {"SMART", "SMART_DOWNSAMPLE", "SMART_GAUSSIAN_BALL_MASKED", "SMART_BOX_MASKED", "SMART_SATLOSS3", "SMART_SATLOSS4", "SMART_SATLOSS5", "SMART_SATLOSS5_NOPM", "SMART_SATLOSS6"}:
+        if model_name in {
+            "SMART",
+            "SMART_DOWNSAMPLE",
+            "SMART_GAUSSIAN_BALL_MASKED",
+            "SMART_BOX_MASKED",
+            "SMART_SATLOSS3",
+            "SMART_SATLOSS4",
+            "SMART_SATLOSS5",
+            "SMART_SATLOSS5_NOPM",
+            "SMART_SATLOSS6",
+            "SMART_SATLOSS6_FIXEDSUM",
+            "SMART_SATLOSS6_GRADNORM",
+            "SMART_SATLOSS6_CONFIG_FULL",
+            "SMART_SATLOSS6_CONFIG_LAYER",
+        }:
             intermediate_latent_geometries, latent_geo_pos = model.encode(geo_b, None)
 
             def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
@@ -1494,7 +1578,10 @@ def mode_color(mode_name: str) -> str:
 
 def model_line_visuals(model_name: str) -> Tuple[str, str]:
     """Use one family color while distinguishing vanilla and SATLOSS lines."""
-    satloss_match = re.match(r"^(.*)_SATLOSS\d+(?:_NOPM)?$", str(model_name))
+    satloss_match = re.match(
+        r"^(.*)_SATLOSS\d+(?:_(?:NOPM|FIXEDSUM|GRADNORM|CONFIG_FULL|CONFIG_LAYER))?$",
+        str(model_name),
+    )
     if satloss_match:
         vanilla_name = satloss_match.group(1)
         color = LINE_MODEL_COLORS.get(vanilla_name, MODEL_COLORS[model_name])
@@ -2213,6 +2300,10 @@ def main():
             ("SMART_SATLOSS5", args.smart_satloss5_config),
             ("SMART_SATLOSS5_NOPM", args.smart_satloss5_nopm_config),
             ("SMART_SATLOSS6", args.smart_satloss6_config),
+            ("SMART_SATLOSS6_FIXEDSUM", args.smart_satloss6_fixedsum_config),
+            ("SMART_SATLOSS6_GRADNORM", args.smart_satloss6_gradnorm_config),
+            ("SMART_SATLOSS6_CONFIG_FULL", args.smart_satloss6_config_full_config),
+            ("SMART_SATLOSS6_CONFIG_LAYER", args.smart_satloss6_config_layer_config),
             ("TRANSOLVERPP", args.transolverpp_config),
             ("TRANSOLVERPP_SAT", args.transolverpp_sat_config),
             ("TRANSOLVERPP_SATLOSS3", args.transolverpp_satloss3_config),
@@ -2273,6 +2364,10 @@ def main():
         "SMART_SATLOSS5": args.smart_satloss5_checkpoint,
         "SMART_SATLOSS5_NOPM": args.smart_satloss5_nopm_checkpoint,
         "SMART_SATLOSS6": args.smart_satloss6_checkpoint,
+        "SMART_SATLOSS6_FIXEDSUM": args.smart_satloss6_fixedsum_checkpoint,
+        "SMART_SATLOSS6_GRADNORM": args.smart_satloss6_gradnorm_checkpoint,
+        "SMART_SATLOSS6_CONFIG_FULL": args.smart_satloss6_config_full_checkpoint,
+        "SMART_SATLOSS6_CONFIG_LAYER": args.smart_satloss6_config_layer_checkpoint,
         "TRANSOLVERPP": args.transolverpp_checkpoint,
         "TRANSOLVERPP_SAT": args.transolverpp_sat_checkpoint,
         "TRANSOLVERPP_SATLOSS3": args.transolverpp_satloss3_checkpoint,

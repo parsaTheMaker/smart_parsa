@@ -234,6 +234,9 @@ def main(cfg: DictConfig):
                             y_hat_surf, y_hat_vol = model(geo_mesh, surf_mesh, vol_mesh, params)
                         loss = combined_loss_fn(y_hat_surf, y_hat_vol, surf_data, vol_data) if use_surface_supervision else loss_fn(y_hat_vol, vol_data)
                         scaler.scale(loss).backward()
+                        if gradient_norm is not None:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
                         scaler.step(optimizer)
                         scaler.update()
                         scheduler.step()

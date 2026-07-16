@@ -237,6 +237,9 @@ def main(cfg: DictConfig):
                             loss = loss_fn(y_hat_vol, vol_data)
 
                         scaler.scale(loss).backward()
+                        if gradient_norm is not None:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
                         scaler.step(optimizer)
                         scaler.update()
                         scheduler.step()

@@ -171,12 +171,150 @@ def config_layer_gradient(task_losses, reference_parameter, return_diagnostics=F
     return direction, diagnostics
 
 
+def _config_full_update(gradient_matrix):
+    """Apply the standard non-momentum ConFIG operator to full gradients.
+
+    For m loss gradients and P parameters, the paper's least-squares solve can
+    be reduced from an m-by-P solve to the m-by-m Gram system
+    (U U^T) a = 1, followed by U^T a. This is the same minimum-norm
+    least-squares solution while keeping the expensive linear algebra in loss
+    space rather than parameter space.
+    """
+    with torch.no_grad():
+        if not bool(torch.isfinite(gradient_matrix).all().item()):
+            raise FloatingPointError("ConFIG_full received non-finite task gradients.")
+
+        gradient_norms = gradient_matrix.float().norm(dim=1)
+        unit_gradients = gradient_matrix.float()
+        unit_gradients.div_(gradient_norms.unsqueeze(1).clamp_min(1.0e-12))
+        zero_rows = gradient_norms <= 1.0e-12
+        unit_gradients.masked_fill_(zero_rows.unsqueeze(1), 0.0)
+
+        gram = unit_gradients @ unit_gradients.transpose(0, 1)
+        equal_weights = torch.ones(gradient_matrix.shape[0], device=gradient_matrix.device, dtype=gradient_matrix.dtype)
+        coefficients = torch.linalg.lstsq(gram, equal_weights).solution
+        best_direction = unit_gradients.transpose(0, 1) @ coefficients
+        best_norm = best_direction.norm()
+        unit_direction = best_direction / best_norm.clamp_min(1.0e-12)
+        unit_direction = torch.nan_to_num(unit_direction, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # ProjectionLength from the reference implementation:
+        # |g_c| = sum_i <g_i, g_c / |g_c|>.
+        projection_lengths = (unit_gradients @ unit_direction) * gradient_norms
+        config_gradient = unit_direction * projection_lengths.sum()
+        min_cosine = (unit_gradients @ unit_direction).min()
+
+        diagnostics = {
+            "mean_grad_norm": gradient_norms.mean().detach().float(),
+            "direction_norm": config_gradient.norm().detach().float(),
+            "min_cosine": min_cosine.detach().float(),
+            "used_fallback": torch.tensor(0.0, device=gradient_matrix.device),
+        }
+        return config_gradient, diagnostics
+
+
+def config_full_backward(
+    task_losses,
+    parameters,
+    scaler=None,
+    amp_enabled=False,
+    vectorized=True,
+    allow_sequential_fallback=True,
+):
+    """Compute full-network ConFIG gradients and assign them to parameters.
+
+    Each task is differentiated separately through one retained forward graph,
+    matching full ConFIG rather than the paper's alternating M-ConFIG variant.
+    Only flattened detached gradient rows are retained; parameter gradients are
+    assigned from the final ConFIG vector in place.
+    """
+    parameters = [parameter for parameter in parameters if parameter.requires_grad]
+    if not parameters:
+        raise ValueError("ConFIG_full requires at least one trainable parameter.")
+
+    task_count = len(task_losses)
+    stacked_losses = torch.stack(list(task_losses))
+    if amp_enabled and scaler is not None and scaler.is_enabled():
+        stacked_losses = scaler.scale(stacked_losses)
+
+    gradient_matrix = None
+    if vectorized:
+        try:
+            gradients = torch.autograd.grad(
+                stacked_losses,
+                parameters,
+                grad_outputs=torch.eye(
+                    task_count,
+                    device=stacked_losses.device,
+                    dtype=stacked_losses.dtype,
+                ),
+                retain_graph=False,
+                create_graph=False,
+                allow_unused=True,
+                is_grads_batched=True,
+            )
+            gradient_parts = []
+            for parameter, gradient in zip(parameters, gradients):
+                if gradient is None:
+                    gradient_parts.append(
+                        torch.zeros((task_count, parameter.numel()), device=parameter.device, dtype=torch.float32)
+                    )
+                else:
+                    gradient_parts.append(gradient.detach().float().reshape(task_count, -1))
+            gradient_matrix = torch.cat(gradient_parts, dim=1)
+            del gradients, gradient_parts
+        except RuntimeError as exc:
+            if not allow_sequential_fallback:
+                raise RuntimeError(
+                    "Vectorized ConFIG_full gradients failed. Set "
+                    "experiment.config_full_vectorized_gradients=False to use the sequential path."
+                ) from exc
+            print(f"[ConFIG_full] Vectorized gradients unavailable; using sequential fallback: {exc}")
+
+    if gradient_matrix is None:
+        gradient_rows = []
+        for task_index, task_loss in enumerate(task_losses):
+            scaled_loss = task_loss
+            if amp_enabled and scaler is not None and scaler.is_enabled():
+                scaled_loss = scaler.scale(task_loss)
+            gradients = torch.autograd.grad(
+                scaled_loss,
+                parameters,
+                retain_graph=task_index < len(task_losses) - 1,
+                create_graph=False,
+                allow_unused=True,
+            )
+            row_parts = []
+            for parameter, gradient in zip(parameters, gradients):
+                if gradient is None:
+                    row_parts.append(torch.zeros(parameter.numel(), device=parameter.device, dtype=torch.float32))
+                else:
+                    row_parts.append(gradient.detach().float().reshape(-1))
+            gradient_rows.append(torch.cat(row_parts, dim=0))
+            del gradients, row_parts, scaled_loss
+        gradient_matrix = torch.stack(gradient_rows, dim=0)
+        del gradient_rows
+
+    del stacked_losses
+    config_gradient, diagnostics = _config_full_update(gradient_matrix)
+
+    offset = 0
+    for parameter in parameters:
+        parameter_size = parameter.numel()
+        parameter.grad = config_gradient[offset:offset + parameter_size].view_as(parameter).to(dtype=parameter.dtype)
+        offset += parameter_size
+
+    return diagnostics
+
+
 def external_gradnorm_backward(
     external_gradnorm,
     losses,
     reference_parameter,
     weighted_total_loss,
     min_loss_weights=None,
+    scaler=None,
+    amp_enabled=False,
 ):
     """Apply GradNorm weight updates and the weighted model backward separately.
 
@@ -202,7 +340,10 @@ def external_gradnorm_backward(
         and bool(external_gradnorm.loss_mask.any().item())
     )
     if not should_update:
-        weighted_total_loss.backward()
+        model_loss = weighted_total_loss
+        if amp_enabled and scaler is not None and scaler.is_enabled():
+            model_loss = scaler.scale(model_loss)
+        model_loss.backward()
         return torch.zeros((), device=losses.device, dtype=torch.float32)
 
     loss_mask = external_gradnorm.loss_mask.to(device=losses.device, dtype=torch.bool)
@@ -260,7 +401,10 @@ def external_gradnorm_backward(
 
     # The weighted loss keeps a detached view of the current weight buffer.
     # Backpropagate it before updating that buffer in place.
-    weighted_total_loss.backward()
+    model_loss = weighted_total_loss
+    if amp_enabled and scaler is not None and scaler.is_enabled():
+        model_loss = scaler.scale(model_loss)
+    model_loss.backward()
 
     with torch.no_grad():
         updated_weights = selected_weights.detach() - weight_gradient.detach() * float(external_gradnorm.learning_rate)
@@ -1276,20 +1420,23 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
     use_prediction_consistency = bool(getattr(config, "use_prediction_consistency", True))
     task_weighting_method = str(getattr(config, "task_weighting_method", "legacy")).strip().lower()
     use_config_layer = task_weighting_method in {"config", "config_layer", "config-layer"}
+    use_config_full = task_weighting_method in {"config_full", "config-full", "configfull"}
     use_external_gradnorm = task_weighting_method in {"gradnorm_external", "external_gradnorm", "gradnorm"}
     use_fixed_sum = task_weighting_method in {"fixed_sum", "fixed-sum", "fixedsum"}
     use_learned_task_weighting = bool(
         getattr(config, "use_learned_task_weighting", getattr(config, "use_uncertainty_weighting", False))
     )
-    if sum((use_config_layer, use_external_gradnorm, use_fixed_sum, use_learned_task_weighting)) > 1:
+    if sum((use_config_layer, use_config_full, use_external_gradnorm, use_fixed_sum, use_learned_task_weighting)) > 1:
         raise ValueError(
             "Only one task weighting backend can be enabled: task_weighting_method=CONFIG, "
+            "task_weighting_method=config_full, "
             "task_weighting_method=gradnorm_external, task_weighting_method=fixed_sum, "
             "or use_learned_task_weighting."
         )
     scaler = torch.amp.GradScaler("cuda")
     uncertainty_balancer = None
     config_reference_parameter = None
+    config_full_parameters = None
     config_task_weights = None
     external_gradnorm = None
     external_gradnorm_min_weights = None
@@ -1314,7 +1461,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                 "weight_decay": 0.0,
             }
         )
-    if use_config_layer or use_external_gradnorm or use_fixed_sum:
+    if use_config_layer or use_config_full or use_external_gradnorm or use_fixed_sum:
         task_count = 3 if use_prediction_consistency else 2
         configured_task_weights = list(
             getattr(config, "config_task_base_weights", getattr(config, "task_weight_base_weights", []))
@@ -1332,6 +1479,8 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
         config_task_weights = [float(weight) / weight_sum for weight in configured_task_weights]
         if use_config_layer or use_external_gradnorm:
             config_reference_parameter = resolve_balance_reference_parameter(model)
+        if use_config_full:
+            config_full_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
         if use_external_gradnorm:
             configured_min_weights = getattr(config, "external_gradnorm_min_weights", None)
             if configured_min_weights is not None:
@@ -1365,7 +1514,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
     if is_main_process():
         active_backend = (
             task_weighting_method
-            if use_config_layer or use_external_gradnorm
+            if use_config_layer or use_config_full or use_external_gradnorm
             else "uncertainty"
             if use_learned_task_weighting
             else "fixed_sum"
@@ -1491,6 +1640,10 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
         "config_direction_scale",
         "config_direction_cosine",
         "config_direction_fallback",
+        "config_full_mean_grad_norm",
+        "config_full_direction_norm",
+        "config_full_min_cosine",
+        "config_full_fallback",
     ]
 
     fuse_consistency_views = bool(getattr(config, "fuse_consistency_views", False))
@@ -1730,6 +1883,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     pred_consistency.float(),
                 ]
                 external_gradnorm_tasks = None
+                config_full_info = None
                 if use_learned_task_weighting:
                     learned_tasks = [
                         task_losses[2],
@@ -1759,6 +1913,21 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     ).float()
                     uncertainty_info = None
                     config_info = {"task_losses": config_tasks}
+                    external_gradnorm_info = None
+                elif use_config_full:
+                    config_full_tasks = [
+                        config_task_weights[0] * task_losses[2],
+                        config_task_weights[1] * task_losses[3],
+                    ]
+                    if use_prediction_consistency:
+                        config_full_tasks.append(
+                            (config_task_weights[2] * pred_consistency_weight * task_losses[4]).float()
+                        )
+                    current_task_weights = torch.tensor(config_task_weights, device=device, dtype=torch.float32)
+                    weighted_total_loss = sum(config_full_tasks).float()
+                    uncertainty_info = None
+                    config_info = None
+                    config_full_info = {"task_losses": config_full_tasks}
                     external_gradnorm_info = None
                 elif use_external_gradnorm:
                     external_gradnorm_tasks = [
@@ -1801,6 +1970,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
 
                 config_direction = None
                 config_diagnostics = None
+                config_full_diagnostics = None
                 if config_info is not None:
                     config_direction, config_diagnostics = config_layer_gradient(
                         [
@@ -1822,20 +1992,33 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     )
 
                 external_gradnorm_loss = weighted_total_loss.new_zeros((), dtype=torch.float32)
-                if use_external_gradnorm:
+                if use_config_full:
+                    config_full_diagnostics = config_full_backward(
+                        config_full_info["task_losses"],
+                        config_full_parameters,
+                        scaler=scaler,
+                        amp_enabled=amp,
+                        vectorized=bool(getattr(config, "config_full_vectorized_gradients", False)),
+                        allow_sequential_fallback=bool(
+                            getattr(config, "config_full_allow_sequential_fallback", True)
+                        ),
+                    )
+                elif use_external_gradnorm:
                     external_gradnorm_loss = external_gradnorm_backward(
                         external_gradnorm,
                         external_gradnorm_tasks,
                         config_reference_parameter,
                         weighted_total_loss,
                         min_loss_weights=external_gradnorm_min_weights,
+                        scaler=scaler,
+                        amp_enabled=amp,
                     )
                 elif amp:
                     scaler.scale(weighted_total_loss).backward()
                 else:
                     weighted_total_loss.backward()
 
-                if amp and not use_external_gradnorm:
+                if amp:
                     scaler.unscale_(optimizer)
                 if config_direction is not None:
                     if config_reference_parameter.grad is None:
@@ -1844,7 +2027,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                         config_reference_parameter.grad.copy_(config_direction)
                 if gradient_norm is not None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
-                if amp and not use_external_gradnorm:
+                if amp:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
@@ -1913,6 +2096,11 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                         train_losses["config_direction_scale"] += config_diagnostics["direction_scale"] * batch_size_float
                         train_losses["config_direction_cosine"] += config_diagnostics["direction_cosine"] * batch_size_float
                         train_losses["config_direction_fallback"] += config_diagnostics["used_fallback"] * batch_size_float
+                    if config_full_diagnostics is not None:
+                        train_losses["config_full_mean_grad_norm"] += config_full_diagnostics["mean_grad_norm"] * batch_size_float
+                        train_losses["config_full_direction_norm"] += config_full_diagnostics["direction_norm"] * batch_size_float
+                        train_losses["config_full_min_cosine"] += config_full_diagnostics["min_cosine"] * batch_size_float
+                        train_losses["config_full_fallback"] += config_full_diagnostics["used_fallback"] * batch_size_float
 
                     if use_surface_supervision:
                         pred_surf_primary = y1_surf_teacher * std_surf + mean_surf
@@ -2011,6 +2199,16 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                                 "train/batch_config_direction_scale": float(config_diagnostics["direction_scale"].item()),
                                 "train/batch_config_direction_cosine": float(config_diagnostics["direction_cosine"].item()),
                                 "train/batch_config_direction_fallback": float(config_diagnostics["used_fallback"].item()),
+                            },
+                            step=global_step,
+                        )
+                    if config_full_diagnostics is not None:
+                        wandb.log(
+                            {
+                                "train/batch_config_full_mean_grad_norm": float(config_full_diagnostics["mean_grad_norm"].item()),
+                                "train/batch_config_full_direction_norm": float(config_full_diagnostics["direction_norm"].item()),
+                                "train/batch_config_full_min_cosine": float(config_full_diagnostics["min_cosine"].item()),
+                                "train/batch_config_full_fallback": float(config_full_diagnostics["used_fallback"].item()),
                             },
                             step=global_step,
                         )

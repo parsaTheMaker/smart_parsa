@@ -1,0 +1,15 @@
+defaults:
+  - drivaerml_satloss6
+  - _self_
+
+experiment:
+  name: "DrivAerML_SMART_SATLOSS6_CONFIG_FULL"
+  model_name: "SMART_SATLOSS6_CONFIG_FULL"
+  task_weighting_method: "config_full"
+  epochs: 200
+  use_learned_task_weighting: False
+  config_task_base_weights: [0.15, 0.15, 0.70]
+  # The exact batched-autograd path is available, but sequential autograd is
+  # faster for this model on the current CUDA/PyTorch stack.
+  config_full_vectorized_gradients: False
+  config_full_allow_sequential_fallback: True

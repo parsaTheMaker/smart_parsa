@@ -100,6 +100,9 @@ class LNO(nn.Module):
         pos_scale_factor=1.0,
         query_chunk_size=65536,
         dropout=0.0,
+        normalize_scores=True,
+        encode_score_temperature=2.0,
+        decode_score_temperature=1.0,
         **_unused,
     ):
         super().__init__()
@@ -116,6 +119,11 @@ class LNO(nn.Module):
         self.n_dim = int(n_dim)
         self.pos_scale_factor = float(pos_scale_factor)
         self.query_chunk_size = max(1, int(query_chunk_size))
+        self.normalize_scores = bool(normalize_scores)
+        self.encode_score_temperature = float(encode_score_temperature)
+        self.decode_score_temperature = float(decode_score_temperature)
+        if self.encode_score_temperature <= 0.0 or self.decode_score_temperature <= 0.0:
+            raise ValueError("LNO score temperatures must be positive.")
         act = nn.GELU()
 
         self.trunk_projector = _LNOBackboneMLP(3, n_dim, n_dim, n_layer, act)
@@ -127,18 +135,30 @@ class LNO(nn.Module):
         self.attention_blocks = nn.ModuleList(
             [_LNOAttentionBlock(n_dim, n_head, dropout=dropout) for _ in range(int(n_block))]
         )
+        self.latent_norm = nn.LayerNorm(n_dim)
         self.output_mlp = _LNOBackboneMLP(n_dim, n_dim, self.surface_channels + self.volume_channels, n_layer, act)
+
+    def _score_logits(self, logits, dim, temperature):
+        logits = logits.float()
+        if self.normalize_scores:
+            mean = logits.mean(dim=dim, keepdim=True)
+            std = logits.std(dim=dim, keepdim=True, unbiased=False).clamp_min(1.0e-4)
+            logits = (logits - mean) / std
+        return logits * float(temperature)
 
     def encode_geometry(self, geo, params=None):
         source = geo * self.pos_scale_factor
         source_trunk = self.trunk_projector(source)
         branch = self.branch_cond(self.branch_projector(source), params)
         encode_logits = self.attention_projector(source_trunk)
-        encode_weights = torch.softmax(encode_logits.float(), dim=1).to(dtype=branch.dtype)
-        latent = torch.einsum("bnm,bnd->bmd", encode_weights, branch)
+        encode_logits = self._score_logits(encode_logits, dim=1, temperature=self.encode_score_temperature)
+        encode_weights = torch.softmax(encode_logits, dim=1)
+        # Accumulate over large point clouds in fp32. Casting the normalized
+        # weights to fp16 before this reduction loses useful geometry signal.
+        latent = torch.einsum("bnm,bnd->bmd", encode_weights, branch.float()).to(dtype=branch.dtype)
         for block in self.attention_blocks:
             latent = block(latent)
-        return latent
+        return self.latent_norm(latent)
 
     def decode_features(self, latent, surf_query_pos, vol_query_pos, params=None):
         surf = self.trunk_projector(surf_query_pos * self.pos_scale_factor)
@@ -147,8 +167,9 @@ class LNO(nn.Module):
         query = torch.cat([surf, vol], dim=1)
         query = self.query_cond(query, params)
         decode_logits = self.attention_projector(query)
-        decode_weights = torch.softmax(decode_logits.float(), dim=-1).to(dtype=query.dtype)
-        decoded = torch.einsum("bnm,bmd->bnd", decode_weights, latent)
+        decode_logits = self._score_logits(decode_logits, dim=-1, temperature=self.decode_score_temperature)
+        decode_weights = torch.softmax(decode_logits, dim=-1)
+        decoded = torch.einsum("bnm,bmd->bnd", decode_weights, latent.float()).to(dtype=query.dtype)
         pred = self.output_mlp(decoded)
         return split_surface_volume_predictions(pred, surf_query_pos, self.surface_channels)
 

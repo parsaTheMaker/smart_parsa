@@ -1,0 +1,23 @@
+defaults:
+  - drivaerml_satloss6
+  - _self_
+
+experiment:
+  name: "DrivAerML_LNO_SATLOSS6"
+  model_name: "LNO_SATLOSS6"
+  init_ckpt: ""
+  architecture:
+    n_block: 6
+    n_mode: 64
+    n_dim: 128
+    n_head: 8
+    n_layer: 2
+    attn: "Galerkin"
+    activation: "GELU"
+    pos_scale_factor: 1.0
+    query_chunk_size: 65536
+    dropout: 0.0
+  view_geometry_points: 65536
+  eval_view_geometry_points: 65536
+  geometry_epoch_seeded_sampling: False
+  cuda_batch_prefetch: True

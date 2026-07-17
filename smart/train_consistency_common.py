@@ -181,8 +181,13 @@ def _config_full_update(gradient_matrix):
     space rather than parameter space.
     """
     with torch.no_grad():
-        if not bool(torch.isfinite(gradient_matrix).all().item()):
-            raise FloatingPointError("ConFIG_full received non-finite task gradients.")
+        had_nonfinite = not bool(torch.isfinite(gradient_matrix).all().item())
+        if had_nonfinite:
+            # Keep AMP enabled and skip only invalid gradient coordinates.
+            # This is intentionally a loose fallback: finite task-gradient
+            # directions still contribute, while one overflowed coordinate
+            # cannot terminate a long run.
+            torch.nan_to_num(gradient_matrix, nan=0.0, posinf=0.0, neginf=0.0, out=gradient_matrix)
 
         gradient_norms = gradient_matrix.float().norm(dim=1)
         unit_gradients = gradient_matrix.float()
@@ -208,7 +213,8 @@ def _config_full_update(gradient_matrix):
             "mean_grad_norm": gradient_norms.mean().detach().float(),
             "direction_norm": config_gradient.norm().detach().float(),
             "min_cosine": min_cosine.detach().float(),
-            "used_fallback": torch.tensor(0.0, device=gradient_matrix.device),
+            "used_fallback": torch.tensor(float(had_nonfinite), device=gradient_matrix.device),
+            "nonfinite_gradients": torch.tensor(float(had_nonfinite), device=gradient_matrix.device),
         }
         return config_gradient, diagnostics
 
@@ -234,8 +240,10 @@ def config_full_backward(
 
     task_count = len(task_losses)
     stacked_losses = torch.stack(list(task_losses))
+    amp_scale = 1.0
     if amp_enabled and scaler is not None and scaler.is_enabled():
         stacked_losses = scaler.scale(stacked_losses)
+        amp_scale = float(scaler.get_scale())
 
     gradient_matrix = None
     if vectorized:
@@ -297,6 +305,12 @@ def config_full_backward(
 
     del stacked_losses
     config_gradient, diagnostics = _config_full_update(gradient_matrix)
+    if amp_scale != 1.0:
+        # The assigned parameter gradients stay AMP-scaled for the normal
+        # scaler.unscale_/step path; expose raw norms in W&B diagnostics.
+        diagnostics["mean_grad_norm"] = diagnostics["mean_grad_norm"] / amp_scale
+        diagnostics["direction_norm"] = diagnostics["direction_norm"] / amp_scale
+    diagnostics["amp_scale"] = torch.tensor(amp_scale, device=parameters[0].device, dtype=torch.float32)
 
     offset = 0
     for parameter in parameters:
@@ -2029,7 +2043,10 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
                 if amp:
                     scaler.step(optimizer)
-                    scaler.update()
+                    if config_full_diagnostics is not None and float(config_full_diagnostics["used_fallback"].item()) > 0.0:
+                        scaler.update(new_scale=max(1.0, 0.5 * scaler.get_scale()))
+                    else:
+                        scaler.update()
                 else:
                     optimizer.step()
                 scheduler.step()
@@ -2209,6 +2226,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                                 "train/batch_config_full_direction_norm": float(config_full_diagnostics["direction_norm"].item()),
                                 "train/batch_config_full_min_cosine": float(config_full_diagnostics["min_cosine"].item()),
                                 "train/batch_config_full_fallback": float(config_full_diagnostics["used_fallback"].item()),
+                                "train/batch_config_full_amp_scale": float(config_full_diagnostics["amp_scale"].item()),
                             },
                             step=global_step,
                         )

@@ -1,0 +1,21 @@
+defaults:
+  - drivaerml
+  - _self_
+
+experiment:
+  name: "DrivAerML_POINTNET2_SSG"
+  model_name: "POINTNET2_SSG"
+  architecture:
+    latent_dim: 256
+    sa1_npoint: 1024
+    sa1_radius: 0.25
+    sa1_nsample: 32
+    sa2_npoint: 256
+    sa2_radius: 0.65
+    sa2_nsample: 64
+    pos_scale_factor: 1.0
+    query_chunk_size: 65536
+    dropout: 0.0
+  num_body_points: 65536
+  batch_size: 2
+  geometry_epoch_seeded_sampling: True

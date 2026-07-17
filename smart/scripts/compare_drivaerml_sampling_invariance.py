@@ -63,6 +63,9 @@ from models.smart.smart_sat4 import SMARTSAT4
 from models.transolverpp import TransolverPP
 from models.transolverpp_sat import TransolverPPSAT
 from models.mspt import MSPT
+from models.pointnet2_ssg import PointNet2SSG
+from models.lno import LNO
+from models.randla_net import RandLANet
 from utils.geometry_density import estimate_log_sampling_density
 from utils.utils import get_model_checkpoint_name
 
@@ -116,6 +119,12 @@ MODEL_ORDER = [
     "ABUPT_SATLOSS3",
     "POINTNET",
     "POINTNET_SATLOSS3",
+    "POINTNET2_SSG",
+    "POINTNET2_SSG_SATLOSS6",
+    "LNO",
+    "LNO_SATLOSS6",
+    "RANDLA_NET",
+    "RANDLA_NET_SATLOSS6",
     "MSPT",
     "MSPT_SATLOSS6",
 ]
@@ -142,6 +151,12 @@ MODEL_LABELS = {
     "ABUPT_SATLOSS3": "ABUPT-SATLOSS3",
     "POINTNET": "PointNet",
     "POINTNET_SATLOSS3": "PointNet-SATLOSS3",
+    "POINTNET2_SSG": "PointNet++-SSG",
+    "POINTNET2_SSG_SATLOSS6": "PointNet++-SSG-SATLOSS6",
+    "LNO": "LNO",
+    "LNO_SATLOSS6": "LNO-SATLOSS6",
+    "RANDLA_NET": "RandLA-Net",
+    "RANDLA_NET_SATLOSS6": "RandLA-Net-SATLOSS6",
     "MSPT": "MSPT",
     "MSPT_SATLOSS6": "MSPT-SATLOSS6",
 }
@@ -168,6 +183,12 @@ MODEL_COLORS = {
     "ABUPT_SATLOSS3": "#E45756",
     "POINTNET": "#6C6F7D",
     "POINTNET_SATLOSS3": "#4C78A8",
+    "POINTNET2_SSG": "#17BECF",
+    "POINTNET2_SSG_SATLOSS6": "#2CA02C",
+    "LNO": "#E45756",
+    "LNO_SATLOSS6": "#F58518",
+    "RANDLA_NET": "#7F7F7F",
+    "RANDLA_NET_SATLOSS6": "#9467BD",
     "MSPT": "#BCBD22",
     "MSPT_SATLOSS6": "#9467BD",
 }
@@ -183,6 +204,9 @@ LINE_MODEL_COLORS = {
     "TRANSOLVERPP_SAT": "#2CA02C",
     "ABUPT": "#D62728",
     "POINTNET": "#9467BD",
+    "POINTNET2_SSG": "#17BECF",
+    "LNO": "#D62728",
+    "RANDLA_NET": "#8C564B",
     "MSPT": "#2CA02C",
 }
 DRAG_RANK_MODELS = [
@@ -231,6 +255,9 @@ FAMILY_GROUPS = OrderedDict(
         ("transolverpp_family", ["TRANSOLVERPP", "TRANSOLVERPP_SAT", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6"]),
         ("abupt_family", ["ABUPT", "ABUPT_SATLOSS3"]),
         ("pointnet_family", ["POINTNET", "POINTNET_SATLOSS3"]),
+        ("pointnet2_ssg_family", ["POINTNET2_SSG", "POINTNET2_SSG_SATLOSS6"]),
+        ("lno_family", ["LNO", "LNO_SATLOSS6"]),
+        ("randla_net_family", ["RANDLA_NET", "RANDLA_NET_SATLOSS6"]),
         ("mspt_family", ["MSPT", "MSPT_SATLOSS6"]),
     ]
 )
@@ -240,6 +267,9 @@ FAMILY_TITLES = {
     "transolverpp_family": "TransolverPP vs TransolverPP-SAT vs TransolverPP-SATLOSS3 vs TransolverPP-SATLOSS6",
     "abupt_family": "ABUPT vs ABUPT-SATLOSS3",
     "pointnet_family": "PointNet vs PointNet-SATLOSS3",
+    "pointnet2_ssg_family": "PointNet++ SSG vs PointNet++ SSG-SATLOSS6",
+    "lno_family": "LNO vs LNO-SATLOSS6",
+    "randla_net_family": "RandLA-Net vs RandLA-Net-SATLOSS6",
     "mspt_family": "MSPT vs MSPT-SATLOSS6",
 }
 VTK_PRESSURE_MODELS = [
@@ -261,6 +291,12 @@ VTK_PRESSURE_MODELS = [
     "TRANSOLVERPP_SATLOSS3",
     "POINTNET",
     "POINTNET_SATLOSS3",
+    "POINTNET2_SSG",
+    "POINTNET2_SSG_SATLOSS6",
+    "LNO",
+    "LNO_SATLOSS6",
+    "RANDLA_NET",
+    "RANDLA_NET_SATLOSS6",
     "MSPT",
     "MSPT_SATLOSS6",
 ]
@@ -300,6 +336,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--abupt-satloss3-config", default="drivaerml_abupt_satloss3")
     p.add_argument("--pointnet-config", default="drivaerml_pointnet")
     p.add_argument("--pointnet-satloss3-config", default="drivaerml_pointnet_satloss3")
+    p.add_argument("--pointnet2-ssg-config", default="drivaerml_pointnet2_ssg")
+    p.add_argument("--pointnet2-ssg-satloss6-config", default="drivaerml_pointnet2_ssg_satloss6")
+    p.add_argument("--lno-config", default="drivaerml_lno")
+    p.add_argument("--lno-satloss6-config", default="drivaerml_lno_satloss6")
+    p.add_argument("--randla-net-config", default="drivaerml_randla_net")
+    p.add_argument("--randla-net-satloss6-config", default="drivaerml_randla_net_satloss6")
     p.add_argument("--mspt-config", default="drivaerml_mspt")
     p.add_argument("--mspt-satloss6-config", default="drivaerml_mspt_satloss6")
     p.add_argument("--smart-checkpoint", default=None)
@@ -334,6 +376,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--abupt-satloss3-checkpoint", default=None)
     p.add_argument("--pointnet-checkpoint", default=None)
     p.add_argument("--pointnet-satloss3-checkpoint", default=None)
+    p.add_argument("--pointnet2-ssg-checkpoint", default=None)
+    p.add_argument("--pointnet2-ssg-satloss6-checkpoint", default=None)
+    p.add_argument("--lno-checkpoint", default=None)
+    p.add_argument("--lno-satloss6-checkpoint", default=None)
+    p.add_argument("--randla-net-checkpoint", default=None)
+    p.add_argument("--randla-net-satloss6-checkpoint", default=None)
     p.add_argument("--mspt-checkpoint", default=None)
     p.add_argument("--mspt-satloss6-checkpoint", default=None)
     p.add_argument("--num-runs", type=int, default=8, help="Number of test runs to evaluate.")
@@ -510,6 +558,12 @@ def choose_ckpt(config, explicit: str | None) -> str:
         "ABUPT_SATLOSS3": "abupt-satloss3-",
         "POINTNET": "pointnet-",
         "POINTNET_SATLOSS3": "pointnet-satloss3-",
+        "POINTNET2_SSG": "pointnet2-ssg-",
+        "POINTNET2_SSG_SATLOSS6": "pointnet2-ssg-satloss6-",
+        "LNO": "lno-",
+        "LNO_SATLOSS6": "lno-satloss6-",
+        "RANDLA_NET": "randla-net-",
+        "RANDLA_NET_SATLOSS6": "randla-net-satloss6-",
         "MSPT": "mspt-",
         "MSPT_SATLOSS6": "mspt-satloss6-",
     }
@@ -587,6 +641,12 @@ def build_model(config, ckpt_path: str, device: torch.device, batched_query_subr
         model = ABUPTSAT(**base_kwargs, **arch)
     elif model_name in {"POINTNET", "POINTNET_SATLOSS3"}:
         model = PointNet(**base_kwargs, **arch)
+    elif model_name in {"POINTNET2_SSG", "POINTNET2_SSG_SATLOSS6"}:
+        model = PointNet2SSG(**base_kwargs, **arch)
+    elif model_name in {"LNO", "LNO_SATLOSS6"}:
+        model = LNO(**base_kwargs, **arch)
+    elif model_name in {"RANDLA_NET", "RANDLA_NET_SATLOSS6"}:
+        model = RandLANet(**base_kwargs, **arch)
     elif model_name in {"MSPT", "MSPT_SATLOSS6"}:
         model = MSPT(**base_kwargs, **arch)
     else:
@@ -2312,6 +2372,12 @@ def main():
             ("ABUPT_SATLOSS3", args.abupt_satloss3_config),
             ("POINTNET", args.pointnet_config),
             ("POINTNET_SATLOSS3", args.pointnet_satloss3_config),
+            ("POINTNET2_SSG", args.pointnet2_ssg_config),
+            ("POINTNET2_SSG_SATLOSS6", args.pointnet2_ssg_satloss6_config),
+            ("LNO", args.lno_config),
+            ("LNO_SATLOSS6", args.lno_satloss6_config),
+            ("RANDLA_NET", args.randla_net_config),
+            ("RANDLA_NET_SATLOSS6", args.randla_net_satloss6_config),
             ("MSPT", args.mspt_config),
             ("MSPT_SATLOSS6", args.mspt_satloss6_config),
         ]
@@ -2376,6 +2442,12 @@ def main():
         "ABUPT_SATLOSS3": args.abupt_satloss3_checkpoint,
         "POINTNET": args.pointnet_checkpoint,
         "POINTNET_SATLOSS3": args.pointnet_satloss3_checkpoint,
+        "POINTNET2_SSG": args.pointnet2_ssg_checkpoint,
+        "POINTNET2_SSG_SATLOSS6": args.pointnet2_ssg_satloss6_checkpoint,
+        "LNO": args.lno_checkpoint,
+        "LNO_SATLOSS6": args.lno_satloss6_checkpoint,
+        "RANDLA_NET": args.randla_net_checkpoint,
+        "RANDLA_NET_SATLOSS6": args.randla_net_satloss6_checkpoint,
         "MSPT": args.mspt_checkpoint,
         "MSPT_SATLOSS6": args.mspt_satloss6_checkpoint,
     }

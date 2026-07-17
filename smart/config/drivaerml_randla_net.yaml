@@ -1,0 +1,17 @@
+defaults:
+  - drivaerml
+  - _self_
+
+experiment:
+  name: "DrivAerML_RANDLA_NET"
+  model_name: "RANDLA_NET"
+  architecture:
+    num_neighbors: 16
+    decimation: 4
+    query_chunk_size: 32768
+    latent_dim: 256
+    pos_scale_factor: 1.0
+    dropout: 0.0
+  num_body_points: 65536
+  batch_size: 2
+  geometry_epoch_seeded_sampling: True

@@ -1,0 +1,20 @@
+defaults:
+  - drivaerml_satloss6
+  - _self_
+
+experiment:
+  name: "DrivAerML_RANDLA_NET_SATLOSS6"
+  model_name: "RANDLA_NET_SATLOSS6"
+  init_ckpt: ""
+  architecture:
+    num_neighbors: 16
+    decimation: 4
+    query_chunk_size: 32768
+    latent_dim: 256
+    pos_scale_factor: 1.0
+    dropout: 0.0
+  view_geometry_points: 65536
+  eval_view_geometry_points: 65536
+  batch_size: 2
+  geometry_epoch_seeded_sampling: False
+  cuda_batch_prefetch: True

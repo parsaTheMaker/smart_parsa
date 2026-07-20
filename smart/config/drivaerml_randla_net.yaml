@@ -13,5 +13,5 @@ experiment:
     pos_scale_factor: 1.0
     dropout: 0.0
   num_body_points: 65536
-  batch_size: 2
+  batch_size: 4
   geometry_epoch_seeded_sampling: True

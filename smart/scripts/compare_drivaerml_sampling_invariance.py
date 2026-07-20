@@ -64,6 +64,7 @@ from models.transolverpp import TransolverPP
 from models.transolverpp_sat import TransolverPPSAT
 from models.mspt import MSPT
 from models.pointnet2_ssg import PointNet2SSG
+from models.point_gnn import PointGNN
 from models.lno import LNO
 from models.randla_net import RandLANet
 from utils.geometry_density import estimate_log_sampling_density
@@ -121,6 +122,8 @@ MODEL_ORDER = [
     "POINTNET_SATLOSS3",
     "POINTNET2_SSG",
     "POINTNET2_SSG_SATLOSS6",
+    "POINT_GNN",
+    "POINT_GNN_SATLOSS6",
     "LNO",
     "LNO_SATLOSS6",
     "RANDLA_NET",
@@ -153,6 +156,8 @@ MODEL_LABELS = {
     "POINTNET_SATLOSS3": "PointNet-SATLOSS3",
     "POINTNET2_SSG": "PointNet++-SSG",
     "POINTNET2_SSG_SATLOSS6": "PointNet++-SSG-SATLOSS6",
+    "POINT_GNN": "Point-GNN",
+    "POINT_GNN_SATLOSS6": "Point-GNN-SATLOSS6",
     "LNO": "LNO",
     "LNO_SATLOSS6": "LNO-SATLOSS6",
     "RANDLA_NET": "RandLA-Net",
@@ -185,6 +190,8 @@ MODEL_COLORS = {
     "POINTNET_SATLOSS3": "#4C78A8",
     "POINTNET2_SSG": "#17BECF",
     "POINTNET2_SSG_SATLOSS6": "#2CA02C",
+    "POINT_GNN": "#8C564B",
+    "POINT_GNN_SATLOSS6": "#E377C2",
     "LNO": "#E45756",
     "LNO_SATLOSS6": "#F58518",
     "RANDLA_NET": "#7F7F7F",
@@ -205,10 +212,31 @@ LINE_MODEL_COLORS = {
     "ABUPT": "#D62728",
     "POINTNET": "#9467BD",
     "POINTNET2_SSG": "#17BECF",
+    "POINT_GNN": "#8C564B",
     "LNO": "#D62728",
     "RANDLA_NET": "#8C564B",
     "MSPT": "#2CA02C",
 }
+# In the dedicated SMART/SATLOSS6 weighting comparison, each weighting method
+# is an independent experiment. Keep this separate from the usual paired
+# vanilla-vs-SATLOSS family colors used by the broader comparison plots.
+INDEPENDENT_SATLOSS6_MODELS = {
+    "SMART_SATLOSS6",
+    "SMART_SATLOSS6_FIXEDSUM",
+    "SMART_SATLOSS6_GRADNORM",
+    "SMART_SATLOSS6_CONFIG_FULL",
+    "SMART_SATLOSS6_CONFIG_LAYER",
+}
+INDEPENDENT_SATLOSS6_COLORS = {
+    "SMART_SATLOSS6": "#2CA02C",
+    "SMART_SATLOSS6_FIXEDSUM": "#FF7F0E",
+    "SMART_SATLOSS6_GRADNORM": "#9467BD",
+    "SMART_SATLOSS6_CONFIG_FULL": "#D62728",
+    "SMART_SATLOSS6_CONFIG_LAYER": "#17BECF",
+}
+# Set once in main after the active checkpoints are known. Plot workers are
+# forked on the target Linux environment and inherit this read-only context.
+_INDEPENDENT_SATLOSS6_LINE_MODE = False
 DRAG_RANK_MODELS = [
     "SMART",
     "SMART_DOWNSAMPLE",
@@ -221,6 +249,8 @@ DRAG_RANK_MODELS = [
     "SMART_SATLOSS6_GRADNORM",
     "SMART_SATLOSS6_CONFIG_FULL",
     "SMART_SATLOSS6_CONFIG_LAYER",
+    "POINT_GNN",
+    "POINT_GNN_SATLOSS6",
 ]
 FAMILY_GROUPS = OrderedDict(
     [
@@ -256,6 +286,7 @@ FAMILY_GROUPS = OrderedDict(
         ("abupt_family", ["ABUPT", "ABUPT_SATLOSS3"]),
         ("pointnet_family", ["POINTNET", "POINTNET_SATLOSS3"]),
         ("pointnet2_ssg_family", ["POINTNET2_SSG", "POINTNET2_SSG_SATLOSS6"]),
+        ("point_gnn_family", ["POINT_GNN", "POINT_GNN_SATLOSS6"]),
         ("lno_family", ["LNO", "LNO_SATLOSS6"]),
         ("randla_net_family", ["RANDLA_NET", "RANDLA_NET_SATLOSS6"]),
         ("mspt_family", ["MSPT", "MSPT_SATLOSS6"]),
@@ -268,6 +299,7 @@ FAMILY_TITLES = {
     "abupt_family": "ABUPT vs ABUPT-SATLOSS3",
     "pointnet_family": "PointNet vs PointNet-SATLOSS3",
     "pointnet2_ssg_family": "PointNet++ SSG vs PointNet++ SSG-SATLOSS6",
+    "point_gnn_family": "Point-GNN vs Point-GNN-SATLOSS6",
     "lno_family": "LNO vs LNO-SATLOSS6",
     "randla_net_family": "RandLA-Net vs RandLA-Net-SATLOSS6",
     "mspt_family": "MSPT vs MSPT-SATLOSS6",
@@ -293,6 +325,8 @@ VTK_PRESSURE_MODELS = [
     "POINTNET_SATLOSS3",
     "POINTNET2_SSG",
     "POINTNET2_SSG_SATLOSS6",
+    "POINT_GNN",
+    "POINT_GNN_SATLOSS6",
     "LNO",
     "LNO_SATLOSS6",
     "RANDLA_NET",
@@ -338,6 +372,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pointnet-satloss3-config", default="drivaerml_pointnet_satloss3")
     p.add_argument("--pointnet2-ssg-config", default="drivaerml_pointnet2_ssg")
     p.add_argument("--pointnet2-ssg-satloss6-config", default="drivaerml_pointnet2_ssg_satloss6")
+    p.add_argument("--point-gnn-config", default="drivaerml_point_gnn")
+    p.add_argument("--point-gnn-satloss6-config", default="drivaerml_point_gnn_satloss6")
     p.add_argument("--lno-config", default="drivaerml_lno")
     p.add_argument("--lno-satloss6-config", default="drivaerml_lno_satloss6")
     p.add_argument("--randla-net-config", default="drivaerml_randla_net")
@@ -378,6 +414,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pointnet-satloss3-checkpoint", default=None)
     p.add_argument("--pointnet2-ssg-checkpoint", default=None)
     p.add_argument("--pointnet2-ssg-satloss6-checkpoint", default=None)
+    p.add_argument("--point-gnn-checkpoint", default=None)
+    p.add_argument("--point-gnn-satloss6-checkpoint", default=None)
     p.add_argument("--lno-checkpoint", default=None)
     p.add_argument("--lno-satloss6-checkpoint", default=None)
     p.add_argument("--randla-net-checkpoint", default=None)
@@ -560,6 +598,8 @@ def choose_ckpt(config, explicit: str | None) -> str:
         "POINTNET_SATLOSS3": "pointnet-satloss3-",
         "POINTNET2_SSG": "pointnet2-ssg-",
         "POINTNET2_SSG_SATLOSS6": "pointnet2-ssg-satloss6-",
+        "POINT_GNN": "point-gnn-",
+        "POINT_GNN_SATLOSS6": "point-gnn-satloss6-",
         "LNO": "lno-",
         "LNO_SATLOSS6": "lno-satloss6-",
         "RANDLA_NET": "randla-net-",
@@ -643,6 +683,8 @@ def build_model(config, ckpt_path: str, device: torch.device, batched_query_subr
         model = PointNet(**base_kwargs, **arch)
     elif model_name in {"POINTNET2_SSG", "POINTNET2_SSG_SATLOSS6"}:
         model = PointNet2SSG(**base_kwargs, **arch)
+    elif model_name in {"POINT_GNN", "POINT_GNN_SATLOSS6"}:
+        model = PointGNN(**base_kwargs, **arch)
     elif model_name in {"LNO", "LNO_SATLOSS6"}:
         model = LNO(**base_kwargs, **arch)
     elif model_name in {"RANDLA_NET", "RANDLA_NET_SATLOSS6"}:
@@ -1570,6 +1612,19 @@ def mode_display_name(mode_name: str) -> str:
     return mode_name
 
 
+def is_zero_shift_mode(mode_name: str, eps: float = 1.0e-12) -> bool:
+    """Return whether a shifted mode represents the zero-severity control."""
+    if mode_name == "aligned_uniform_wor":
+        return True
+    beta_match = re.search(r"beta_([0-9]+\.[0-9]+)", str(mode_name))
+    if beta_match is not None:
+        return abs(float(beta_match.group(1))) <= eps
+    sine_match = re.search(r"ood_sine_y_mix_([0-9]+\.[0-9]+)", str(mode_name))
+    if sine_match is not None:
+        return abs(float(sine_match.group(1))) <= eps
+    return False
+
+
 def mode_rows(rows: List[Dict[str, object]], model_name: str, sampling_mode: str) -> List[Dict[str, object]]:
     return [r for r in rows if r["model_name"] == model_name and r["sampling_mode"] == sampling_mode]
 
@@ -1643,6 +1698,11 @@ def model_line_visuals(model_name: str) -> Tuple[str, str]:
         str(model_name),
     )
     if satloss_match:
+        if (
+            (_INDEPENDENT_SATLOSS6_LINE_MODE or os.environ.get("SMART_COMPARE_INDEPENDENT_SATLOSS6", "0") == "1")
+            and model_name in INDEPENDENT_SATLOSS6_MODELS
+        ):
+            return INDEPENDENT_SATLOSS6_COLORS[model_name], "--"
         vanilla_name = satloss_match.group(1)
         color = LINE_MODEL_COLORS.get(vanilla_name, MODEL_COLORS[model_name])
         return color, "-."
@@ -2111,6 +2171,9 @@ def plot_delta_severity_curve(
             if row is None:
                 ys.append(np.nan)
                 ystd.append(0.0)
+            elif is_zero_shift_mode(mode_name):
+                ys.append(0.0)
+                ystd.append(0.0)
             else:
                 ys.append(float(row[metric_key]) - float(aligned[metric_key]))
                 ystd.append(float(row.get(f"{metric_key}_std", 0.0)))
@@ -2157,10 +2220,16 @@ def build_percentage_degradation_rows(
                 "sampling_mode_id": int(shifted["sampling_mode_id"]),
             }
             for metric_key in metric_keys:
-                baseline = max(abs(float(aligned[metric_key])), 1.0e-12)
-                result[f"{metric_key}_pct_worsening"] = 100.0 * (
-                    float(shifted[metric_key]) - float(aligned[metric_key])
-                ) / baseline
+                if is_zero_shift_mode(mode_name):
+                    # beta=0 and sine=0 are control points, not independent
+                    # degradation conditions. Their worsening is defined as
+                    # exactly zero even though the sampled point sets differ.
+                    result[f"{metric_key}_pct_worsening"] = 0.0
+                else:
+                    baseline = max(abs(float(aligned[metric_key])), 1.0e-12)
+                    result[f"{metric_key}_pct_worsening"] = 100.0 * (
+                        float(shifted[metric_key]) - float(aligned[metric_key])
+                    ) / baseline
             out.append(result)
     return out
 
@@ -2195,6 +2264,10 @@ def plot_percentage_degradation_curve(
             ystd.append(float(np.std(values)) if values.size else 0.0)
         ys = np.asarray(ys, dtype=np.float64)
         ystd = np.asarray(ystd, dtype=np.float64)
+        for idx, mode_name in enumerate(mode_order):
+            if is_zero_shift_mode(mode_name):
+                ys[idx] = 0.0
+                ystd[idx] = 0.0
         color, linestyle = model_line_visuals(model_name)
         ax.plot(xs, ys, marker="o", linewidth=2, color=color, linestyle=linestyle, label=MODEL_LABELS[model_name])
         if show_std:
@@ -2243,6 +2316,10 @@ def plot_family_percentage_degradation_curve(
             )
             ys.append(float(np.mean(values)) if values.size else np.nan)
             ystd.append(float(np.std(values)) if values.size else 0.0)
+        for idx, mode_name in enumerate(mode_order):
+            if is_zero_shift_mode(mode_name):
+                ys[idx] = 0.0
+                ystd[idx] = 0.0
         color = family_colors[color_idx % len(family_colors)]
         color_idx += 1
         ys = np.asarray(ys, dtype=np.float64)
@@ -2342,6 +2419,7 @@ def plot_percentage_degradation_bars(
 
 
 def main():
+    global _INDEPENDENT_SATLOSS6_LINE_MODE
     args = parse_args()
     seed_everything(args.seed)
     device = resolve_device(args.device)
@@ -2374,6 +2452,8 @@ def main():
             ("POINTNET_SATLOSS3", args.pointnet_satloss3_config),
             ("POINTNET2_SSG", args.pointnet2_ssg_config),
             ("POINTNET2_SSG_SATLOSS6", args.pointnet2_ssg_satloss6_config),
+            ("POINT_GNN", args.point_gnn_config),
+            ("POINT_GNN_SATLOSS6", args.point_gnn_satloss6_config),
             ("LNO", args.lno_config),
             ("LNO_SATLOSS6", args.lno_satloss6_config),
             ("RANDLA_NET", args.randla_net_config),
@@ -2444,6 +2524,8 @@ def main():
         "POINTNET_SATLOSS3": args.pointnet_satloss3_checkpoint,
         "POINTNET2_SSG": args.pointnet2_ssg_checkpoint,
         "POINTNET2_SSG_SATLOSS6": args.pointnet2_ssg_satloss6_checkpoint,
+        "POINT_GNN": args.point_gnn_checkpoint,
+        "POINT_GNN_SATLOSS6": args.point_gnn_satloss6_checkpoint,
         "LNO": args.lno_checkpoint,
         "LNO_SATLOSS6": args.lno_satloss6_checkpoint,
         "RANDLA_NET": args.randla_net_checkpoint,
@@ -2454,6 +2536,17 @@ def main():
     requested_model_names = [model_name for model_name in MODEL_ORDER if checkpoint_arg_map[model_name] is not None]
     if not requested_model_names:
         raise ValueError("No model checkpoints were provided. Pass at least one --*-checkpoint argument.")
+    active_model_set = set(requested_model_names)
+    _INDEPENDENT_SATLOSS6_LINE_MODE = bool(
+        active_model_set.intersection(INDEPENDENT_SATLOSS6_MODELS)
+        and active_model_set <= ({"SMART"} | INDEPENDENT_SATLOSS6_MODELS)
+    )
+    os.environ["SMART_COMPARE_INDEPENDENT_SATLOSS6"] = "1" if _INDEPENDENT_SATLOSS6_LINE_MODE else "0"
+    if _INDEPENDENT_SATLOSS6_LINE_MODE:
+        print(
+            "[plot styles] SMART/SATLOSS6 weighting comparison detected: "
+            "SATLOSS6 variants use independent colors and dashed lines; SMART uses a solid line."
+        )
     model_specs = OrderedDict(
         (
             model_name,

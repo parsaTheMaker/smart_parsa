@@ -1,0 +1,67 @@
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+
+wandb:
+  project: "smart_drivaerml"
+  entity: "parsa-vatani99-technical-university-of-munich"
+
+experiment:
+  name: "DrivAerML_POINT_GNN"
+  model_name: "POINT_GNN"
+  model_tag: ""
+  random_seed: 42
+  manifest_variant: "full"
+
+  architecture:
+    latent_dim: 256
+    node_dim: 64
+    edge_hidden_dim: 128
+    graph_radii: [0.035, 0.08, 0.16, 0.24]
+    graph_max_neighbors: 16
+    pool_voxel_sizes: [0.025, 0.06, 0.12]
+    auto_center_layers: [true, true, true, true]
+    auto_center_offset_scale: 0.05
+    query_neighbors: 8
+    query_chunk_size: 32768
+    num_query_blocks: 3
+    pos_scale_factor: 100.0
+    local_sum_scale: 0.25
+    global_sum_scale: 0.015625
+    edge_chunk_size: 262144
+    dropout: 0.0
+
+  optimizer: "adamw"
+  loss_fn: "rel_l2"
+  scheduler: "cosine"
+  scheduler_warmup_fraction: 0.2
+  batch_size: 2
+  epochs: 300
+  learning_rate: 2.e-4
+  gradient_norm: null
+  amp: true
+  precision: "float16"
+  log_every_n_steps: 10
+  inspect_first_sample: false
+  resume_ckpt: ""
+  resume_full_state: false
+  init_ckpt: ""
+  wandb_watch_model: false
+
+  dataset: "DrivAerML"
+  data_path: "/mnt/ssdraid/parsa/drivaerml_preprocessed"
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: true
+  cuda_batch_prefetch: true
+  geometry_epoch_seeded_sampling: true
+  num_body_points: 131072
+  num_surface_points: 65536
+  num_volume_points: 65536
+  scale_positions: false

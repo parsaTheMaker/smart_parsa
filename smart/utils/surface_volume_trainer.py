@@ -89,6 +89,51 @@ def load_partial_state_dict(model, checkpoint_path, device):
     return matched, skipped
 
 
+def load_full_training_state(model, optimizer, scheduler, scaler, checkpoint_path, device, steps_per_epoch=None):
+    """Restore a vanilla trainer checkpoint without replaying completed epochs."""
+    if not checkpoint_path:
+        raise ValueError("checkpoint_path must be provided for full-state resume.")
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    source = checkpoint.get("model_state_dict")
+    if source is None:
+        raise KeyError(f"Checkpoint {checkpoint_path} does not contain model_state_dict.")
+
+    target_model = model.module if hasattr(model, "module") else model
+    if any(key.startswith("module.") for key in source):
+        source = {key.removeprefix("module."): value for key, value in source.items()}
+    target_model.load_state_dict(source, strict=True)
+
+    optimizer_state = checkpoint.get("optimizer_state_dict")
+    scheduler_state = checkpoint.get("scheduler_state_dict")
+    if optimizer_state is None or scheduler_state is None:
+        raise KeyError(
+            f"Checkpoint {checkpoint_path} is missing optimizer_state_dict or scheduler_state_dict."
+        )
+    optimizer.load_state_dict(optimizer_state)
+    scheduler.load_state_dict(scheduler_state)
+
+    scaler_state = checkpoint.get("scaler_state_dict")
+    if scaler_state is not None:
+        scaler.load_state_dict(scaler_state)
+
+    resumed_epoch = int(checkpoint.get("epoch", -1))
+    start_epoch = resumed_epoch + 1
+    global_step = checkpoint.get("global_step")
+    if global_step is None:
+        global_step = (resumed_epoch + 1) * int(steps_per_epoch or 0)
+    global_step = int(global_step)
+    best_rel_l2 = float(checkpoint.get("best_rel_l2", checkpoint.get("rel_l2_loss", np.inf)))
+    print(
+        f"[resume] Restored full training state from {checkpoint_path}: "
+        f"epoch={resumed_epoch}, next_epoch={start_epoch}, global_step={global_step}, "
+        f"best_rel_l2={best_rel_l2:.6g}"
+    )
+    return start_epoch, global_step, best_rel_l2
+
+
 def _parse_batch(batch, params_dim):
     geo_log_density = None
     if params_dim > 0:
@@ -245,7 +290,12 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
 
     resume_ckpt = str(getattr(config, "resume_ckpt", "")).strip()
     init_ckpt = str(getattr(config, "init_ckpt", "")).strip()
-    if resume_ckpt:
+    resume_full_state = bool(getattr(config, "resume_full_state", False))
+    if resume_full_state and not resume_ckpt:
+        raise ValueError("resume_full_state=True requires experiment.resume_ckpt to be set.")
+    if resume_full_state:
+        pass
+    elif resume_ckpt:
         print(f"[init] Loading model weights from experiment.resume_ckpt={resume_ckpt}")
         load_partial_state_dict(model, resume_ckpt, device)
     elif init_ckpt:
@@ -264,10 +314,21 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
 
     loss_test_min = np.inf
     global_step = 0
+    start_epoch = 0
+    if resume_full_state:
+        start_epoch, global_step, loss_test_min = load_full_training_state(
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            resume_ckpt,
+            device,
+            steps_per_epoch=len(train_loader),
+        )
     log_every_n_steps = getattr(config, "log_every_n_steps", 10)
 
     try:
-        for ep in tqdm(range(config.epochs), desc="Epochs", dynamic_ncols=True):
+        for ep in tqdm(range(start_epoch, config.epochs), desc="Epochs", dynamic_ncols=True):
             t1 = default_timer()
             # Propagate the epoch to datasets that use epoch-seeded point sampling.
             if hasattr(train_data, "set_epoch"):
@@ -435,9 +496,12 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                 loss_test_min = test_losses["rel_l2"]
                 torch.save({
                     "epoch": ep,
+                    "global_step": global_step,
+                    "best_rel_l2": loss_test_min,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
                     "loss": test_losses["loss"],
                     "rel_l2_loss": test_losses["rel_l2"],
                     "surface_fields": fields["surface"],
@@ -447,9 +511,12 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
 
             torch.save({
                 "epoch": ep,
+                "global_step": global_step,
+                "best_rel_l2": loss_test_min,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
+                "scaler_state_dict": scaler.state_dict(),
                 "loss": test_losses["loss"],
                 "rel_l2_loss": test_losses["rel_l2"],
                 "surface_fields": fields["surface"],

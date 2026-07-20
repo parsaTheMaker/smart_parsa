@@ -20,5 +20,6 @@ experiment:
     encode_score_temperature: 2.0
     decode_score_temperature: 1.0
   num_body_points: 65536
+  batch_size: 2
   geometry_epoch_seeded_sampling: True
   cuda_batch_prefetch: True

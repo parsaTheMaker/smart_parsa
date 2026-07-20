@@ -59,6 +59,38 @@ def _gather_features(features: torch.Tensor, indices: torch.Tensor) -> torch.Ten
     )
 
 
+def _index_select_features(features, indices):
+    """Gather batched K-neighbor features without expanding source points."""
+    batch_size, source_points, channels = features.shape
+    offsets = torch.arange(batch_size, device=features.device, dtype=indices.dtype).view(batch_size, 1, 1)
+    flat_indices = (indices + offsets * source_points).reshape(-1)
+    flat_features = features.reshape(batch_size * source_points, channels)
+    return flat_features.index_select(0, flat_indices).view(
+        batch_size, indices.shape[1], indices.shape[2], channels
+    )
+
+
+def _weighted_interpolate(source_coords, source_features, target_coords, indices):
+    """Interpolate local features while retaining sensitivity to point spacing."""
+    neighbor_coords = _index_select_features(source_coords, indices)
+    neighbor_features = _index_select_features(source_features, indices)
+    distances = torch.linalg.vector_norm(
+        neighbor_coords.float() - target_coords.float().unsqueeze(2), dim=-1
+    )
+    weights = torch.reciprocal(distances.clamp_min(1.0e-5))
+    weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-6)
+    interpolated = (weights.to(dtype=neighbor_features.dtype).unsqueeze(-1) * neighbor_features).sum(dim=2)
+    effective_distance = (weights * distances).sum(dim=-1, keepdim=True)
+    return interpolated, effective_distance
+
+
+def _spacing_modulate(features, distances):
+    """Keep nearest-feature decoding sensitive to the relative local spacing."""
+    relative_spacing = distances / distances.detach().mean(dim=1, keepdim=True).clamp_min(1.0e-6)
+    modulation = (1.0 + 0.35 * relative_spacing.clamp(0.0, 3.0)).to(dtype=features.dtype)
+    return features * modulation
+
+
 class _SharedMLP(nn.Module):
     """RandLA-Net's shared 1x1 Conv2d MLP for channel-last point tensors."""
 
@@ -113,18 +145,29 @@ class _LocalSpatialEncoding(nn.Module):
         positional = torch.cat([center_coords, neighbor_coords, relative, distance], dim=-1)
         encoded_position = self.position_mlp(positional)
         center_features = features.unsqueeze(2).expand(-1, -1, neighbor_indices.shape[-1], -1)
-        return torch.cat([encoded_position, center_features], dim=-1)
+        return torch.cat([encoded_position, center_features], dim=-1), distance
 
 
 class _AttentivePooling(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
         self.score = nn.Linear(int(input_dim), int(input_dim), bias=False)
+        # A scalar spacing bias avoids allocating another full K-by-channel
+        # attention tensor while keeping the pooling arrangement-sensitive.
+        self.distance_score = nn.Linear(1, 1, bias=False)
+        self.distance_context = nn.Linear(2, int(input_dim))
         self.output = _SharedMLP(input_dim, output_dim, activation=nn.ReLU(), batch_norm=True)
 
-    def forward(self, features):
-        weights = torch.softmax(self.score(features), dim=2)
+    def forward(self, features, distances):
+        normalized_distances = distances / distances.mean(dim=2, keepdim=True).clamp_min(1.0e-6)
+        logits = self.score(features) + 0.25 * self.distance_score(normalized_distances)
+        weights = torch.softmax(logits, dim=2)
         pooled = (weights * features).sum(dim=2)
+        distance_weights = weights.mean(dim=-1, keepdim=True)
+        distance_mean = (distance_weights * distances).sum(dim=2)
+        distance_variance = (distance_weights * (distances - distance_mean.unsqueeze(2)).square()).sum(dim=2)
+        distance_stats = torch.cat([distance_mean, torch.sqrt(distance_variance.clamp_min(1.0e-8))], dim=-1)
+        pooled = pooled + 0.1 * self.distance_context(distance_stats)
         return self.output(pooled)
 
 
@@ -144,8 +187,10 @@ class _LocalFeatureAggregation(nn.Module):
     def forward(self, coords, features):
         neighbor_indices = _knn_indices(coords, coords, self.lse1.num_neighbors)
         x = self.mlp1(features)
-        x = self.pool1(self.lse1(coords, x, neighbor_indices))
-        x = self.pool2(self.lse2(coords, x, neighbor_indices))
+        x, distances = self.lse1(coords, x, neighbor_indices)
+        x = self.pool1(x, distances)
+        x, distances = self.lse2(coords, x, neighbor_indices)
+        x = self.pool2(x, distances)
         return self.activation(self.mlp2(x) + self.shortcut(features))
 
 
@@ -164,6 +209,8 @@ class RandLANet(nn.Module):
         latent_dim=256,
         pos_scale_factor=1.0,
         dropout=0.0,
+        query_interpolation_neighbors=2,
+        decoder_interpolation_neighbors=2,
         **_unused,
     ):
         super().__init__()
@@ -177,6 +224,8 @@ class RandLANet(nn.Module):
         self.query_chunk_size = max(1, int(query_chunk_size))
         self.latent_dim = int(latent_dim)
         self.pos_scale_factor = float(pos_scale_factor)
+        self.query_interpolation_neighbors = max(1, int(query_interpolation_neighbors))
+        self.decoder_interpolation_neighbors = max(1, int(decoder_interpolation_neighbors))
 
         self.fc_start = _SharedMLP(3, 8, activation=nn.LeakyReLU(0.2), batch_norm=True)
         encoder_dims = (16, 64, 128, 256)
@@ -266,12 +315,18 @@ class RandLANet(nn.Module):
             target_level = len(skip_features) - 1 - decoder_index
             target_coords = skip_coords[target_level]
             target_skip = skip_features[target_level]
-            nearest = _knn_indices(current_coords, target_coords, 1).squeeze(-1)
-            upsampled = torch.gather(
-                features,
-                1,
-                nearest.unsqueeze(-1).expand(-1, -1, features.shape[-1]),
+            interpolation_indices = _knn_indices(
+                current_coords,
+                target_coords,
+                self.decoder_interpolation_neighbors,
             )
+            upsampled, interpolation_distances = _weighted_interpolate(
+                current_coords,
+                features,
+                target_coords,
+                interpolation_indices,
+            )
+            upsampled = _spacing_modulate(upsampled, interpolation_distances)
             features = self.decoder[decoder_index](torch.cat([upsampled, target_skip], dim=-1))
             current_coords = target_coords
 
@@ -281,13 +336,20 @@ class RandLANet(nn.Module):
         return current_coords, features, latent
 
     def _decode_query_chunk(self, geometry_coords, geometry_features, latent, query, query_type, params=None):
-        nearest = _knn_indices(geometry_coords, query * self.pos_scale_factor, 1).squeeze(-1)
-        local = torch.gather(
-            geometry_features,
-            1,
-            nearest.unsqueeze(-1).expand(-1, -1, geometry_features.shape[-1]),
+        query_coords = query * self.pos_scale_factor
+        query_indices = _knn_indices(
+            geometry_coords,
+            query_coords,
+            self.query_interpolation_neighbors,
         )
-        hidden = self.query_projection(torch.cat([local, query * self.pos_scale_factor, latent.unsqueeze(1).expand(-1, query.shape[1], -1)], dim=-1))
+        local, query_distances = _weighted_interpolate(
+            geometry_coords,
+            geometry_features,
+            query_coords,
+            query_indices,
+        )
+        local = _spacing_modulate(local, query_distances)
+        hidden = self.query_projection(torch.cat([local, query_coords, latent.unsqueeze(1).expand(-1, query.shape[1], -1)], dim=-1))
         hidden = hidden + query_type
         hidden = self.query_cond(hidden, params)
         for block in self.query_blocks:

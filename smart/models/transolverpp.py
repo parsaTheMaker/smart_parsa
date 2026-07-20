@@ -5,9 +5,6 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .family_common import sample_tokens_density_compensated
-
-
 def gumbel_softmax(logits, tau=1.0):
     u = torch.rand_like(logits)
     noise = -torch.log(-torch.log(u + 1.0e-8) + 1.0e-8)
@@ -157,10 +154,6 @@ class TransolverPPBase(nn.Module):
         mlp_ratio=2,
         slice_num=32,
         geometry_points=0,
-        density_compensated=False,
-        density_knn_k=8,
-        density_neighbor_hops=1,
-        density_estimator="rk2",
     ):
         super().__init__()
         if parameter_channels:
@@ -169,10 +162,6 @@ class TransolverPPBase(nn.Module):
         self.volume_channels = int(volume_channels)
         self.spatial_dim = int(spatial_dim)
         self.geometry_points = int(geometry_points)
-        self.density_compensated = bool(density_compensated)
-        self.density_knn_k = int(density_knn_k)
-        self.density_neighbor_hops = int(density_neighbor_hops)
-        self.density_estimator = str(density_estimator)
         self.preprocess = TransolverPlusMLP(
             self.spatial_dim, n_hidden * 2, n_hidden, n_layers=0, residual=False
         )
@@ -204,15 +193,9 @@ class TransolverPPBase(nn.Module):
             nn.init.ones_(module.weight)
 
     def _select_geometry(self, geo, geo_log_density=None):
+        del geo_log_density
         if self.geometry_points <= 0 or self.geometry_points >= geo.shape[1]:
             return geo
-        if self.density_compensated:
-            if geo_log_density is None:
-                raise ValueError("Density-compensated Transolver++ requires geometry log density.")
-            sampled, _ = sample_tokens_density_compensated(
-                geo, self.geometry_points, geo_log_density
-            )
-            return sampled
         indices = torch.stack(
             [torch.randperm(geo.shape[1], device=geo.device)[: self.geometry_points] for _ in range(geo.shape[0])],
             dim=0,
@@ -266,4 +249,4 @@ class TransolverPPBase(nn.Module):
 
 class TransolverPP(TransolverPPBase):
     def __init__(self, **kwargs):
-        super().__init__(density_compensated=False, **kwargs)
+        super().__init__(**kwargs)

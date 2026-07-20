@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,15 +14,9 @@ except ImportError:  # pragma: no cover - optional acceleration backend
 
 from .smart.smart import (
     CrossAttention,
-    ModulatedPositionalEmbedding,
     PlainMLP,
     SimulationParamModulatedMLP,
 )
-from .smart.smart_sat import DensityCompensatedCrossAttention
-try:
-    from utils.geometry_density import estimate_log_sampling_density
-except ImportError:  # pragma: no cover - package-style imports
-    from smart.utils.geometry_density import estimate_log_sampling_density
 
 
 def gather_tokens(tokens, idx):
@@ -93,25 +85,6 @@ def sample_tokens_fps(tokens, num_samples, random_start=False):
     return gather_tokens(tokens, idx), idx
 
 
-def sample_tokens_density_compensated_fps(tokens, num_samples, log_density, candidate_multiplier=4):
-    n_points = int(tokens.shape[1])
-    if num_samples <= 0 or num_samples >= n_points:
-        idx = torch.arange(n_points, device=tokens.device, dtype=torch.long).unsqueeze(0).expand(tokens.shape[0], -1)
-        return tokens, idx
-
-    candidate_points, candidate_idx = sample_tokens_density_compensated(
-        tokens,
-        num_samples=min(n_points, max(num_samples, candidate_multiplier * num_samples)),
-        log_density=log_density,
-    )
-    rel_idx = torch.stack(
-        [_fps_indices_single(candidate_points[b], num_samples=num_samples, random_start=False) for b in range(candidate_points.shape[0])],
-        dim=0,
-    )
-    idx = torch.gather(candidate_idx, 1, rel_idx)
-    return gather_tokens(tokens, idx), idx
-
-
 def knn_group(points, centers, k):
     """Group k nearest points for each center.
 
@@ -157,32 +130,6 @@ def sample_tokens(tokens, num_samples):
     return gather_tokens(tokens, idx), idx
 
 
-def sample_tokens_density_compensated(tokens, num_samples, log_density):
-    n_points = int(tokens.shape[1])
-    batch_size = int(tokens.shape[0])
-    if num_samples <= 0 or num_samples >= n_points:
-        idx = torch.arange(n_points, device=tokens.device, dtype=torch.long).unsqueeze(0).expand(batch_size, -1)
-        return tokens, idx
-
-    weights = torch.exp(-log_density.float()).clamp(min=0.0)
-    weights_sum = weights.sum(dim=1, keepdim=True)
-    uniform = torch.full_like(weights, 1.0 / float(n_points))
-    probs = torch.where(weights_sum > 0.0, weights / torch.clamp(weights_sum, min=1e-12), uniform)
-    idx = torch.multinomial(probs, num_samples=num_samples, replacement=False)
-    return gather_tokens(tokens, idx), idx
-
-
-def resolve_geo_log_density(geo, geo_log_density, knn_k, neighbor_hops, estimator):
-    if geo_log_density is not None:
-        return geo_log_density.to(device=geo.device, dtype=geo.dtype)
-    return estimate_log_sampling_density(
-        geo,
-        knn_k=knn_k,
-        neighbor_hops=neighbor_hops,
-        estimator=estimator,
-    )
-
-
 def split_surface_volume_predictions(pred, surf_query_pos, surface_channels):
     pred_surf = pred[:, :surf_query_pos.shape[1], :surface_channels]
     pred_vol = pred[:, surf_query_pos.shape[1]:, surface_channels:]
@@ -226,23 +173,6 @@ class SelfAttentionBlock(nn.Module):
         x = x + self.dropout(self.attn(q=x, kv=x, q_pos=pos, kv_pos=pos))
         x = x + self.mlp(x, params)
         return x
-
-
-class GeometryCrossBlock(nn.Module):
-    def __init__(self, dim, num_heads=8, dropout=0.0, spatial_dim=3, cond_dim=0, density_compensated=False):
-        super().__init__()
-        attn_cls = DensityCompensatedCrossAttention if density_compensated else CrossAttention
-        self.cross = attn_cls(dim=dim, num_heads=num_heads, spatial_dim=spatial_dim) if density_compensated else attn_cls(dim=dim, num_heads=num_heads, dropout=dropout, spatial_dim=spatial_dim)
-        self.self_block = SelfAttentionBlock(dim=dim, num_heads=num_heads, dropout=dropout, spatial_dim=spatial_dim, cond_dim=cond_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.density_compensated = bool(density_compensated)
-
-    def forward(self, q, kv, params=None, q_pos=None, kv_pos=None, kv_log_density=None):
-        if self.density_compensated:
-            q = q + self.dropout(self.cross(q=q, kv=kv, q_pos=q_pos, kv_pos=kv_pos, kv_log_density=kv_log_density))
-        else:
-            q = q + self.dropout(self.cross(q=q, kv=kv, q_pos=q_pos, kv_pos=kv_pos))
-        return self.self_block(q, params=params, pos=q_pos)
 
 
 def gumbel_softmax(logits, tau):

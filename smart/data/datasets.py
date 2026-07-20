@@ -19,15 +19,7 @@ datasets = {"ShapeNetCar": {"dataset": ShapeNetCarDataset, "spatial_dim": 3, "su
 
 def _uses_drivaerml_geometry_density(model_name):
     model_name = str(model_name)
-    return (
-        model_name in {"SMART_SAT", "SMART_SATLOSS", "SMART_SATLOSS2", "SMART_SAT2", "SMART_SAT3", "SMART_SAT4"}
-        or model_name.startswith("SMART_SATLOSS")
-        or "_SATLOSS" in model_name
-        or model_name.endswith("_SAT")
-        or model_name.endswith("_SAT2")
-        or model_name.endswith("_SAT3")
-        or model_name.endswith("_SAT4")
-    )
+    return model_name.startswith("SMART_SATLOSS") or "_SATLOSS" in model_name
 
 
 def get_dataset(config):

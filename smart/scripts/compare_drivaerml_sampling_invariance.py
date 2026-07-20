@@ -52,21 +52,12 @@ if str(SMART_ROOT) not in sys.path:
     sys.path.insert(0, str(SMART_ROOT))
 
 from data.ahmedml_dataset_v2 import AhmedMLDatasetV2
-from models.abupt import ABUPT
-from models.abupt_sat import ABUPTSAT
-from models.pointnet import PointNet
 from models.smart.smart import SMART
-from models.smart.smart_sat import SMARTSAT
-from models.smart.smart_sat2 import SMARTSAT2
-from models.smart.smart_sat3 import SMARTSAT3
-from models.smart.smart_sat4 import SMARTSAT4
 from models.transolverpp import TransolverPP
-from models.transolverpp_sat import TransolverPPSAT
 from models.mspt import MSPT
 from models.pointnet2_ssg import PointNet2SSG
 from models.point_gnn import PointGNN
 from models.lno import LNO
-from models.randla_net import RandLANet
 from utils.geometry_density import estimate_log_sampling_density
 from utils.utils import get_model_checkpoint_name
 
@@ -102,7 +93,6 @@ MODEL_ORDER = [
     "SMART_DOWNSAMPLE",
     "SMART_GAUSSIAN_BALL_MASKED",
     "SMART_BOX_MASKED",
-    "SMART_SAT",
     "SMART_SATLOSS3",
     "SMART_SATLOSS4",
     "SMART_SATLOSS5",
@@ -113,21 +103,14 @@ MODEL_ORDER = [
     "SMART_SATLOSS6_CONFIG_FULL",
     "SMART_SATLOSS6_CONFIG_LAYER",
     "TRANSOLVERPP",
-    "TRANSOLVERPP_SAT",
     "TRANSOLVERPP_SATLOSS3",
     "TRANSOLVERPP_SATLOSS6",
-    "ABUPT",
-    "ABUPT_SATLOSS3",
-    "POINTNET",
-    "POINTNET_SATLOSS3",
     "POINTNET2_SSG",
     "POINTNET2_SSG_SATLOSS6",
     "POINT_GNN",
     "POINT_GNN_SATLOSS6",
     "LNO",
     "LNO_SATLOSS6",
-    "RANDLA_NET",
-    "RANDLA_NET_SATLOSS6",
     "MSPT",
     "MSPT_SATLOSS6",
 ]
@@ -136,7 +119,6 @@ MODEL_LABELS = {
     "SMART_DOWNSAMPLE": "SMART-DOWNSAMPLE",
     "SMART_GAUSSIAN_BALL_MASKED": "SMART-GAUSSIAN-BALL-MASKED",
     "SMART_BOX_MASKED": "SMART-BOX-MASKED",
-    "SMART_SAT": "SMART-SAT",
     "SMART_SATLOSS3": "SMART-SATLOSS3",
     "SMART_SATLOSS4": "SMART-SATLOSS4",
     "SMART_SATLOSS5": "SMART-SATLOSS5",
@@ -147,21 +129,14 @@ MODEL_LABELS = {
     "SMART_SATLOSS6_CONFIG_FULL": "SMART-SATLOSS6-ConFIG-FULL",
     "SMART_SATLOSS6_CONFIG_LAYER": "SMART-SATLOSS6-ConFIG-LAYER",
     "TRANSOLVERPP": "TransolverPP",
-    "TRANSOLVERPP_SAT": "TransolverPP-SAT",
     "TRANSOLVERPP_SATLOSS3": "TransolverPP-SATLOSS3",
     "TRANSOLVERPP_SATLOSS6": "TransolverPP-SATLOSS6",
-    "ABUPT": "ABUPT",
-    "ABUPT_SATLOSS3": "ABUPT-SATLOSS3",
-    "POINTNET": "PointNet",
-    "POINTNET_SATLOSS3": "PointNet-SATLOSS3",
     "POINTNET2_SSG": "PointNet++-SSG",
     "POINTNET2_SSG_SATLOSS6": "PointNet++-SSG-SATLOSS6",
     "POINT_GNN": "Point-GNN",
     "POINT_GNN_SATLOSS6": "Point-GNN-SATLOSS6",
     "LNO": "LNO",
     "LNO_SATLOSS6": "LNO-SATLOSS6",
-    "RANDLA_NET": "RandLA-Net",
-    "RANDLA_NET_SATLOSS6": "RandLA-Net-SATLOSS6",
     "MSPT": "MSPT",
     "MSPT_SATLOSS6": "MSPT-SATLOSS6",
 }
@@ -170,7 +145,6 @@ MODEL_COLORS = {
     "SMART_DOWNSAMPLE": "#B279A2",
     "SMART_GAUSSIAN_BALL_MASKED": "#8C6BB1",
     "SMART_BOX_MASKED": "#E377C2",
-    "SMART_SAT": "#4C78A8",
     "SMART_SATLOSS3": "#F58518",
     "SMART_SATLOSS4": "#72B7B2",
     "SMART_SATLOSS5": "#E45756",
@@ -181,21 +155,14 @@ MODEL_COLORS = {
     "SMART_SATLOSS6_CONFIG_FULL": "#9467BD",
     "SMART_SATLOSS6_CONFIG_LAYER": "#17BECF",
     "TRANSOLVERPP": "#6C6F7D",
-    "TRANSOLVERPP_SAT": "#54A24B",
     "TRANSOLVERPP_SATLOSS3": "#E45756",
     "TRANSOLVERPP_SATLOSS6": "#FF9896",
-    "ABUPT": "#6C6F7D",
-    "ABUPT_SATLOSS3": "#E45756",
-    "POINTNET": "#6C6F7D",
-    "POINTNET_SATLOSS3": "#4C78A8",
     "POINTNET2_SSG": "#17BECF",
     "POINTNET2_SSG_SATLOSS6": "#2CA02C",
     "POINT_GNN": "#8C564B",
     "POINT_GNN_SATLOSS6": "#E377C2",
     "LNO": "#E45756",
     "LNO_SATLOSS6": "#F58518",
-    "RANDLA_NET": "#7F7F7F",
-    "RANDLA_NET_SATLOSS6": "#9467BD",
     "MSPT": "#BCBD22",
     "MSPT_SATLOSS6": "#9467BD",
 }
@@ -206,15 +173,10 @@ LINE_MODEL_COLORS = {
     "SMART_DOWNSAMPLE": "#9467BD",
     "SMART_GAUSSIAN_BALL_MASKED": "#8C564B",
     "SMART_BOX_MASKED": "#E377C2",
-    "SMART_SAT": "#17BECF",
     "TRANSOLVERPP": "#FF7F0E",
-    "TRANSOLVERPP_SAT": "#2CA02C",
-    "ABUPT": "#D62728",
-    "POINTNET": "#9467BD",
     "POINTNET2_SSG": "#17BECF",
     "POINT_GNN": "#8C564B",
     "LNO": "#D62728",
-    "RANDLA_NET": "#8C564B",
     "MSPT": "#2CA02C",
 }
 # In the dedicated SMART/SATLOSS6 weighting comparison, each weighting method
@@ -261,7 +223,6 @@ FAMILY_GROUPS = OrderedDict(
                 "SMART_DOWNSAMPLE",
                 "SMART_GAUSSIAN_BALL_MASKED",
                 "SMART_BOX_MASKED",
-                "SMART_SAT",
                 "SMART_SATLOSS3",
                 "SMART_SATLOSS4",
                 "SMART_SATLOSS5",
@@ -282,26 +243,20 @@ FAMILY_GROUPS = OrderedDict(
                 "SMART_SATLOSS6_CONFIG_LAYER",
             ],
         ),
-        ("transolverpp_family", ["TRANSOLVERPP", "TRANSOLVERPP_SAT", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6"]),
-        ("abupt_family", ["ABUPT", "ABUPT_SATLOSS3"]),
-        ("pointnet_family", ["POINTNET", "POINTNET_SATLOSS3"]),
+        ("transolverpp_family", ["TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6"]),
         ("pointnet2_ssg_family", ["POINTNET2_SSG", "POINTNET2_SSG_SATLOSS6"]),
         ("point_gnn_family", ["POINT_GNN", "POINT_GNN_SATLOSS6"]),
         ("lno_family", ["LNO", "LNO_SATLOSS6"]),
-        ("randla_net_family", ["RANDLA_NET", "RANDLA_NET_SATLOSS6"]),
         ("mspt_family", ["MSPT", "MSPT_SATLOSS6"]),
     ]
 )
 FAMILY_TITLES = {
-    "smart_family": "SMART vs SMART-DOWNSAMPLE vs SMART-GAUSSIAN-BALL-MASKED vs SMART-BOX-MASKED vs SMART-SAT vs SMART-SATLOSS3 vs SMART-SATLOSS4 vs SMART-SATLOSS5 vs SMART-SATLOSS5-NOPM vs SMART-SATLOSS6 vs SATLOSS6 weighting variants",
+    "smart_family": "SMART vs SMART-DOWNSAMPLE vs SMART-GAUSSIAN-BALL-MASKED vs SMART-BOX-MASKED vs SMART-SATLOSS3 vs SMART-SATLOSS4 vs SMART-SATLOSS5 vs SMART-SATLOSS5-NOPM vs SMART-SATLOSS6 vs SATLOSS6 weighting variants",
     "smart_satloss6_weighting_family": "SMART-SATLOSS6-FIXEDSUM vs SMART-SATLOSS6-GRADNORM vs SMART-SATLOSS6-ConFIG-FULL vs SMART-SATLOSS6-ConFIG-LAYER",
-    "transolverpp_family": "TransolverPP vs TransolverPP-SAT vs TransolverPP-SATLOSS3 vs TransolverPP-SATLOSS6",
-    "abupt_family": "ABUPT vs ABUPT-SATLOSS3",
-    "pointnet_family": "PointNet vs PointNet-SATLOSS3",
+    "transolverpp_family": "TransolverPP vs TransolverPP-SATLOSS3 vs TransolverPP-SATLOSS6",
     "pointnet2_ssg_family": "PointNet++ SSG vs PointNet++ SSG-SATLOSS6",
     "point_gnn_family": "Point-GNN vs Point-GNN-SATLOSS6",
     "lno_family": "LNO vs LNO-SATLOSS6",
-    "randla_net_family": "RandLA-Net vs RandLA-Net-SATLOSS6",
     "mspt_family": "MSPT vs MSPT-SATLOSS6",
 }
 VTK_PRESSURE_MODELS = [
@@ -309,7 +264,6 @@ VTK_PRESSURE_MODELS = [
     "SMART_DOWNSAMPLE",
     "SMART_GAUSSIAN_BALL_MASKED",
     "SMART_BOX_MASKED",
-    "SMART_SAT",
     "SMART_SATLOSS3",
     "SMART_SATLOSS4",
     "SMART_SATLOSS5",
@@ -321,23 +275,19 @@ VTK_PRESSURE_MODELS = [
     "SMART_SATLOSS6_CONFIG_LAYER",
     "TRANSOLVERPP",
     "TRANSOLVERPP_SATLOSS3",
-    "POINTNET",
-    "POINTNET_SATLOSS3",
     "POINTNET2_SSG",
     "POINTNET2_SSG_SATLOSS6",
     "POINT_GNN",
     "POINT_GNN_SATLOSS6",
     "LNO",
     "LNO_SATLOSS6",
-    "RANDLA_NET",
-    "RANDLA_NET_SATLOSS6",
     "MSPT",
     "MSPT_SATLOSS6",
 ]
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Fair DrivAerML sampling-invariance comparison across SMART, TransolverPP, ABUPT, and PointNet families.")
+    p = argparse.ArgumentParser(description="Fair DrivAerML sampling-invariance comparison across the retained operator families.")
     p.add_argument("--smart-config", default="drivaerml")
     p.add_argument(
         "--smart-downsample-config",
@@ -352,7 +302,6 @@ def parse_args() -> argparse.Namespace:
         default="drivaerml_smart_gaussian_ball_masked",
     )
     p.add_argument("--smart-box-masked-config", default="drivaerml_smart_box_masked")
-    p.add_argument("--smart-sat-config", default="drivaerml_sat")
     p.add_argument("--smart-satloss3-config", default="drivaerml_satloss3")
     p.add_argument("--smart-satloss4-config", default="drivaerml_satloss4")
     p.add_argument("--smart-satloss5-config", default="drivaerml_satloss5")
@@ -363,21 +312,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smart-satloss6-config-full-config", default="drivaerml_satloss6_config_full")
     p.add_argument("--smart-satloss6-config-layer-config", default="drivaerml_satloss6_config")
     p.add_argument("--transolverpp-config", default="drivaerml_transolverpp")
-    p.add_argument("--transolverpp-sat-config", default="drivaerml_transolverpp_sat")
     p.add_argument("--transolverpp-satloss3-config", default="drivaerml_transolverpp_satloss3")
     p.add_argument("--transolverpp-satloss6-config", default="drivaerml_transolverpp_satloss6")
-    p.add_argument("--abupt-config", default="drivaerml_abupt")
-    p.add_argument("--abupt-satloss3-config", default="drivaerml_abupt_satloss3")
-    p.add_argument("--pointnet-config", default="drivaerml_pointnet")
-    p.add_argument("--pointnet-satloss3-config", default="drivaerml_pointnet_satloss3")
     p.add_argument("--pointnet2-ssg-config", default="drivaerml_pointnet2_ssg")
     p.add_argument("--pointnet2-ssg-satloss6-config", default="drivaerml_pointnet2_ssg_satloss6")
     p.add_argument("--point-gnn-config", default="drivaerml_point_gnn")
     p.add_argument("--point-gnn-satloss6-config", default="drivaerml_point_gnn_satloss6")
     p.add_argument("--lno-config", default="drivaerml_lno")
     p.add_argument("--lno-satloss6-config", default="drivaerml_lno_satloss6")
-    p.add_argument("--randla-net-config", default="drivaerml_randla_net")
-    p.add_argument("--randla-net-satloss6-config", default="drivaerml_randla_net_satloss6")
     p.add_argument("--mspt-config", default="drivaerml_mspt")
     p.add_argument("--mspt-satloss6-config", default="drivaerml_mspt_satloss6")
     p.add_argument("--smart-checkpoint", default=None)
@@ -394,7 +336,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
     )
     p.add_argument("--smart-box-masked-checkpoint", default=None)
-    p.add_argument("--smart-sat-checkpoint", default=None)
     p.add_argument("--smart-satloss3-checkpoint", default=None)
     p.add_argument("--smart-satloss4-checkpoint", default=None)
     p.add_argument("--smart-satloss5-checkpoint", default=None)
@@ -405,21 +346,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smart-satloss6-config-full-checkpoint", default=None)
     p.add_argument("--smart-satloss6-config-layer-checkpoint", default=None)
     p.add_argument("--transolverpp-checkpoint", default=None)
-    p.add_argument("--transolverpp-sat-checkpoint", default=None)
     p.add_argument("--transolverpp-satloss3-checkpoint", default=None)
     p.add_argument("--transolverpp-satloss6-checkpoint", default=None)
-    p.add_argument("--abupt-checkpoint", default=None)
-    p.add_argument("--abupt-satloss3-checkpoint", default=None)
-    p.add_argument("--pointnet-checkpoint", default=None)
-    p.add_argument("--pointnet-satloss3-checkpoint", default=None)
     p.add_argument("--pointnet2-ssg-checkpoint", default=None)
     p.add_argument("--pointnet2-ssg-satloss6-checkpoint", default=None)
     p.add_argument("--point-gnn-checkpoint", default=None)
     p.add_argument("--point-gnn-satloss6-checkpoint", default=None)
     p.add_argument("--lno-checkpoint", default=None)
     p.add_argument("--lno-satloss6-checkpoint", default=None)
-    p.add_argument("--randla-net-checkpoint", default=None)
-    p.add_argument("--randla-net-satloss6-checkpoint", default=None)
     p.add_argument("--mspt-checkpoint", default=None)
     p.add_argument("--mspt-satloss6-checkpoint", default=None)
     p.add_argument("--num-runs", type=int, default=8, help="Number of test runs to evaluate.")
@@ -464,8 +398,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--plot-workers", type=int, default=max(1, min(6, (os.cpu_count() or 1) // 2)), help="Worker count for CPU-side plot generation.")
     p.add_argument("--surface-query-points", type=int, default=0, help="Fixed surface query budget for all models. Use 0 to auto-pick the minimum training budget across compared models.")
     p.add_argument("--volume-query-points", type=int, default=0, help="Fixed volume query budget for all models. Use 0 to auto-pick the minimum training budget across compared models.")
-    p.add_argument("--abupt-surface-query-points", type=int, default=0, help="Optional ABUPT-family surface query override. Use 0 to follow --surface-query-points.")
-    p.add_argument("--abupt-volume-query-points", type=int, default=0, help="Optional ABUPT-family volume query override. Use 0 to follow --volume-query-points.")
     p.add_argument("--audi-surface-chunk-size", type=int, default=2048, help="Chunk size used only for the full Audi surface-pressure visualization export.")
     p.add_argument(
         "--test-smart-satloss5-nopm-beta-error-scale",
@@ -578,32 +510,26 @@ def choose_ckpt(config, explicit: str | None) -> str:
         "SMART_DOWNSAMPLE": "smart-downsample-",
         "SMART_GAUSSIAN_BALL_MASKED": "smart-gaussian-ball-masked-",
         "SMART_BOX_MASKED": "smart-box-masked-",
-        "SMART_SAT": "smart-sat-",
         "SMART_SATLOSS3": "smart-satloss3-",
         "SMART_SATLOSS4": "smart-satloss4-",
         "SMART_SATLOSS5": "smart-satloss5-",
         "SMART_SATLOSS5_NOPM": "smart-satloss5-nopm-",
-        "SMART_SATLOSS6": "smart-satloss6-",
+        # Keep the generic SATLOSS6 family separate from its weighting
+        # variants; all of them share the ``smart-satloss6-`` prefix.
+        "SMART_SATLOSS6": "smart-satloss6-smart-satloss6-",
         "SMART_SATLOSS6_FIXEDSUM": "smart-satloss6-fixedsum-",
         "SMART_SATLOSS6_GRADNORM": "smart-satloss6-gradnorm-",
         "SMART_SATLOSS6_CONFIG_FULL": "smart-satloss6-config-full-",
         "SMART_SATLOSS6_CONFIG_LAYER": "smart-satloss6-config-layer-",
         "TRANSOLVERPP": "transolverpp-",
-        "TRANSOLVERPP_SAT": "transolverpp-sat-",
         "TRANSOLVERPP_SATLOSS3": "transolverpp-satloss3-",
         "TRANSOLVERPP_SATLOSS6": "transolverpp-satloss6-",
-        "ABUPT": "abupt-",
-        "ABUPT_SATLOSS3": "abupt-satloss3-",
-        "POINTNET": "pointnet-",
-        "POINTNET_SATLOSS3": "pointnet-satloss3-",
         "POINTNET2_SSG": "pointnet2-ssg-",
         "POINTNET2_SSG_SATLOSS6": "pointnet2-ssg-satloss6-",
         "POINT_GNN": "point-gnn-",
         "POINT_GNN_SATLOSS6": "point-gnn-satloss6-",
         "LNO": "lno-",
         "LNO_SATLOSS6": "lno-satloss6-",
-        "RANDLA_NET": "randla-net-",
-        "RANDLA_NET_SATLOSS6": "randla-net-satloss6-",
         "MSPT": "mspt-",
         "MSPT_SATLOSS6": "mspt-satloss6-",
     }
@@ -663,32 +589,14 @@ def build_model(config, ckpt_path: str, device: torch.device, batched_query_subr
         "SMART_SATLOSS6_CONFIG_LAYER",
     }:
         model = SMART(**base_kwargs, **arch)
-    elif model_name == "SMART_SAT":
-        model = SMARTSAT(**base_kwargs, **arch)
-    elif model_name == "SMART_SAT2":
-        model = SMARTSAT2(**base_kwargs, **arch)
-    elif model_name == "SMART_SAT3":
-        model = SMARTSAT3(**base_kwargs, **arch)
-    elif model_name == "SMART_SAT4":
-        model = SMARTSAT4(**base_kwargs, **arch)
     elif model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6"}:
         model = TransolverPP(**base_kwargs, **arch)
-    elif model_name == "TRANSOLVERPP_SAT":
-        model = TransolverPPSAT(**base_kwargs, **arch)
-    elif model_name in {"ABUPT", "ABUPT_SATLOSS3"}:
-        model = ABUPT(**base_kwargs, **arch)
-    elif model_name == "ABUPT_SAT":
-        model = ABUPTSAT(**base_kwargs, **arch)
-    elif model_name in {"POINTNET", "POINTNET_SATLOSS3"}:
-        model = PointNet(**base_kwargs, **arch)
     elif model_name in {"POINTNET2_SSG", "POINTNET2_SSG_SATLOSS6"}:
         model = PointNet2SSG(**base_kwargs, **arch)
     elif model_name in {"POINT_GNN", "POINT_GNN_SATLOSS6"}:
         model = PointGNN(**base_kwargs, **arch)
     elif model_name in {"LNO", "LNO_SATLOSS6"}:
         model = LNO(**base_kwargs, **arch)
-    elif model_name in {"RANDLA_NET", "RANDLA_NET_SATLOSS6"}:
-        model = RandLANet(**base_kwargs, **arch)
     elif model_name in {"MSPT", "MSPT_SATLOSS6"}:
         model = MSPT(**base_kwargs, **arch)
     else:
@@ -1242,14 +1150,8 @@ def compute_surface_drag_force_x(surf_fields: np.ndarray, surface_areas: np.ndar
 
 
 def model_uses_density(model_name: str) -> bool:
-    return model_name in {
-        "SMART_SAT",
-        "SMART_SAT2",
-        "SMART_SAT3",
-        "SMART_SAT4",
-        "TRANSOLVERPP_SAT",
-        "ABUPT_SAT",
-    }
+    del model_name
+    return False
 
 
 @torch.inference_mode()
@@ -1315,51 +1217,13 @@ def predict_audi_surface_pressure(
     repeats: int,
     surface_chunk_size: int,
 ) -> np.ndarray:
+    del geo_log_density_view
     n_surface = int(surf_query_norm.shape[0])
     pred_surf = np.empty((n_surface,), dtype=np.float32)
-    abupt_audi_query_subsamples = 10
 
     geo_b = geo_view_norm.to(device, non_blocking=True)
     dummy_vol_b = dummy_vol_query_norm.to(device, non_blocking=True)
-    full_surf_b = surf_query_norm.unsqueeze(0).to(device, non_blocking=True)
-    geo_log_b = None if geo_log_density_view is None else geo_log_density_view.to(device, non_blocking=True)
     use_autocast = device.type == "cuda"
-
-    if model_name in {"ABUPT", "ABUPT_SATLOSS3"}:
-        surf_acc = np.zeros((n_surface,), dtype=np.float32)
-        original_subregion_size = int(getattr(model, "subregion_size", max(1, int(surface_chunk_size))))
-        model.subregion_size = max(1, int(surface_chunk_size))
-        try:
-            for rep in range(int(repeats)):
-                seed = int(base_seed + rep)
-                torch.manual_seed(seed)
-                if device.type == "cuda":
-                    torch.cuda.manual_seed_all(seed)
-                # For the Audi visualization only, predict on a random partition of
-                # the external surface cloud instead of one monolithic full-cloud
-                # forward. This keeps the export tractable and avoids axis-aligned
-                # chunk artifacts from sequential slicing.
-                rep_rng = np.random.default_rng(seed)
-                perm = rep_rng.permutation(n_surface)
-                query_subsets = [chunk for chunk in np.array_split(perm, abupt_audi_query_subsamples) if len(chunk) > 0]
-                rep_pred = np.empty((n_surface,), dtype=np.float32)
-                with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=False):
-                    for subset_idx in query_subsets:
-                        surf_subset_b = full_surf_b[:, torch.from_numpy(np.asarray(subset_idx, dtype=np.int64)).to(device=device, dtype=torch.long)]
-                        if model_uses_density(model_name):
-                            pred_s_norm, _ = model.inference(geo_b, surf_subset_b, dummy_vol_b, None, geo_log_density=geo_log_b)
-                        else:
-                            pred_s_norm, _ = model.inference(geo_b, surf_subset_b, dummy_vol_b, None)
-                        rep_pred[np.asarray(subset_idx, dtype=np.int64)] = (
-                            pred_s_norm[0, :, 0].detach().to(torch.float32).cpu().numpy() * float(std_s[0]) + float(mean_s[0])
-                        )
-                    if not np.isfinite(rep_pred).all():
-                        raise RuntimeError(f"{model_name} produced non-finite surface predictions during Audi VTK export.")
-                surf_acc += rep_pred
-        finally:
-            model.subregion_size = original_subregion_size
-        pred_surf[:] = surf_acc / float(repeats)
-        return pred_surf
 
     def _build_surface_decoder():
         if model_name in {
@@ -1385,36 +1249,6 @@ def predict_audi_surface_pressure(
 
             return decode_chunk
 
-        if model_name == "SMART_SAT":
-            intermediate_latent_geometries, latent_geo_pos, latent_geo_log_density = model.encode(
-                geo_b,
-                None,
-                geo_log_density=geo_log_b,
-                return_latent_density=True,
-            )
-
-            def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
-                pred_norm = model.decode(
-                    intermediate_latent_geometries,
-                    latent_geo_pos,
-                    None,
-                    chunk,
-                    latent_geo_log_density=latent_geo_log_density,
-                )
-                return pred_norm[:, :, 0]
-
-            return decode_chunk
-
-        if model_name in {"POINTNET", "POINTNET_SATLOSS3"}:
-            _, global_feat = model.encode_geometry(geo_b, params=None)
-
-            def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
-                query_features = model.decode_features(global_feat, chunk, chunk[:, :0], params=None)
-                pred = model.output_head(query_features)
-                return pred[:, :, 0]
-
-            return decode_chunk
-
         if model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6"}:
             def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
                 pred_surf, _ = model.inference(geo_b, chunk, dummy_vol_b, None)
@@ -1423,11 +1257,8 @@ def predict_audi_surface_pressure(
             return decode_chunk
 
         def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
-            vol_query = dummy_vol_b if model_name in {"ABUPT", "ABUPT_SATLOSS3"} else dummy_vol_b[:, :0]
-            if model_uses_density(model_name):
-                pred_s_norm, _ = model.inference(geo_b, chunk, vol_query, None, geo_log_density=geo_log_b)
-            else:
-                pred_s_norm, _ = model.inference(geo_b, chunk, vol_query, None)
+            vol_query = dummy_vol_b[:, :0]
+            pred_s_norm, _ = model.inference(geo_b, chunk, vol_query, None)
             if not torch.isfinite(pred_s_norm).all():
                 raise RuntimeError(f"{model_name} produced non-finite surface predictions during Audi VTK export.")
             return pred_s_norm[:, :, 0]
@@ -2432,7 +2263,6 @@ def main():
             ("SMART_DOWNSAMPLE", args.smart_downsample_config),
             ("SMART_GAUSSIAN_BALL_MASKED", args.smart_gaussian_ball_masked_config),
             ("SMART_BOX_MASKED", args.smart_box_masked_config),
-            ("SMART_SAT", args.smart_sat_config),
             ("SMART_SATLOSS3", args.smart_satloss3_config),
             ("SMART_SATLOSS4", args.smart_satloss4_config),
             ("SMART_SATLOSS5", args.smart_satloss5_config),
@@ -2443,21 +2273,14 @@ def main():
             ("SMART_SATLOSS6_CONFIG_FULL", args.smart_satloss6_config_full_config),
             ("SMART_SATLOSS6_CONFIG_LAYER", args.smart_satloss6_config_layer_config),
             ("TRANSOLVERPP", args.transolverpp_config),
-            ("TRANSOLVERPP_SAT", args.transolverpp_sat_config),
             ("TRANSOLVERPP_SATLOSS3", args.transolverpp_satloss3_config),
             ("TRANSOLVERPP_SATLOSS6", args.transolverpp_satloss6_config),
-            ("ABUPT", args.abupt_config),
-            ("ABUPT_SATLOSS3", args.abupt_satloss3_config),
-            ("POINTNET", args.pointnet_config),
-            ("POINTNET_SATLOSS3", args.pointnet_satloss3_config),
             ("POINTNET2_SSG", args.pointnet2_ssg_config),
             ("POINTNET2_SSG_SATLOSS6", args.pointnet2_ssg_satloss6_config),
             ("POINT_GNN", args.point_gnn_config),
             ("POINT_GNN_SATLOSS6", args.point_gnn_satloss6_config),
             ("LNO", args.lno_config),
             ("LNO_SATLOSS6", args.lno_satloss6_config),
-            ("RANDLA_NET", args.randla_net_config),
-            ("RANDLA_NET_SATLOSS6", args.randla_net_satloss6_config),
             ("MSPT", args.mspt_config),
             ("MSPT_SATLOSS6", args.mspt_satloss6_config),
         ]
@@ -2504,7 +2327,6 @@ def main():
         "SMART_DOWNSAMPLE": args.smart_downsample_checkpoint,
         "SMART_GAUSSIAN_BALL_MASKED": args.smart_gaussian_ball_masked_checkpoint,
         "SMART_BOX_MASKED": args.smart_box_masked_checkpoint,
-        "SMART_SAT": args.smart_sat_checkpoint,
         "SMART_SATLOSS3": args.smart_satloss3_checkpoint,
         "SMART_SATLOSS4": args.smart_satloss4_checkpoint,
         "SMART_SATLOSS5": args.smart_satloss5_checkpoint,
@@ -2515,21 +2337,14 @@ def main():
         "SMART_SATLOSS6_CONFIG_FULL": args.smart_satloss6_config_full_checkpoint,
         "SMART_SATLOSS6_CONFIG_LAYER": args.smart_satloss6_config_layer_checkpoint,
         "TRANSOLVERPP": args.transolverpp_checkpoint,
-        "TRANSOLVERPP_SAT": args.transolverpp_sat_checkpoint,
         "TRANSOLVERPP_SATLOSS3": args.transolverpp_satloss3_checkpoint,
         "TRANSOLVERPP_SATLOSS6": args.transolverpp_satloss6_checkpoint,
-        "ABUPT": args.abupt_checkpoint,
-        "ABUPT_SATLOSS3": args.abupt_satloss3_checkpoint,
-        "POINTNET": args.pointnet_checkpoint,
-        "POINTNET_SATLOSS3": args.pointnet_satloss3_checkpoint,
         "POINTNET2_SSG": args.pointnet2_ssg_checkpoint,
         "POINTNET2_SSG_SATLOSS6": args.pointnet2_ssg_satloss6_checkpoint,
         "POINT_GNN": args.point_gnn_checkpoint,
         "POINT_GNN_SATLOSS6": args.point_gnn_satloss6_checkpoint,
         "LNO": args.lno_checkpoint,
         "LNO_SATLOSS6": args.lno_satloss6_checkpoint,
-        "RANDLA_NET": args.randla_net_checkpoint,
-        "RANDLA_NET_SATLOSS6": args.randla_net_satloss6_checkpoint,
         "MSPT": args.mspt_checkpoint,
         "MSPT_SATLOSS6": args.mspt_satloss6_checkpoint,
     }
@@ -2576,7 +2391,7 @@ def main():
         print(f"Using per-model train-aligned encoder input budgets: {budget_text}")
     dataset_geometry_points = max(unique_input_budgets)
 
-    density_cfg = configs["SMART_SAT"] if "SMART_SAT" in configs else next(iter(configs.values()))
+    density_cfg = smart_cfg
     _, default_density_knn_k, density_neighbor_hops, density_cache_dtype = resolve_density_spec(density_cfg)
     density_knn_k = int(args.density_knn_k) if args.density_knn_k is not None else int(default_density_knn_k)
     density_estimator = str(args.density_estimator)
@@ -2668,11 +2483,6 @@ def main():
     for model_name in model_specs:
         model_surface_query_points = surface_query_points
         model_volume_query_points = volume_query_points
-        if model_name in {"ABUPT", "ABUPT_SATLOSS3"}:
-            if int(args.abupt_surface_query_points) > 0:
-                model_surface_query_points = int(args.abupt_surface_query_points)
-            if int(args.abupt_volume_query_points) > 0:
-                model_volume_query_points = int(args.abupt_volume_query_points)
         per_model_query_budgets[model_name] = {
             "surface": model_surface_query_points,
             "volume": model_volume_query_points,
@@ -4049,7 +3859,6 @@ def main():
         f"- Shift betas: `{shift_betas}`",
         f"- OOD sampling modes: progressive uniform-to-sinusoidal mixtures along `y` only, with severities `{sine_mix_levels}`",
         f"- Fixed benchmark query subsets per run: `{surface_query_points}` surface + `{volume_query_points}` volume",
-        f"- ABUPT-family query override: `{int(args.abupt_surface_query_points) if int(args.abupt_surface_query_points) > 0 else surface_query_points}` surface + `{int(args.abupt_volume_query_points) if int(args.abupt_volume_query_points) > 0 else volume_query_points}` volume",
         "- SMART-family drag plots are sorted by full-surface ground-truth drag instead of severity to reduce visual noise.",
         f"- Representative VTK surface query source: `{vtk_surface_query_dir}`",
         "",

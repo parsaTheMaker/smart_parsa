@@ -3467,10 +3467,13 @@ def main():
     sampling_full_geo_log_density_np = sampling_full_geo_log_density.to(dtype=torch.float32).numpy()
     sampling_sine_y_weights = sinusoidal_axis_probabilities(sampling_input_surf_coords, axis=1)
 
+    gt_pressure = np.asarray(rep_surf_gt_full[:, 0], dtype=np.float32)
     surface_point_data: Dict[str, np.ndarray] = {
-        "gt_pressure": rep_surf_gt_full[:, 0],
+        "gt_pressure": gt_pressure,
     }
-    representative_models = OrderedDict((m, models[m]) for m in VTK_PRESSURE_MODELS if m in models)
+    # Export every checkpoint requested for this comparison.  The old allowlist
+    # could silently omit newly added model variants from the Audi VTK.
+    representative_models = OrderedDict((m, models[m]) for m in model_specs)
     audi_vtk_skipped_models: List[str] = []
     n_surface_points = int(rep_surf_gt_full.shape[0])
     for model_name, model in tqdm(representative_models.items(), desc="Representative full-surface predictions", dynamic_ncols=True):
@@ -3510,11 +3513,22 @@ def main():
                 repeats=args.model_repeats,
                 surface_chunk_size=int(args.audi_surface_chunk_size),
             )
+            signed_error = np.asarray(pred_pressure, dtype=np.float32) - gt_pressure
+            absolute_error = np.abs(signed_error)
+            relative_absolute_error = absolute_error / np.maximum(np.abs(gt_pressure), 1.0e-8)
             surface_point_data[f"{prefix}_pressure_pred"] = pred_pressure
+            surface_point_data[f"{prefix}_pressure_error"] = signed_error
+            surface_point_data[f"{prefix}_pressure_abs_error"] = absolute_error
+            surface_point_data[f"{prefix}_pressure_relative_abs_error"] = relative_absolute_error
         except Exception as exc:
             audi_vtk_skipped_models.append(model_name)
             print(f"[warning] Skipping Audi VTK export for {model_name}: {exc}")
             surface_point_data[f"{prefix}_pressure_pred"] = np.full((n_surface_points,), np.nan, dtype=np.float32)
+            surface_point_data[f"{prefix}_pressure_error"] = np.full((n_surface_points,), np.nan, dtype=np.float32)
+            surface_point_data[f"{prefix}_pressure_abs_error"] = np.full((n_surface_points,), np.nan, dtype=np.float32)
+            surface_point_data[f"{prefix}_pressure_relative_abs_error"] = np.full(
+                (n_surface_points,), np.nan, dtype=np.float32
+            )
         if device.type == "cuda":
             torch.cuda.empty_cache()
         models[model_name] = model
@@ -3798,7 +3812,7 @@ def main():
         "## Representative VTK Export",
         "- The Audi pressure-field VTK uses the full Audi surface point cloud for the surface query cloud.",
         "- The Audi VTK export is visualization-only and does not affect the benchmark statistics.",
-        "- The representative prediction VTK stores only ground-truth pressure and model pressure predictions.",
+        "- The representative prediction VTK stores ground-truth pressure, every active model's pressure prediction, signed pressure error, absolute pressure error, and pointwise relative absolute pressure error.",
         "- If a model cannot execute a true empty-volume surface-only export path, the script falls back to one fixed representative volume query point from the selected DrivAerML run. This affects only the Audi visualization export, not the benchmark metrics.",
         "- If a model still cannot complete the full-Audi visualization export safely, it is skipped only for this VTK step and recorded in the results payload.",
         f"- Surface-query directory for the Audi pressure-field export: `{vtk_surface_query_dir}`",
@@ -3836,7 +3850,7 @@ def main():
         "- `*_ratio_heatmap.png`: model-by-sampling-mode ratios relative to aligned sampling.",
         "- `*_distribution_boxplot.png`: per-run error distributions at the strongest shift.",
         "- `*_delta_vs_beta.png`: degradation relative to aligned sampling across beta severity.",
-        "- `audi_surface_pressure_predictions.vtk`: full Audi surface pressure ground truth plus selected model pressure predictions.",
+        "- `audi_surface_pressure_predictions.vtk`: full Audi surface pressure ground truth plus every active model's pressure prediction and per-point error fields.",
         "- `results.json`: machine-readable summary including any representative-VTK model skips.",
         "- `smart_family_surface_drag_force_x_ranked_beta_*.png`: full-surface drag curves for SMART, SMART-SATLOSS3, and SMART-SATLOSS5, sorted by ground-truth drag within each beta mode.",
         "- `smart_family_surface_drag_force_x_ranked_sine_*.png`: full-surface drag curves for SMART, SMART-SATLOSS3, and SMART-SATLOSS5, sorted by ground-truth drag within each sine-y mode.",

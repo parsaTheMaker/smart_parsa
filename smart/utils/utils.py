@@ -13,6 +13,33 @@ import re
 import hashlib
 
 
+def make_grad_scaler(config):
+    """Build an AMP scaler with optional model-specific stability settings."""
+    return torch.amp.GradScaler(
+        "cuda",
+        init_scale=float(getattr(config, "amp_scaler_init_scale", 65536.0)),
+        growth_factor=float(getattr(config, "amp_scaler_growth_factor", 2.0)),
+        backoff_factor=float(getattr(config, "amp_scaler_backoff_factor", 0.5)),
+        growth_interval=int(getattr(config, "amp_scaler_growth_interval", 2000)),
+    )
+
+
+def reset_scheduler_for_extension(scheduler, optimizer, total_steps):
+    """Start a fresh cosine schedule for a post-checkpoint training extension."""
+    if not isinstance(scheduler, torch.optim.lr_scheduler.CosineAnnealingLR):
+        raise ValueError("scheduler_reset_on_resume currently supports only the cosine scheduler.")
+    total_steps = max(1, int(total_steps))
+    base_lrs = list(scheduler.base_lrs)
+    if len(base_lrs) != len(optimizer.param_groups):
+        raise ValueError("Scheduler and optimizer parameter-group counts do not match.")
+    for group, base_lr in zip(optimizer.param_groups, base_lrs):
+        group["lr"] = base_lr
+    scheduler.T_max = total_steps
+    scheduler.last_epoch = -1
+    scheduler._step_count = 0
+    scheduler._last_lr = list(base_lrs)
+
+
 def _slugify(text):
     text = str(text).strip().lower()
     text = re.sub(r"[^a-z0-9]+", "-", text)

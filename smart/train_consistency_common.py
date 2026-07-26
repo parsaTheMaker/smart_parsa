@@ -25,7 +25,9 @@ from utils.utils import (
     get_optimizer_scheduler_loss,
     initialize_gpu,
     initialize_wandb,
+    make_grad_scaler,
     print_point_budget,
+    reset_scheduler_for_extension,
 )
 
 CANON_SURF_FIELDS = ["pressure", "normal_x", "normal_y"]
@@ -50,6 +52,52 @@ def is_main_process():
 
 def unwrap_model(model):
     return model.module if isinstance(model, (DDP, DataParallel)) else model
+
+
+def gradient_diagnostics(model):
+    """Return finite gradient and parameter norms for training observability."""
+    grad_sq = None
+    param_sq = None
+    max_grad = None
+    finite = True
+    for parameter in model.parameters():
+        if not parameter.requires_grad:
+            continue
+        parameter_sq = parameter.detach().float().pow(2).sum()
+        param_sq = parameter_sq if param_sq is None else param_sq + parameter_sq
+        if parameter.grad is None:
+            continue
+        gradient = parameter.grad.detach().float()
+        if not torch.isfinite(gradient).all():
+            finite = False
+        gradient_sq = gradient.pow(2).sum()
+        grad_sq = gradient_sq if grad_sq is None else grad_sq + gradient_sq
+        gradient_max = gradient.abs().max()
+        max_grad = gradient_max if max_grad is None else torch.maximum(max_grad, gradient_max)
+    reference = next(model.parameters()).detach()
+    zero = reference.new_zeros((), dtype=torch.float32)
+    return {
+        "grad_norm": torch.sqrt(grad_sq.clamp_min(0.0)) if grad_sq is not None else zero,
+        "parameter_norm": torch.sqrt(param_sq.clamp_min(0.0)) if param_sq is not None else zero,
+        "max_grad": max_grad if max_grad is not None else zero,
+        "finite": finite,
+    }
+
+
+def snapshot_model_buffers(model):
+    return {name: buffer.detach().clone() for name, buffer in unwrap_model(model).named_buffers()}
+
+
+def restore_model_buffers(model, snapshot):
+    if snapshot is None:
+        return
+    for name, value in unwrap_model(model).named_buffers():
+        if name in snapshot:
+            value.copy_(snapshot[name])
+
+
+def model_buffers_are_finite(model):
+    return all(bool(torch.isfinite(buffer).all().item()) for buffer in unwrap_model(model).buffers())
 
 
 def _last_linear_params(module):
@@ -590,6 +638,9 @@ def load_full_training_state(
     load_scaler=True,
     uncertainty_balancer=None,
     external_gradnorm=None,
+    reset_scheduler=False,
+    steps_per_epoch=None,
+    target_epochs=None,
 ):
     if not checkpoint_path:
         raise ValueError("checkpoint_path must be provided for full-state resume.")
@@ -635,6 +686,13 @@ def load_full_training_state(
 
     resumed_epoch = int(checkpoint.get("epoch", -1))
     start_epoch = resumed_epoch + 1
+    if reset_scheduler:
+        if steps_per_epoch is None or target_epochs is None:
+            raise ValueError("steps_per_epoch and target_epochs are required to reset a resumed scheduler.")
+        extension_epochs = max(int(target_epochs) - start_epoch, 1)
+        reset_scheduler_for_extension(scheduler, optimizer, extension_epochs * int(steps_per_epoch))
+        if is_main_process():
+            print(f"[resume] Reset cosine scheduler for {extension_epochs} extension epochs.")
     global_step = int(checkpoint.get("global_step", 0))
     best_robust_rel_l2 = float(checkpoint.get("best_robust_rel_l2", np.inf))
     print(
@@ -1332,6 +1390,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
     device = initialize_gpu(config.random_seed, high_precision=False)
 
     gradient_norm = config.gradient_norm
+    track_gradient_diagnostics = bool(getattr(config, "track_gradient_diagnostics", False))
     precisions = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
     dtype = precisions.get(config.precision, torch.float16)
     amp = config.amp
@@ -1422,6 +1481,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
     if is_main_process():
         print(f"Model kwargs: {merged_kwargs}")
     model = model_ctor(**merged_kwargs).to(device)
+    rollback_buffers = bool(getattr(model, "rollback_buffers_on_nonfinite", False))
 
     if is_main_process():
         print(f"Total parameters: {count_model_params(model)}")
@@ -1447,7 +1507,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             "task_weighting_method=gradnorm_external, task_weighting_method=fixed_sum, "
             "or use_learned_task_weighting."
         )
-    scaler = torch.amp.GradScaler("cuda")
+    scaler = make_grad_scaler(config)
     uncertainty_balancer = None
     config_reference_parameter = None
     config_full_parameters = None
@@ -1584,9 +1644,12 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             scaler,
             resume_ckpt,
             device,
-            load_scaler=bool(amp),
+            load_scaler=bool(amp) and not bool(getattr(config, "amp_scaler_reset_on_resume", False)),
             uncertainty_balancer=uncertainty_balancer,
             external_gradnorm=external_gradnorm,
+            reset_scheduler=bool(getattr(config, "scheduler_reset_on_resume", False)),
+            steps_per_epoch=len(train_loader),
+            target_epochs=int(config.epochs),
         )
     elif resume_ckpt:
         if is_main_process():
@@ -1658,6 +1721,10 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
         "config_full_direction_norm",
         "config_full_min_cosine",
         "config_full_fallback",
+        "gradient_norm_raw",
+        "parameter_norm",
+        "gradient_max_abs",
+        "gradient_nonfinite",
     ]
 
     fuse_consistency_views = bool(getattr(config, "fuse_consistency_views", False))
@@ -1789,6 +1856,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                 vol_data = vol_data.to(device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
+                buffer_snapshot = snapshot_model_buffers(model) if rollback_buffers else None
 
                 primary_view_geo = primary_view_geo.to(device, non_blocking=True)
                 if model_requires_density:
@@ -1996,6 +2064,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     )
 
                 if not torch.isfinite(weighted_total_loss):
+                    restore_model_buffers(model, buffer_snapshot)
                     raise FloatingPointError(
                         f"Non-finite consistency loss detected at epoch={ep} batch={batch_idx}: "
                         f"supervised_primary={float(supervised_primary.detach().item()):.6g}, "
@@ -2039,6 +2108,17 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                         config_reference_parameter.grad = config_direction.clone()
                     else:
                         config_reference_parameter.grad.copy_(config_direction)
+                gradient_stats = gradient_diagnostics(train_model) if track_gradient_diagnostics else None
+                if gradient_stats is not None and not gradient_stats["finite"]:
+                    print(
+                        f"[warn] Non-finite gradients at epoch={ep} batch={batch_idx}; "
+                        "skipping optimizer step and reducing AMP scale."
+                    )
+                    restore_model_buffers(model, buffer_snapshot)
+                    optimizer.zero_grad(set_to_none=True)
+                    if amp:
+                        scaler.update(new_scale=max(1.0, 0.5 * scaler.get_scale()))
+                    continue
                 if gradient_norm is not None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
                 if amp:
@@ -2049,6 +2129,11 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                         scaler.update()
                 else:
                     optimizer.step()
+                if rollback_buffers and not model_buffers_are_finite(model):
+                    restore_model_buffers(model, buffer_snapshot)
+                    raise FloatingPointError(
+                        f"Non-finite PTv3 state after optimizer step at epoch={ep} batch={batch_idx}."
+                    )
                 scheduler.step()
 
                 total_loss = weighted_total_loss.detach()
@@ -2081,6 +2166,11 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     train_losses["loss_supervised_worst"] += supervised_worst.detach().float() * batch_size_float
                     train_losses["loss_supervised_worst_soft"] += supervised_worst_soft.detach().float() * batch_size_float
                     train_losses["loss_prediction_consistency"] += pred_consistency.detach().float() * batch_size_float
+                    if gradient_stats is not None:
+                        train_losses["gradient_norm_raw"] += gradient_stats["grad_norm"] * batch_size_float
+                        train_losses["parameter_norm"] += gradient_stats["parameter_norm"] * batch_size_float
+                        train_losses["gradient_max_abs"] += gradient_stats["max_grad"] * batch_size_float
+                        train_losses["gradient_nonfinite"] += float(not gradient_stats["finite"]) * batch_size_float
                     train_losses["primary_inverse_density_fraction"] += torch.tensor(
                         primary_inverse_density_fraction, device=device, dtype=torch.float32
                     ) * batch_size_float
@@ -2168,11 +2258,22 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             "train/batch_secondary_inverse_density_fraction": log_scalars[11],
                             "train/batch_secondary_inverse_density_beta": log_scalars[12],
                             "train/prediction_consistency_weight": pred_consistency_weight,
+                            "train/batch_amp_scale": float(scaler.get_scale()) if amp else 1.0,
                             "lr": scheduler.get_last_lr()[0],
                             "epoch": ep,
                         },
                         step=global_step,
                     )
+                    if gradient_stats is not None:
+                        wandb.log(
+                            {
+                                "train/batch_gradient_norm_raw": float(gradient_stats["grad_norm"].item()),
+                                "train/batch_parameter_norm": float(gradient_stats["parameter_norm"].item()),
+                                "train/batch_gradient_max_abs": float(gradient_stats["max_grad"].item()),
+                                "train/batch_gradient_nonfinite": float(not gradient_stats["finite"]),
+                            },
+                            step=global_step,
+                        )
                     if uncertainty_info is not None:
                         uncertainty_values = [
                             float(current_task_weights[0].item()),

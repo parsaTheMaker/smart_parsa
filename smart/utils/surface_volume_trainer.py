@@ -19,7 +19,9 @@ from utils.utils import (
     get_optimizer_scheduler_loss,
     initialize_gpu,
     initialize_wandb,
+    make_grad_scaler,
     print_point_budget,
+    reset_scheduler_for_extension,
 )
 
 CANON_SURF_FIELDS = ["pressure", "normal_x", "normal_y"]
@@ -39,6 +41,51 @@ def accumulate_channel_metrics(metrics, prefix, pred, gt, field_names, rel_l2_lo
     for channel_idx, field_name in enumerate(field_names):
         channel_loss = rel_l2_loss_fn(pred[..., channel_idx:channel_idx + 1], gt[..., channel_idx:channel_idx + 1])
         metrics[f"{prefix}_{field_name}"] += channel_loss.item() * batch_size
+
+
+def gradient_diagnostics(model):
+    grad_sq = None
+    param_sq = None
+    max_grad = None
+    finite = True
+    for parameter in model.parameters():
+        if not parameter.requires_grad:
+            continue
+        parameter_sq = parameter.detach().float().pow(2).sum()
+        param_sq = parameter_sq if param_sq is None else param_sq + parameter_sq
+        if parameter.grad is None:
+            continue
+        gradient = parameter.grad.detach().float()
+        if not torch.isfinite(gradient).all():
+            finite = False
+        gradient_sq = gradient.pow(2).sum()
+        grad_sq = gradient_sq if grad_sq is None else grad_sq + gradient_sq
+        gradient_max = gradient.abs().max()
+        max_grad = gradient_max if max_grad is None else torch.maximum(max_grad, gradient_max)
+    reference = next(model.parameters()).detach()
+    zero = reference.new_zeros((), dtype=torch.float32)
+    return {
+        "grad_norm": torch.sqrt(grad_sq.clamp_min(0.0)) if grad_sq is not None else zero,
+        "parameter_norm": torch.sqrt(param_sq.clamp_min(0.0)) if param_sq is not None else zero,
+        "max_grad": max_grad if max_grad is not None else zero,
+        "finite": finite,
+    }
+
+
+def snapshot_model_buffers(model):
+    return {name: buffer.detach().clone() for name, buffer in model.named_buffers()}
+
+
+def restore_model_buffers(model, snapshot):
+    if snapshot is None:
+        return
+    for name, value in model.named_buffers():
+        if name in snapshot:
+            value.copy_(snapshot[name])
+
+
+def model_buffers_are_finite(model):
+    return all(bool(torch.isfinite(buffer).all().item()) for buffer in model.buffers())
 
 
 def add_canonical_field_metrics(wandb_dict, split, surface_fields, volume_fields, metric_values=None):
@@ -89,7 +136,18 @@ def load_partial_state_dict(model, checkpoint_path, device):
     return matched, skipped
 
 
-def load_full_training_state(model, optimizer, scheduler, scaler, checkpoint_path, device, steps_per_epoch=None):
+def load_full_training_state(
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    checkpoint_path,
+    device,
+    steps_per_epoch=None,
+    load_scaler=True,
+    reset_scheduler=False,
+    target_epochs=None,
+):
     """Restore a vanilla trainer checkpoint without replaying completed epochs."""
     if not checkpoint_path:
         raise ValueError("checkpoint_path must be provided for full-state resume.")
@@ -116,11 +174,17 @@ def load_full_training_state(model, optimizer, scheduler, scaler, checkpoint_pat
     scheduler.load_state_dict(scheduler_state)
 
     scaler_state = checkpoint.get("scaler_state_dict")
-    if scaler_state is not None:
+    if load_scaler and scaler_state is not None:
         scaler.load_state_dict(scaler_state)
 
     resumed_epoch = int(checkpoint.get("epoch", -1))
     start_epoch = resumed_epoch + 1
+    if reset_scheduler:
+        if steps_per_epoch is None or target_epochs is None:
+            raise ValueError("steps_per_epoch and target_epochs are required to reset a resumed scheduler.")
+        extension_epochs = max(int(target_epochs) - start_epoch, 1)
+        reset_scheduler_for_extension(scheduler, optimizer, extension_epochs * int(steps_per_epoch))
+        print(f"[resume] Reset cosine scheduler for {extension_epochs} extension epochs.")
     global_step = checkpoint.get("global_step")
     if global_step is None:
         global_step = (resumed_epoch + 1) * int(steps_per_epoch or 0)
@@ -226,6 +290,7 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
     device = initialize_gpu(config.random_seed, high_precision=False)
 
     gradient_norm = config.gradient_norm
+    track_gradient_diagnostics = bool(getattr(config, "track_gradient_diagnostics", False))
     precisions = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
     dtype = precisions.get(config.precision, torch.float16)
     amp = config.amp
@@ -287,18 +352,17 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
     merged_kwargs = {**model_kwargs, **config.architecture} if "architecture" in config else model_kwargs
     print(f"Model kwargs: {merged_kwargs}")
     model = model_cls(**merged_kwargs).to(device)
+    rollback_buffers = bool(getattr(model, "rollback_buffers_on_nonfinite", False))
 
     resume_ckpt = str(getattr(config, "resume_ckpt", "")).strip()
     init_ckpt = str(getattr(config, "init_ckpt", "")).strip()
     resume_full_state = bool(getattr(config, "resume_full_state", False))
     if resume_full_state and not resume_ckpt:
         raise ValueError("resume_full_state=True requires experiment.resume_ckpt to be set.")
-    if resume_full_state:
-        pass
-    elif resume_ckpt:
+    if not resume_full_state and resume_ckpt:
         print(f"[init] Loading model weights from experiment.resume_ckpt={resume_ckpt}")
         load_partial_state_dict(model, resume_ckpt, device)
-    elif init_ckpt:
+    elif not resume_full_state and init_ckpt:
         print(f"[init] Loading model weights from experiment.init_ckpt={init_ckpt}")
         load_partial_state_dict(model, init_ckpt, device)
 
@@ -308,7 +372,7 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
     if bool(getattr(config, "wandb_watch_model", False)):
         run.watch(model, log="all")
 
-    scaler = torch.amp.GradScaler("cuda")
+    scaler = make_grad_scaler(config)
     optimizer, scheduler, loss_fn, rel_l2_loss_fn = get_optimizer_scheduler_loss(model, config, train_loader, loss_dim=1)
     combined_loss_fn = CombinedLoss(loss_fn, fields) if use_surface_supervision else None
 
@@ -324,6 +388,9 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
             resume_ckpt,
             device,
             steps_per_epoch=len(train_loader),
+            load_scaler=not bool(getattr(config, "amp_scaler_reset_on_resume", False)),
+            reset_scheduler=bool(getattr(config, "scheduler_reset_on_resume", False)),
+            target_epochs=int(config.epochs),
         )
     log_every_n_steps = getattr(config, "log_every_n_steps", 10)
 
@@ -336,6 +403,9 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
             if hasattr(test_data, "set_epoch"):
                 test_data.set_epoch(0)
             train_losses = init_metric_dict(fields["surface"], fields["volume"])
+            if track_gradient_diagnostics:
+                for key in ("gradient_norm_raw", "parameter_norm", "gradient_max_abs", "gradient_nonfinite"):
+                    train_losses[key] = 0.0
             test_losses = init_metric_dict(fields["surface"], fields["volume"])
 
             model.train()
@@ -357,6 +427,7 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                     vol_data = torch.cat([vol_data[..., :1], vol_data[..., 2:4]], dim=-1)
 
                 optimizer.zero_grad(set_to_none=True)
+                buffer_snapshot = snapshot_model_buffers(model) if rollback_buffers else None
                 if amp:
                     with torch.autocast(device_type=str(device).split(":")[0], dtype=dtype, enabled=True):
                         if accepts_geo_log_density:
@@ -373,15 +444,34 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                         )
                     if not torch.isfinite(loss):
                         print(f"[warn] Non-finite training loss at epoch {ep} batch {batch_idx}; skipping optimizer step.")
+                        restore_model_buffers(model, buffer_snapshot)
                         optimizer.zero_grad(set_to_none=True)
+                        if rollback_buffers:
+                            scaler.update(new_scale=max(1.0, 0.5 * scaler.get_scale()))
                         continue
                     prev_scale = scaler.get_scale()
                     scaler.scale(loss).backward()
-                    if gradient_norm is not None:
+                    if gradient_norm is not None or track_gradient_diagnostics:
                         scaler.unscale_(optimizer)
+                    gradient_stats = gradient_diagnostics(model) if track_gradient_diagnostics else None
+                    if gradient_stats is not None and not gradient_stats["finite"]:
+                        print(
+                            f"[warn] Non-finite gradients at epoch {ep} batch {batch_idx}; "
+                            "skipping optimizer step and reducing AMP scale."
+                        )
+                        restore_model_buffers(model, buffer_snapshot)
+                        optimizer.zero_grad(set_to_none=True)
+                        scaler.update(new_scale=max(1.0, 0.5 * scaler.get_scale()))
+                        continue
+                    if gradient_norm is not None:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
                     scaler.step(optimizer)
                     scaler.update()
+                    if rollback_buffers and not model_buffers_are_finite(model):
+                        restore_model_buffers(model, buffer_snapshot)
+                        raise FloatingPointError(
+                            f"Non-finite PTv3 state after optimizer step at epoch={ep} batch={batch_idx}."
+                        )
                     if scaler.get_scale() >= prev_scale:
                         scheduler.step()
                 else:
@@ -396,16 +486,36 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                     )
                     if not torch.isfinite(loss):
                         print(f"[warn] Non-finite training loss at epoch {ep} batch {batch_idx}; skipping optimizer step.")
+                        restore_model_buffers(model, buffer_snapshot)
                         optimizer.zero_grad(set_to_none=True)
                         continue
                     loss.backward()
+                    gradient_stats = gradient_diagnostics(model) if track_gradient_diagnostics else None
+                    if gradient_stats is not None and not gradient_stats["finite"]:
+                        print(f"[warn] Non-finite gradients at epoch {ep} batch {batch_idx}; skipping optimizer step.")
+                        restore_model_buffers(model, buffer_snapshot)
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
                     if gradient_norm is not None:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_norm)
                     optimizer.step()
+                    if rollback_buffers and not model_buffers_are_finite(model):
+                        restore_model_buffers(model, buffer_snapshot)
+                        raise FloatingPointError(
+                            f"Non-finite PTv3 state after optimizer step at epoch={ep} batch={batch_idx}."
+                        )
                     scheduler.step()
+
+                if not track_gradient_diagnostics:
+                    gradient_stats = None
 
                 batch_size = surf_data.size(0)
                 train_losses["loss"] += loss.item() * batch_size
+                if gradient_stats is not None:
+                    train_losses["gradient_norm_raw"] += gradient_stats["grad_norm"] * batch_size
+                    train_losses["parameter_norm"] += gradient_stats["parameter_norm"] * batch_size
+                    train_losses["gradient_max_abs"] += gradient_stats["max_grad"] * batch_size
+                    train_losses["gradient_nonfinite"] += (0.0 if gradient_stats["finite"] else 1.0) * batch_size
                 with torch.no_grad():
                     surface_loss = rel_l2_loss_fn(y_hat_surf.float(), surf_data.float()) if use_surface_supervision else torch.tensor(0.0, device=device)
                     volume_loss = rel_l2_loss_fn(y_hat_vol.float(), vol_data.float())
@@ -422,14 +532,25 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
 
                 global_step += 1
                 if batch_idx % log_every_n_steps == 0 or batch_idx == len(train_loader) - 1:
-                    wandb.log({
+                    batch_log = {
                         "train/batch_loss": loss.item(),
                         "train/batch_rel_l2": (surface_loss + volume_loss).item(),
                         "train/batch_rel_l2_surf": surface_loss.item(),
                         "train/batch_rel_l2_vol": volume_loss.item(),
+                        "train/batch_amp_scale": float(scaler.get_scale()) if amp else 1.0,
                         "lr": scheduler.get_last_lr()[0],
                         "epoch": ep,
-                    }, step=global_step)
+                    }
+                    if gradient_stats is not None:
+                        batch_log.update(
+                            {
+                                "train/batch_gradient_norm_raw": gradient_stats["grad_norm"],
+                                "train/batch_parameter_norm": gradient_stats["parameter_norm"],
+                                "train/batch_gradient_max_abs": gradient_stats["max_grad"],
+                                "train/batch_gradient_nonfinite": 0.0 if gradient_stats["finite"] else 1.0,
+                            }
+                        )
+                    wandb.log(batch_log, step=global_step)
                     train_pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
 
             model.eval()

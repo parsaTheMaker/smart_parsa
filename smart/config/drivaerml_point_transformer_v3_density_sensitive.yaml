@@ -1,0 +1,17 @@
+defaults:
+  - drivaerml_point_transformer_v3
+  - _self_
+
+experiment:
+  name: "DrivAerML_POINT_TRANSFORMER_V3_DENSITY_SENSITIVE"
+  model_name: "POINT_TRANSFORMER_V3"
+  epochs: 150
+  architecture:
+    order: [z, hilbert]
+    shuffle_orders: false
+    voxel_density_power: 0.75
+    preserve_density: true
+    local_query_chunk_size: 16384
+  init_ckpt: "/home/parsa/smart_parsa/checkpoints/point-transformer-v3-ptv3-drivaerml-131k-from-last-150-drivaerml-s42_best.pt"
+  resume_ckpt: ""
+  resume_full_state: False

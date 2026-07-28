@@ -408,6 +408,7 @@ class _SerializedPooling(_PointModule):
         out_channels,
         stride=2,
         shuffle_orders=True,
+        preserve_density=False,
         bn_eps=1.0e-3,
         bn_momentum=0.01,
     ):
@@ -416,6 +417,7 @@ class _SerializedPooling(_PointModule):
             raise ValueError("PTv3 serialized pooling supports strides 2, 4, and 8.")
         self.stride = int(stride)
         self.shuffle_orders = bool(shuffle_orders)
+        self.preserve_density = bool(preserve_density)
         self.proj = nn.Linear(in_channels, out_channels)
         self.norm = _PointSequential(
             nn.BatchNorm1d(out_channels, eps=float(bn_eps), momentum=float(bn_momentum)),
@@ -440,11 +442,24 @@ class _SerializedPooling(_PointModule):
         if self.shuffle_orders:
             permutation = torch.randperm(code.shape[0], device=code.device)
             code, order, inverse = code[permutation], order[permutation], inverse[permutation]
-        pooled_feat = torch_scatter.segment_csr(self.proj(point.feat)[indices], index_ptr, reduce="max")
-        pooled_coord = torch_scatter.segment_csr(point.coord[indices], index_ptr, reduce="mean")
+        pooled_features = self.proj(point.feat)[indices]
+        pooled_feat = torch_scatter.segment_csr(
+            pooled_features,
+            index_ptr,
+            reduce="sum" if self.preserve_density else "max",
+        )
+        pooled_coord = torch_scatter.segment_csr(
+            point.coord[indices],
+            index_ptr,
+            reduce="sum" if self.preserve_density else "mean",
+        )
+        pooled_voxel_count = torch_scatter.segment_csr(
+            point.voxel_count[indices].float(), index_ptr, reduce="sum"
+        )
         pooled = _Point(
             feat=pooled_feat,
             coord=pooled_coord,
+            voxel_count=pooled_voxel_count,
             grid_coord=point.grid_coord[head_indices] >> pooling_depth,
             batch=point.batch[head_indices],
             serialized_code=code,
@@ -510,6 +525,7 @@ class _PTv3Backbone(_PointModule):
         mlp_ratio=4.0,
         drop_path=0.3,
         shuffle_orders=True,
+        preserve_density=False,
         enable_flash=True,
         attn_drop=0.0,
         proj_drop=0.0,
@@ -551,6 +567,7 @@ class _PTv3Backbone(_PointModule):
                         enc_channels[stage],
                         stride=stride[stage - 1],
                         shuffle_orders=shuffle_orders,
+                        preserve_density=preserve_density,
                         bn_eps=bn_eps,
                         bn_momentum=bn_momentum,
                     ),
@@ -651,6 +668,8 @@ class PointTransformerV3(nn.Module):
         use_local_query_features=True,
         dropout=0.0,
         geometry_input_scale=1.0,
+        voxel_density_power=0.0,
+        preserve_density=False,
         bn_eps=1.0e-3,
         bn_momentum=0.01,
         **_unused,
@@ -664,6 +683,8 @@ class PointTransformerV3(nn.Module):
         self.grid_size = float(grid_size)
         self.pos_scale_factor = float(pos_scale_factor)
         self.geometry_input_scale = float(geometry_input_scale)
+        self.voxel_density_power = max(0.0, float(voxel_density_power))
+        self.preserve_density = bool(preserve_density)
         self.query_chunk_size = max(1, int(query_chunk_size))
         self.local_query_neighbors = max(1, int(local_query_neighbors))
         self.local_query_chunk_size = max(1, int(local_query_chunk_size))
@@ -675,6 +696,7 @@ class PointTransformerV3(nn.Module):
             dec_channels=dec_channels, dec_heads=dec_heads,
             dec_patch_size=dec_patch_size, mlp_ratio=mlp_ratio,
             drop_path=drop_path, shuffle_orders=shuffle_orders,
+            preserve_density=self.preserve_density,
             enable_flash=enable_flash, attn_drop=attn_drop, proj_drop=proj_drop,
             spconv_algo=spconv_algo,
             bn_eps=bn_eps,
@@ -752,7 +774,11 @@ class PointTransformerV3(nn.Module):
         counts = torch.bincount(inverse, minlength=int(inverse.max().item()) + 1)
         index_ptr = torch.cat([counts.new_zeros(1), torch.cumsum(counts, dim=0)])
         coords = torch_scatter.segment_csr(coords[sort_order], index_ptr, reduce="mean")
-        raw_features = torch_scatter.segment_csr(raw_features[sort_order], index_ptr, reduce="mean")
+        raw_features = torch_scatter.segment_csr(
+            raw_features[sort_order],
+            index_ptr,
+            reduce="sum" if self.preserve_density else "mean",
+        )
         unique_keys = voxel_keys[sort_order[index_ptr[:-1]]]
         grid_coord = unique_keys[:, 1:]
         batch = unique_keys[:, 0].long()
@@ -761,6 +787,7 @@ class PointTransformerV3(nn.Module):
             coord=coords,
             grid_coord=grid_coord,
             feat=raw_features,
+            voxel_count=counts.to(dtype=torch.float32),
             batch=batch,
             offset=offset,
             grid_size=self.grid_size,
@@ -779,21 +806,56 @@ class PointTransformerV3(nn.Module):
             point_features = point.feat.float()
             scores = self.latent_score(point_features)
             values = self.latent_value(point_features)
-        latent_parts = []
-        latent_coord_parts = []
-        for batch_index in range(int(point.offset.numel())):
-            start = 0 if batch_index == 0 else int(point.offset[batch_index - 1].item())
-            stop = int(point.offset[batch_index].item())
-            batch_scores = scores[start:stop].softmax(dim=0)
-            latent_parts.append(torch.einsum("nl,nd->ld", batch_scores, values[start:stop]))
-            # Preserve where each learned latent gathers its evidence.  The
-            # original global pooling retained feature content but discarded
-            # this spatial identity before query decoding.
-            latent_coord_parts.append(torch.einsum("nl,nc->lc", batch_scores, point.coord[start:stop].float()))
-        # The einsum may be selected by the caller's outer autocast context;
-        # normalize the readout dtype before applying the FP32 LayerNorm.
-        latent = torch.stack(latent_parts, dim=0).float()
-        latent_coords = torch.stack(latent_coord_parts, dim=0).float()
+        if self.preserve_density:
+            # Do not normalize away the number of points represented by the
+            # sparse voxels.  Softplus gates stay positive, while segmented
+            # sums retain both local occupancy and global point mass.  The
+            # square-root stabilization avoids a quadratic scale increase
+            # without turning this back into an average readout.
+            segment_offsets = F.pad(point.offset, (1, 0))
+            density = point.voxel_count.float().clamp_min(1.0)
+            density = density / torch_scatter.segment_csr(
+                density, segment_offsets, reduce="mean"
+            ).repeat_interleave(_offset_to_counts(point.offset)).clamp_min(1.0)
+            gates = F.softplus(scores)
+            if self.voxel_density_power > 0.0:
+                gates = gates * density.pow(self.voxel_density_power).unsqueeze(-1)
+            latent_mass = torch_scatter.segment_csr(gates, segment_offsets, reduce="sum").clamp_min(1.0e-6)
+            latent = torch_scatter.segment_csr(
+                gates.unsqueeze(-1) * values.unsqueeze(1),
+                segment_offsets,
+                reduce="sum",
+            ) / latent_mass.sqrt().unsqueeze(-1)
+            latent_coords = torch_scatter.segment_csr(
+                gates.unsqueeze(-1) * point.coord.float().unsqueeze(1),
+                segment_offsets,
+                reduce="sum",
+            ) / latent_mass.unsqueeze(-1)
+        else:
+            latent_parts = []
+            latent_coord_parts = []
+            for batch_index in range(int(point.offset.numel())):
+                start = 0 if batch_index == 0 else int(point.offset[batch_index - 1].item())
+                stop = int(point.offset[batch_index].item())
+                batch_scores = scores[start:stop].softmax(dim=0)
+                if self.voxel_density_power > 0.0:
+                    # Preserve PTv3's learned normalized readout while exposing
+                    # local sampling density to the operator.  Counts are raw
+                    # points represented by each final serialized voxel; the
+                    # per-batch mean keeps the overall latent scale stable.
+                    batch_density = point.voxel_count[start:stop].float().clamp_min(1.0)
+                    batch_density = batch_density / batch_density.mean().clamp_min(1.0)
+                    density_factor = batch_density.pow(self.voxel_density_power).unsqueeze(-1)
+                    batch_scores = batch_scores * density_factor
+                    batch_scores = batch_scores / batch_scores.sum(dim=0, keepdim=True).clamp_min(1.0e-8)
+                latent_parts.append(torch.einsum("nl,nd->ld", batch_scores, values[start:stop]))
+                latent_coord_parts.append(torch.einsum("nl,nc->lc", batch_scores, point.coord[start:stop].float()))
+            latent = torch.stack(latent_parts, dim=0).float()
+            latent_coords = torch.stack(latent_coord_parts, dim=0).float()
+        # Normalize only feature channels after the density-preserving sum;
+        # the point-mass-dependent content has already been retained.
+        latent = latent.float()
+        latent_coords = latent_coords.float()
         with torch.autocast(device_type=device_type, enabled=False):
             latent = self.geometry_cond(self.latent_norm(latent), params.float() if params is not None else None)
         return latent, latent_coords, point.coord, point.feat, point.batch

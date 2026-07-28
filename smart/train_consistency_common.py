@@ -841,6 +841,23 @@ def _resolve_sampling_mode(mode, mixed_inverse_density_prob, generator):
     return "inverse_density_wor" if draw < float(mixed_inverse_density_prob) else "uniform_wor"
 
 
+def sample_shared_shift_family(family_probabilities, generator):
+    """Choose one sampling family for both views in a training batch."""
+    probabilities = torch.as_tensor(list(family_probabilities), dtype=torch.float32)
+    if probabilities.numel() != 3 or bool((probabilities < 0.0).any().item()):
+        raise ValueError("shared shift family probabilities must contain three non-negative values.")
+    total = float(probabilities.sum().item())
+    if total <= 0.0:
+        raise ValueError("shared shift family probabilities must have a positive sum.")
+    draw = float(torch.rand((), generator=generator).item()) * total
+    cumulative = 0.0
+    for family_id, probability in enumerate(probabilities.tolist()):
+        cumulative += float(probability)
+        if draw < cumulative or family_id == 2:
+            return family_id
+    return 2
+
+
 def sample_uniform_beta(beta_min, beta_max, generator):
     beta_min = float(beta_min)
     beta_max = float(beta_max)
@@ -941,6 +958,8 @@ def _sample_single_view_indices(
     gaussian_mask_std_fraction=0.05,
     gaussian_mask_prob_at_1sigma=0.33,
     gaussian_mask_min_survivors=16384,
+    sinusoidal_axis=None,
+    sinusoidal_mix_fraction=0.0,
 ):
     resolved_mode = _resolve_sampling_mode(mode, mixed_inverse_density_prob, generator)
 
@@ -971,6 +990,44 @@ def _sample_single_view_indices(
             weights = torch.ones_like(weights)
         idx = torch.multinomial(weights, num_samples=num_points, replacement=replacement, generator=generator)
         return idx.to(dtype=torch.long), resolved_mode
+
+    if resolved_mode == "sinusoidal_axis_mixture_wor":
+        axis = int(sinusoidal_axis)
+        if axis not in (0, 1):
+            raise ValueError(f"sinusoidal_axis must be 0 or 1, got {sinusoidal_axis!r}")
+        if num_points >= n_points:
+            return torch.arange(n_points, dtype=torch.long), resolved_mode
+
+        coordinates = geo_row[:, axis].detach().float()
+        coordinate_min = coordinates.amin()
+        coordinate_max = coordinates.amax()
+        span = (coordinate_max - coordinate_min).clamp_min(1.0e-8)
+        normalized = ((coordinates - coordinate_min) / span).clamp(0.0, 1.0)
+        weights = (torch.sin(math.pi * normalized).pow(2) + 1.0e-6).cpu()
+        mix_fraction = min(max(float(sinusoidal_mix_fraction), 0.0), 1.0)
+        weighted_count = min(max(int(round(mix_fraction * num_points)), 0), num_points)
+        uniform_count = num_points - weighted_count
+
+        if weighted_count > 0:
+            weighted_idx = torch.multinomial(
+                weights,
+                num_samples=weighted_count,
+                replacement=False,
+                generator=generator,
+            )
+            selected = torch.zeros(n_points, dtype=torch.bool)
+            selected[weighted_idx] = True
+        else:
+            weighted_idx = torch.empty(0, dtype=torch.long)
+            selected = torch.zeros(n_points, dtype=torch.bool)
+
+        if uniform_count > 0:
+            remaining = torch.nonzero(~selected, as_tuple=False).squeeze(-1)
+            uniform_rel = torch.randperm(int(remaining.numel()), generator=generator)[:uniform_count]
+            uniform_idx = remaining[uniform_rel]
+        else:
+            uniform_idx = torch.empty(0, dtype=torch.long)
+        return torch.cat([weighted_idx, uniform_idx], dim=0).to(dtype=torch.long), resolved_mode
 
     if resolved_mode == "gaussian_ball_mask":
         return _sample_gaussian_ball_mask_indices(
@@ -1006,6 +1063,8 @@ def sample_geometry_view(
     gaussian_mask_std_fraction=0.05,
     gaussian_mask_prob_at_1sigma=0.33,
     gaussian_mask_min_survivors=16384,
+    sinusoidal_axis=None,
+    sinusoidal_mix_fraction=0.0,
 ):
     if geo_log_density is None and _sampling_mode_requires_density(mode):
         raise RuntimeError(f"Sampling mode {mode!r} requires geometry log density for view sampling.")
@@ -1030,6 +1089,8 @@ def sample_geometry_view(
             gaussian_mask_std_fraction=gaussian_mask_std_fraction,
             gaussian_mask_prob_at_1sigma=gaussian_mask_prob_at_1sigma,
             gaussian_mask_min_survivors=gaussian_mask_min_survivors,
+            sinusoidal_axis=sinusoidal_axis,
+            sinusoidal_mix_fraction=sinusoidal_mix_fraction,
         )
         idx_rows.append(idx_row)
         resolved_modes.append(resolved_mode)
@@ -1061,16 +1122,36 @@ def consistency_warmup_factor(epoch, warmup_epochs):
     return min(1.0, float(epoch + 1) / float(warmup_epochs))
 
 
-def prediction_consistency_smooth_l1_loss(y1_surf, y1_vol, y2_surf, y2_vol, beta=0.05):
-    surf_target = (0.5 * (y1_surf.detach() + y2_surf.detach())).to(dtype=y1_surf.dtype)
-    vol_target = (0.5 * (y1_vol.detach() + y2_vol.detach())).to(dtype=y1_vol.dtype)
-    surf_loss = 0.5 * (
-        F.smooth_l1_loss(y1_surf, surf_target, beta=beta) + F.smooth_l1_loss(y2_surf, surf_target, beta=beta)
-    )
-    vol_loss = 0.5 * (
-        F.smooth_l1_loss(y1_vol, vol_target, beta=beta) + F.smooth_l1_loss(y2_vol, vol_target, beta=beta)
-    )
-    return surf_loss + vol_loss
+def prediction_consistency_smooth_l1_loss(
+    y1_surf,
+    y1_vol,
+    y2_surf,
+    y2_vol,
+    beta=0.05,
+    symmetric_detached=False,
+    average_groups=False,
+):
+    if symmetric_detached:
+        surf_loss = 0.5 * (
+            F.smooth_l1_loss(y1_surf, y2_surf.detach(), beta=beta)
+            + F.smooth_l1_loss(y2_surf, y1_surf.detach(), beta=beta)
+        )
+        vol_loss = 0.5 * (
+            F.smooth_l1_loss(y1_vol, y2_vol.detach(), beta=beta)
+            + F.smooth_l1_loss(y2_vol, y1_vol.detach(), beta=beta)
+        )
+    else:
+        surf_target = (0.5 * (y1_surf.detach() + y2_surf.detach())).to(dtype=y1_surf.dtype)
+        vol_target = (0.5 * (y1_vol.detach() + y2_vol.detach())).to(dtype=y1_vol.dtype)
+        surf_loss = 0.5 * (
+            F.smooth_l1_loss(y1_surf, surf_target, beta=beta)
+            + F.smooth_l1_loss(y2_surf, surf_target, beta=beta)
+        )
+        vol_loss = 0.5 * (
+            F.smooth_l1_loss(y1_vol, vol_target, beta=beta)
+            + F.smooth_l1_loss(y2_vol, vol_target, beta=beta)
+        )
+    return 0.5 * (surf_loss + vol_loss) if average_groups else surf_loss + vol_loss
 
 
 def soft_worst_case_loss(loss_a, loss_b, tau=0.1):
@@ -1612,6 +1693,12 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
 
     primary_view_points = int(getattr(config, "primary_view_geometry_points", getattr(config, "view_geometry_points", 0)))
     secondary_view_points = int(getattr(config, "secondary_view_geometry_points", getattr(config, "view_geometry_points", 0)))
+    shared_shift_sampling_mode = str(getattr(config, "train_shared_shift_sampling_mode", "")).strip().lower()
+    if shared_shift_sampling_mode in {"random_beta_sine", "random_beta_sine_axis", "shared_random"}:
+        shared_shift_view_points = int(getattr(config, "shared_shift_view_geometry_points", 0))
+        if shared_shift_view_points > 0:
+            primary_view_points = shared_shift_view_points
+            secondary_view_points = shared_shift_view_points
     eval_aligned_view_points = int(
         getattr(config, "eval_aligned_view_geometry_points", getattr(config, "eval_view_geometry_points", primary_view_points))
     )
@@ -1702,6 +1789,9 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
         "primary_inverse_density_beta",
         "secondary_inverse_density_fraction",
         "secondary_inverse_density_beta",
+        "shared_shift_family_id",
+        "primary_shift_intensity",
+        "secondary_shift_intensity",
         "learned_weight_supervised_mean",
         "learned_weight_supervised_worst",
         "learned_weight_prediction_consistency",
@@ -1796,6 +1886,28 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                 geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, geo_log_density = unpack_batch(batch, params_dim)
                 primary_sampling_mode = str(getattr(config, "train_primary_sampling_mode", "uniform_wor"))
                 secondary_sampling_mode = str(getattr(config, "train_secondary_sampling_mode", "mixed"))
+                shared_shift_family_id = -1
+                primary_sine_axis = None
+                secondary_sine_axis = None
+                primary_sine_mix_fraction = 0.0
+                secondary_sine_mix_fraction = 0.0
+                if shared_shift_sampling_mode in {"random_beta_sine", "random_beta_sine_axis", "shared_random"}:
+                    family_generator = _cpu_generator(
+                        int(config.random_seed + ep * 1000003 + batch_idx * 10007 + 5)
+                    )
+                    shared_shift_family_id = sample_shared_shift_family(
+                        getattr(config, "shared_shift_family_probabilities", [1.0 / 3.0] * 3),
+                        family_generator,
+                    )
+                    if shared_shift_family_id == 0:
+                        primary_sampling_mode = "inverse_density_wor"
+                        secondary_sampling_mode = "inverse_density_wor"
+                    else:
+                        primary_sampling_mode = "sinusoidal_axis_mixture_wor"
+                        secondary_sampling_mode = "sinusoidal_axis_mixture_wor"
+                        sine_axis = 1 if shared_shift_family_id == 1 else 0
+                        primary_sine_axis = sine_axis
+                        secondary_sine_axis = sine_axis
                 if geo_log_density is None and (
                     _sampling_mode_requires_density(primary_sampling_mode)
                     or _sampling_mode_requires_density(secondary_sampling_mode)
@@ -1807,7 +1919,13 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     )
 
                 primary_beta_generator = _cpu_generator(int(config.random_seed + ep * 1000003 + batch_idx * 10007 + 17))
-                if bool(getattr(config, "randomize_primary_inverse_density_beta", False)):
+                if shared_shift_family_id == 0:
+                    primary_inverse_density_beta = sample_uniform_beta(
+                        getattr(config, "shared_shift_beta_min", 0.0),
+                        getattr(config, "shared_shift_beta_max", 1.0),
+                        primary_beta_generator,
+                    )
+                elif bool(getattr(config, "randomize_primary_inverse_density_beta", False)):
                     primary_inverse_density_beta = sample_uniform_beta(
                         getattr(config, "primary_inverse_density_beta_min", 0.0),
                         getattr(config, "primary_inverse_density_beta_max", 0.5),
@@ -1815,6 +1933,12 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     )
                 else:
                     primary_inverse_density_beta = float(getattr(config, "inverse_density_beta", 1.0))
+                if shared_shift_family_id in {1, 2}:
+                    primary_sine_mix_fraction = sample_uniform_beta(
+                        getattr(config, "shared_shift_sine_min", 0.0),
+                        getattr(config, "shared_shift_sine_max", 0.5),
+                        primary_beta_generator,
+                    )
                 primary_view_geo, primary_view_density, primary_modes = sample_geometry_view(
                     geo_mesh,
                     geo_log_density,
@@ -1826,9 +1950,17 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     gaussian_mask_std_fraction=float(getattr(config, "gaussian_mask_std_fraction_of_largest_extent", 0.05)),
                     gaussian_mask_prob_at_1sigma=float(getattr(config, "gaussian_mask_prob_at_1sigma", 0.33)),
                     gaussian_mask_min_survivors=int(getattr(config, "gaussian_mask_min_survivors", 16384)),
+                    sinusoidal_axis=primary_sine_axis,
+                    sinusoidal_mix_fraction=primary_sine_mix_fraction,
                 )
                 secondary_beta_generator = _cpu_generator(int(config.random_seed + ep * 1000003 + batch_idx * 10007 + 23))
-                if bool(getattr(config, "randomize_secondary_inverse_density_beta", False)):
+                if shared_shift_family_id == 0:
+                    secondary_inverse_density_beta = sample_uniform_beta(
+                        getattr(config, "shared_shift_beta_min", 0.0),
+                        getattr(config, "shared_shift_beta_max", 1.0),
+                        secondary_beta_generator,
+                    )
+                elif bool(getattr(config, "randomize_secondary_inverse_density_beta", False)):
                     secondary_inverse_density_beta = sample_uniform_beta(
                         getattr(config, "secondary_inverse_density_beta_min", 0.1),
                         getattr(config, "secondary_inverse_density_beta_max", 0.5),
@@ -1836,6 +1968,12 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     )
                 else:
                     secondary_inverse_density_beta = float(getattr(config, "inverse_density_beta", 1.0))
+                if shared_shift_family_id in {1, 2}:
+                    secondary_sine_mix_fraction = sample_uniform_beta(
+                        getattr(config, "shared_shift_sine_min", 0.0),
+                        getattr(config, "shared_shift_sine_max", 0.5),
+                        secondary_beta_generator,
+                    )
                 secondary_view_geo, secondary_view_density, secondary_modes = sample_geometry_view(
                     geo_mesh,
                     geo_log_density,
@@ -1847,6 +1985,19 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     gaussian_mask_std_fraction=float(getattr(config, "gaussian_mask_std_fraction_of_largest_extent", 0.05)),
                     gaussian_mask_prob_at_1sigma=float(getattr(config, "gaussian_mask_prob_at_1sigma", 0.33)),
                     gaussian_mask_min_survivors=int(getattr(config, "gaussian_mask_min_survivors", 16384)),
+                    sinusoidal_axis=secondary_sine_axis,
+                    sinusoidal_mix_fraction=secondary_sine_mix_fraction,
+                )
+
+                primary_shift_intensity = (
+                    float(primary_inverse_density_beta)
+                    if shared_shift_family_id == 0
+                    else float(primary_sine_mix_fraction)
+                )
+                secondary_shift_intensity = (
+                    float(secondary_inverse_density_beta)
+                    if shared_shift_family_id == 0
+                    else float(secondary_sine_mix_fraction)
                 )
 
                 params = move_optional_tensor(params, device)
@@ -1941,12 +2092,17 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                 y1_surf_teacher = y1_surf_f.detach()
                 y1_vol_teacher = y1_vol_f.detach()
                 if use_prediction_consistency:
+                    symmetric_detached_consistency = bool(
+                        getattr(config, "prediction_consistency_symmetric_detached", False)
+                    )
                     pred_consistency = prediction_consistency_smooth_l1_loss(
-                        y1_surf_teacher,
-                        y1_vol_teacher,
+                        y1_surf_f if symmetric_detached_consistency else y1_surf_teacher,
+                        y1_vol_f if symmetric_detached_consistency else y1_vol_teacher,
                         y2_surf_f,
                         y2_vol_f,
                         beta=float(getattr(config, "prediction_consistency_smooth_l1_beta", 0.05)),
+                        symmetric_detached=symmetric_detached_consistency,
+                        average_groups=bool(getattr(config, "prediction_consistency_average_groups", False)),
                     )
                 else:
                     pred_consistency = y1_vol_f.new_zeros(())
@@ -2028,8 +2184,12 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     external_gradnorm_info = {"task_losses": external_gradnorm_tasks}
                 elif use_fixed_sum:
                     fixed_sum_tasks = [
-                        task_losses[2],
-                        task_losses[3],
+                        task_losses[0]
+                        if bool(getattr(config, "fixed_sum_use_view_losses", False))
+                        else task_losses[2],
+                        task_losses[1]
+                        if bool(getattr(config, "fixed_sum_use_view_losses", False))
+                        else task_losses[3],
                     ]
                     if use_prediction_consistency:
                         fixed_sum_tasks.append((pred_consistency_weight * task_losses[4]).float())
@@ -2183,6 +2343,15 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     train_losses["secondary_inverse_density_beta"] += torch.tensor(
                         float(secondary_inverse_density_beta), device=device, dtype=torch.float32
                     ) * batch_size_float
+                    train_losses["shared_shift_family_id"] += torch.tensor(
+                        float(shared_shift_family_id), device=device, dtype=torch.float32
+                    ) * batch_size_float
+                    train_losses["primary_shift_intensity"] += torch.tensor(
+                        primary_shift_intensity, device=device, dtype=torch.float32
+                    ) * batch_size_float
+                    train_losses["secondary_shift_intensity"] += torch.tensor(
+                        secondary_shift_intensity, device=device, dtype=torch.float32
+                    ) * batch_size_float
                     if uncertainty_info is not None:
                         train_losses["learned_weight_supervised_mean"] += current_task_weights[0].detach().float() * batch_size_float
                         train_losses["learned_weight_supervised_worst"] += current_task_weights[1].detach().float() * batch_size_float
@@ -2240,6 +2409,9 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             float(primary_inverse_density_beta),
                             secondary_inverse_density_fraction,
                             float(secondary_inverse_density_beta),
+                            float(shared_shift_family_id),
+                            primary_shift_intensity,
+                            secondary_shift_intensity,
                         ]
                     )
                     wandb.log(
@@ -2257,6 +2429,9 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             "train/batch_primary_inverse_density_beta": log_scalars[10],
                             "train/batch_secondary_inverse_density_fraction": log_scalars[11],
                             "train/batch_secondary_inverse_density_beta": log_scalars[12],
+                            "train/batch_shared_shift_family_id": log_scalars[13],
+                            "train/batch_primary_shift_intensity": log_scalars[14],
+                            "train/batch_secondary_shift_intensity": log_scalars[15],
                             "train/prediction_consistency_weight": pred_consistency_weight,
                             "train/batch_amp_scale": float(scaler.get_scale()) if amp else 1.0,
                             "lr": scheduler.get_last_lr()[0],

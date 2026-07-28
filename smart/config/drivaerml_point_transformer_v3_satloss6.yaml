@@ -33,6 +33,8 @@ experiment:
     local_query_chunk_size: 8192
     use_local_query_features: true
     geometry_input_scale: 1.0
+    voxel_density_power: 0.0
+    preserve_density: false
     dropout: 0.0
   init_ckpt: ""
   view_geometry_points: 131072

@@ -7,12 +7,19 @@ experiment:
   model_name: "POINTNET2_SSG"
   architecture:
     latent_dim: 256
-    sa1_npoint: 1024
-    sa1_radius: 0.25
-    sa1_nsample: 32
-    sa2_npoint: 256
-    sa2_radius: 0.65
-    sa2_nsample: 64
+    # Radii are in the normalized DrivAerML coordinate system.  These values
+    # keep the first level local and the second level moderately regional.
+    sa1_npoint: 2048
+    sa1_radius: 0.02
+    sa1_nsample: 64
+    sa2_npoint: 512
+    sa2_radius: 0.05
+    sa2_nsample: 128
+    query_neighbors: 3
+    # Random set-abstraction centroids preserve input-density shifts for the
+    # sampling-sensitivity benchmark. Set to fps for canonical PointNet++.
+    centroid_sampling: random
+    density_histogram_bins: 8
     pos_scale_factor: 1.0
     query_chunk_size: 65536
     dropout: 0.0

@@ -1,0 +1,17 @@
+defaults:
+  - drivaerml_pointnet2_ssg_satloss6
+  - _self_
+
+experiment:
+  name: "DrivAerML_POINTNET2_SSG_SATLOSS6_FIXEDSUM"
+  model_name: "POINTNET2_SSG_SATLOSS6"
+  epochs: 200
+  task_weighting_method: "fixed_sum"
+  use_learned_task_weighting: False
+  use_uncertainty_weighting: False
+  config_task_base_weights: [0.4, 0.4, 0.2]
+  task_weight_base_weights: [0.4, 0.4, 0.2]
+  consistency_warmup_epochs: 0
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False

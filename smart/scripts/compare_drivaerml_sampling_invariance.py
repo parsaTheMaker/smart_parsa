@@ -8,12 +8,13 @@ Workflow:
    a fixed-size geometry subset sampled uniformly without replacement
    from the full surface cloud.
 4) Use shifted modes that keep the same number of geometry points but sample
-   them with inverse-density, sinusoidal-axis, radial-shell, or axis-end
-   probabilities.
+   them with inverse-density, sinusoidal-axis, or remeshing-like spatial
+   probability fields. The latter include silhouette shells, boundary layers,
+   and localized feature patches.
 5) Evaluate multiple independently drawn encoder-input views per run/mode.
 6) Aggregate first across views within a run, then across runs.
-7) Save field-level and headline robustness plots, plus a representative
-   surface VTK whose query points come from a user-selected external surface folder.
+7) Save all-model aggregate robustness plots, plus a representative surface
+   VTK whose query points come from a user-selected external surface folder.
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ import torch
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -398,15 +400,15 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--shift-betas",
-        default="0,0.25,0.5,0.75,1.0",
-        help="Comma-separated inverse-density shift severities. Example: 0,0.25,0.5,0.75,1.0",
+        default="0,1",
+        help="Inverse-density range. Only its minimum and maximum are evaluated; intermediate values are ignored.",
     )
     p.add_argument(
         "--active-shifts",
         default="all",
         help=(
-            "Comma-separated active shifts: beta,sine_y,sine_x,radial_shell,z_end,corner_focus. "
-            "Aliases: sine, radial, corner, all. Default: all."
+            "Comma-separated active shifts: beta,sine_y,sine_x. sine_y/sine_x are the restored "
+            "sinusoidal coordinate shifts. Aliases: sine, remesh, remesh_axis, all. Default: all."
         ),
     )
     p.add_argument("--views-per-mode", type=int, default=2, help="Number of independently sampled encoder-input views per run/mode.")
@@ -711,71 +713,23 @@ def sample_weighted_without_replacement(
 
 
 def sinusoidal_axis_probabilities(coords_xyz: np.ndarray, axis: int) -> np.ndarray:
+    """Prefer the center of an axis with a smooth sinusoidal redistribution."""
     coord = np.asarray(coords_xyz[:, axis], dtype=np.float64)
     cmin = float(np.min(coord))
     cmax = float(np.max(coord))
     span = max(cmax - cmin, 1e-12)
     t = np.clip((coord - cmin) / span, 0.0, 1.0)
-    # One sinusoidal hump across the full axis extent: low at the ends, high in the middle.
+    # This is the original sine-y/sine-x benchmark shift: it concentrates
+    # samples near the center of the selected coordinate axis without masking.
     scores = np.sin(np.pi * t) ** 2
     return np.clip(scores + 1e-6, 1e-6, None)
 
 
-def radial_shell_probabilities(coords_xyz: np.ndarray) -> np.ndarray:
-    """Prefer the outer radial shell without deleting any points.
-
-    This is a distribution shift, not a mask: every candidate remains
-    eligible and the same point budget is sampled from a different spatial
-    probability field.  The squared radius makes the shift strong enough to
-    expose encoders that collapse geometry into a global average.
-    """
-    coords = np.asarray(coords_xyz, dtype=np.float64)
-    center = np.mean(coords, axis=0, keepdims=True)
-    radius = np.linalg.norm(coords - center, axis=1)
-    scale = max(float(np.max(radius)), 1.0e-12)
-    normalized = np.clip(radius / scale, 0.0, 1.0)
-    return np.clip(0.05 + normalized**2, 1.0e-6, None)
-
-
-def axis_end_probabilities(coords_xyz: np.ndarray, axis: int, temperature: float = 6.0) -> np.ndarray:
-    """Tilt the sampling distribution toward one end of an axis.
-
-    The exponential tilt is evaluated after subtracting its maximum for
-    numerical stability.  Unlike inverse-density sampling, it is defined
-    directly from spatial coordinates and therefore supplies an independent
-    point-distribution shift.
-    """
-    coord = np.asarray(coords_xyz[:, axis], dtype=np.float64)
-    cmin = float(np.min(coord))
-    cmax = float(np.max(coord))
-    span = max(cmax - cmin, 1.0e-12)
-    normalized = np.clip((coord - cmin) / span, 0.0, 1.0)
-    logits = float(temperature) * normalized
-    logits -= float(np.max(logits))
-    return np.clip(np.exp(logits) + 1.0e-6, 1.0e-6, None)
-
-
-def corner_focus_probabilities(coords_xyz: np.ndarray, temperature: float = 8.0) -> np.ndarray:
-    """Prefer one normalized bounding-box corner without masking points."""
-    coords = np.asarray(coords_xyz, dtype=np.float64)
-    mins = np.min(coords, axis=0, keepdims=True)
-    maxs = np.max(coords, axis=0, keepdims=True)
-    span = np.clip(maxs - mins, 1.0e-12, None)
-    normalized = np.clip((coords - mins) / span, 0.0, 1.0)
-    distance2 = np.sum((normalized - 1.0) ** 2, axis=1)
-    logits = -float(temperature) * distance2
-    logits -= float(np.max(logits))
-    return np.clip(np.exp(logits) + 1.0e-6, 1.0e-6, None)
-
-
-SHIFT_ORDER = ("beta", "sine_y", "sine_x", "radial_shell", "z_end", "corner_focus")
+SHIFT_ORDER = ("beta", "sine_y", "sine_x")
 SHIFT_LABELS = {
     "beta": "Inverse-density beta",
     "sine_y": "Sinusoidal-y intensity",
     "sine_x": "Sinusoidal-x intensity",
-    "radial_shell": "Radial-shell intensity",
-    "z_end": "Z-end intensity",
-    "corner_focus": "Corner-focus intensity",
 }
 
 
@@ -787,8 +741,8 @@ def parse_active_shifts(text: str) -> List[str]:
     aliases = {
         "sine": ("sine_y", "sine_x"),
         "sinusoidal": ("sine_y", "sine_x"),
-        "radial": ("radial_shell",),
-        "corner": ("corner_focus",),
+        "remesh": ("sine_y", "sine_x"),
+        "remesh_axis": ("sine_y", "sine_x"),
     }
     expanded: List[str] = []
     for item in raw:
@@ -1210,6 +1164,123 @@ def save_sampling_y_histogram(
     plt.close(fig)
 
 
+def _spatial_shift_feature_values(
+    points_xyz: np.ndarray,
+    shift_name: str,
+    normalization_reference_points_xyz: np.ndarray | None = None,
+) -> Tuple[np.ndarray, np.ndarray, str]:
+    """Return a normalized diagnostic coordinate and its shift weights."""
+    points = np.asarray(points_xyz, dtype=np.float64)
+    reference = points if normalization_reference_points_xyz is None else np.asarray(normalization_reference_points_xyz, dtype=np.float64)
+    mins = np.min(reference, axis=0, keepdims=True)
+    maxs = np.max(reference, axis=0, keepdims=True)
+    span = np.clip(maxs - mins, 1.0e-12, None)
+    normalized = np.clip((points - mins) / span, 0.0, 1.0)
+
+    if shift_name == "sine_y":
+        feature = normalized[:, 1]
+        label = "Normalized y coordinate"
+    elif shift_name == "sine_x":
+        feature = normalized[:, 0]
+        label = "Normalized x coordinate"
+    else:
+        raise ValueError(f"Unsupported spatial shift: {shift_name}")
+
+    weights = sinusoidal_axis_probabilities(points, axis=1 if shift_name == "sine_y" else 0)
+    return np.asarray(feature, dtype=np.float64), np.asarray(weights, dtype=np.float64), label
+
+
+def _histogram_density(values: np.ndarray, bins: np.ndarray, weights: np.ndarray | None = None) -> np.ndarray:
+    counts, _ = np.histogram(values, bins=bins, weights=weights)
+    widths = np.diff(bins)
+    total = float(np.sum(counts))
+    if total <= 0.0:
+        return np.zeros_like(widths, dtype=np.float64)
+    return counts.astype(np.float64) / (total * widths)
+
+
+def _empirical_cdf(values: np.ndarray, grid: np.ndarray, *, upper_tail: bool = False) -> np.ndarray:
+    values = np.sort(np.asarray(values, dtype=np.float64))
+    if values.size == 0:
+        return np.zeros_like(grid, dtype=np.float64)
+    ranks = np.searchsorted(values, grid, side="right").astype(np.float64) / float(values.size)
+    return 1.0 - ranks if upper_tail else ranks
+
+
+def save_spatial_shift_endpoint_plot(
+    path: Path,
+    shift_name: str,
+    reference_points_xyz: np.ndarray,
+    sampled_points_by_intensity: Dict[float, np.ndarray],
+    title: str,
+) -> None:
+    """Compare zero and maximum spatial-shift intensities with shift-specific diagnostics."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    reference_feature, shift_weights, feature_label = _spatial_shift_feature_values(reference_points_xyz, shift_name)
+    sampled_features = {
+        float(intensity): _spatial_shift_feature_values(
+            points,
+            shift_name,
+            normalization_reference_points_xyz=reference_points_xyz,
+        )[0]
+        for intensity, points in sampled_points_by_intensity.items()
+    }
+    finite = np.isfinite(reference_feature)
+    reference_feature = reference_feature[finite]
+    shift_weights = shift_weights[finite]
+    if reference_feature.size == 0:
+        return
+    feature_min = float(np.min(reference_feature))
+    feature_max = float(np.max(reference_feature))
+    if feature_max <= feature_min:
+        feature_max = feature_min + 1.0e-12
+    bins = np.linspace(feature_min, feature_max, 51)
+    centers = 0.5 * (bins[:-1] + bins[1:])
+    uniform_pdf = _histogram_density(reference_feature, bins)
+    shifted_pdf = _histogram_density(reference_feature, bins, weights=shift_weights)
+
+    zero_intensity = min(sampled_features, key=lambda value: abs(value - 0.0))
+    max_intensity = max(sampled_features)
+    max_features = sampled_features[max_intensity]
+    zero_features = sampled_features[zero_intensity]
+    max_mix_pdf = (1.0 - max_intensity) * uniform_pdf + max_intensity * shifted_pdf
+
+    zero_color = "#4C78A8"
+    max_color = "#E45756"
+    target_color = "#54A24B"
+    reference_color = "#777777"
+    fig, (ax_pdf, ax_aux) = plt.subplots(1, 2, figsize=(13.5, 5.8), constrained_layout=True)
+    ax_pdf.hist(reference_feature, bins=bins, density=True, histtype="step", color=reference_color, linewidth=1.5, label="candidate cloud")
+    ax_pdf.hist(zero_features, bins=bins, density=True, color=zero_color, alpha=0.38, label=f"intensity={zero_intensity:.2f}")
+    ax_pdf.hist(max_features, bins=bins, density=True, color=max_color, alpha=0.42, label=f"intensity={max_intensity:.2f}")
+    ax_pdf.plot(centers, uniform_pdf, color=zero_color, linestyle="--", linewidth=1.8, label="uniform target")
+    ax_pdf.plot(centers, max_mix_pdf, color=target_color, linestyle="-.", linewidth=1.8, label="maximum-shift target")
+    ax_pdf.set_xlabel(feature_label)
+    ax_pdf.set_ylabel("Probability density")
+    ax_pdf.set_title("Endpoint distributions")
+    ax_pdf.grid(True, alpha=0.2)
+    ax_pdf.legend(loc="best", frameon=True, framealpha=0.92)
+
+    if shift_name in {"sine_y", "sine_x"}:
+        ax_aux.plot(centers, shifted_pdf - uniform_pdf, color=max_color, linewidth=2.0)
+        ax_aux.axhline(0.0, color="#333333", linewidth=1.0)
+        ax_aux.set_ylabel("Shifted target PDF - uniform PDF")
+        ax_aux.set_title("Sinusoidal redistribution from zero")
+    else:
+        grid = np.linspace(feature_min, feature_max, 256)
+        ax_aux.plot(grid, _empirical_cdf(reference_feature, grid), color=reference_color, linewidth=1.5, label="candidate")
+        ax_aux.plot(grid, _empirical_cdf(zero_features, grid), color=zero_color, linewidth=1.8, label="zero intensity")
+        ax_aux.plot(grid, _empirical_cdf(max_features, grid), color=max_color, linewidth=1.8, label="maximum intensity")
+        ax_aux.set_ylabel("Cumulative fraction within coordinate")
+        ax_aux.set_title("Sinusoidal coordinate accumulation")
+        ax_aux.legend(loc="best", frameon=True, framealpha=0.92)
+    ax_aux.set_xlabel(feature_label)
+    ax_aux.grid(True, alpha=0.2)
+    fig.suptitle(title, fontsize=15)
+    fig.savefig(path, dpi=260)
+    plt.close(fig)
+
+
 def load_surface_query_from_dir(surface_query_dir: Path) -> Tuple[np.ndarray, np.ndarray]:
     if not surface_query_dir.is_dir():
         raise FileNotFoundError(f"Representative VTK surface-query directory not found: {surface_query_dir}")
@@ -1539,15 +1610,18 @@ def write_csv(path: Path, rows: List[Dict[str, object]], fieldnames: List[str]) 
 
 
 def parse_shift_betas(text: str) -> List[float]:
-    betas = [float(x.strip()) for x in str(text).split(",") if x.strip()]
-    if not betas:
+    values = [float(x.strip()) for x in str(text).split(",") if x.strip()]
+    if not values:
         raise ValueError("Expected at least one beta in --shift-betas")
-    return betas
+    # Endpoint-only comparison: retain the requested range but never spend
+    # evaluation time on intermediate severities.
+    return sorted({float(min(values)), float(max(values))})
 
 
 def sine_mix_levels_from_shift_betas(shift_betas: Sequence[float]) -> List[float]:
-    n = max(len(shift_betas), 1)
-    return [float(x) for x in np.linspace(0.0, 0.5, num=n, dtype=np.float64)]
+    # Spatial remeshing tests use their defined [0, 1] mixture range and
+    # likewise evaluate only the two endpoints.
+    return [0.0, 1.0]
 
 
 def mode_display_name(mode_name: str) -> str:
@@ -1557,18 +1631,15 @@ def mode_display_name(mode_name: str) -> str:
     if beta_match:
         return f"inv-density beta={float(beta_match.group(1)):.2f}"
     shift_match = re.search(
-        r"ood_(sine_[xy]|radial_shell|z_end|corner_focus)_mix_([0-9]+\.[0-9]+)",
+        r"ood_(sine_[xy])_mix_([0-9]+\.[0-9]+)",
         mode_name,
     )
     if shift_match:
         shift_name = {
             "sine_x": "sine-x",
             "sine_y": "sine-y",
-            "radial_shell": "radial-shell",
-            "z_end": "z-end",
-            "corner_focus": "corner-focus",
         }[shift_match.group(1)]
-        return f"OOD {shift_name} mix={float(shift_match.group(2)):.2f}"
+        return f"{shift_name} intensity={float(shift_match.group(2)):.2f}"
     return mode_name
 
 
@@ -1580,7 +1651,7 @@ def is_zero_shift_mode(mode_name: str, eps: float = 1.0e-12) -> bool:
     if beta_match is not None:
         return abs(float(beta_match.group(1))) <= eps
     shift_match = re.search(
-        r"ood_(sine_[xy]|radial_shell|z_end|corner_focus)_mix_([0-9]+\.[0-9]+)",
+        r"ood_(sine_[xy])_mix_([0-9]+\.[0-9]+)",
         str(mode_name),
     )
     if shift_match is not None:
@@ -1647,17 +1718,14 @@ def mode_color(mode_name: str) -> str:
         }
         return palette.get(round(beta, 2), "#999999")
     shift_match = re.search(
-        r"ood_(sine_[xy]|radial_shell|z_end|corner_focus)_mix_([0-9]+\.[0-9]+)",
+        r"ood_(sine_[xy])_mix_([0-9]+\.[0-9]+)",
         mode_name,
     )
     if shift_match:
-        norm = min(max(float(shift_match.group(2)) / 0.5, 0.0), 1.0)
+        norm = min(max(float(shift_match.group(2)), 0.0), 1.0)
         cmap = {
             "sine_x": plt.cm.PuBu,
             "sine_y": plt.cm.YlOrBr,
-            "radial_shell": plt.cm.Greens,
-            "z_end": plt.cm.OrRd,
-            "corner_focus": plt.cm.Purples,
         }[shift_match.group(1)]
         return matplotlib.colors.to_hex(cmap(norm))
     return "#999999"
@@ -1806,7 +1874,7 @@ def maybe_apply_linechart_test_offset(
             positive_modes.append(mode_name)
             continue
         shift_match = re.search(
-            r"ood_(sine_[xy]|radial_shell|z_end|corner_focus)_mix_([0-9]+\.[0-9]+)",
+            r"ood_(sine_[xy])_mix_([0-9]+\.[0-9]+)",
             mode_name,
         )
         if shift_match and float(shift_match.group(2)) > 0.0:
@@ -1913,6 +1981,197 @@ def plot_delta_bars(
     ax.set_ylabel(metric_key)
     ax.set_title(title)
     fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+
+
+def plot_absolute_average_error_bars(
+    aggregate_rows: List[Dict[str, object]],
+    metric_key: str,
+    mode_name: str,
+    model_order: Sequence[str],
+    out_path: Path,
+    title: str,
+    show_std: bool = True,
+) -> None:
+    """Plot absolute aggregate error with the same family colors as curves.
+
+    ``combined_physics_rel_l2`` is the mean of the four physics quantities
+    (surface pressure, surface WSS magnitude, volume pressure, and volume
+    velocity magnitude). ``combined_global_rel_l2`` is the mean of the
+    surface-global and volume-global errors. SATLOSS variants keep their
+    vanilla family color and use a hatch to mirror their dash-dot curves.
+    """
+    row_map = {
+        (str(row["model_name"]), str(row["sampling_mode"])): row
+        for row in aggregate_rows
+    }
+    present_models = [
+        model_name
+        for model_name in model_order
+        if (model_name, mode_name) in row_map
+    ]
+    if not present_models:
+        return
+
+    means = [float(row_map[(model_name, mode_name)][metric_key]) for model_name in present_models]
+    stds = [
+        float(row_map[(model_name, mode_name)].get(f"{metric_key}_std", 0.0))
+        for model_name in present_models
+    ]
+    colors = []
+    hatches = []
+    for model_name in present_models:
+        color, linestyle = model_line_visuals(model_name)
+        colors.append(color)
+        hatches.append("///" if linestyle != "-" else "")
+
+    fig, ax = plt.subplots(figsize=(max(10.0, 1.25 * len(present_models)), 6.0), constrained_layout=True)
+    bars = ax.bar(
+        np.arange(len(present_models)),
+        means,
+        yerr=stds if show_std else None,
+        capsize=4,
+        color=colors,
+        edgecolor="black",
+        linewidth=0.6,
+        alpha=0.9,
+    )
+    for bar, hatch in zip(bars, hatches):
+        bar.set_hatch(hatch)
+    ax.set_xticks(np.arange(len(present_models)))
+    ax.set_xticklabels([MODEL_LABELS[model] for model in present_models], rotation=22, ha="right")
+    ax.set_ylabel(_metric_display_name(metric_key))
+    ax.set_yscale("log")
+    ax.set_title(title)
+    ax.legend(
+        handles=[
+            Patch(facecolor="#BDBDBD", edgecolor="black", label="Vanilla / solid"),
+            Patch(facecolor="#BDBDBD", edgecolor="black", hatch="///", label="SATLOSS / dash-dot"),
+        ],
+        loc="upper left",
+        fontsize=9,
+    )
+    fig.savefig(out_path, dpi=240)
+    plt.close(fig)
+
+
+def _vanilla_model_name(model_name: str) -> str:
+    match = re.match(
+        r"^(.*)_SATLOSS\d+(?:_(?:NOPM|FIXEDSUM|GRADNORM|CONFIG_FULL|CONFIG_LAYER))?$",
+        str(model_name),
+    )
+    return match.group(1) if match else str(model_name)
+
+
+def plot_endpoint_error_bars(
+    aggregate_rows: List[Dict[str, object]],
+    metric_key: str,
+    endpoint_modes: Sequence[str],
+    endpoint_labels: Sequence[str],
+    model_order: Sequence[str],
+    out_path: Path,
+    title: str,
+    show_std: bool = True,
+    log_scale: bool = True,
+) -> None:
+    """Plot two endpoint errors with vanilla-relative labels."""
+    if len(endpoint_modes) != 2 or len(endpoint_labels) != 2:
+        raise ValueError("Endpoint bar plots require exactly two modes and labels.")
+    row_map = {
+        (str(row["model_name"]), str(row["sampling_mode"])): row
+        for row in aggregate_rows
+    }
+    present_models = [
+        model_name
+        for model_name in model_order
+        if all((model_name, mode_name) in row_map for mode_name in endpoint_modes)
+    ]
+    if not present_models:
+        return
+
+    x = np.arange(len(present_models), dtype=np.float64)
+    width = 0.34
+    fig, ax = plt.subplots(figsize=(max(12.0, 1.55 * len(present_models)), 7.2), constrained_layout=True)
+    all_values: List[float] = []
+    for endpoint_idx, (mode_name, endpoint_label) in enumerate(zip(endpoint_modes, endpoint_labels)):
+        means = np.asarray(
+            [max(float(row_map[(model_name, mode_name)][metric_key]), 1.0e-12) for model_name in present_models],
+            dtype=np.float64,
+        )
+        stds = np.asarray(
+            [max(float(row_map[(model_name, mode_name)].get(f"{metric_key}_std", 0.0)), 0.0) for model_name in present_models],
+            dtype=np.float64,
+        )
+        # Error bars on a log scale must not extend below zero.
+        stds = np.minimum(stds, means * 0.8)
+        all_values.extend(means.tolist())
+        for model_idx, model_name in enumerate(present_models):
+            base_name = _vanilla_model_name(model_name)
+            baseline_row = row_map.get((base_name, endpoint_modes[0]))
+            baseline = float(baseline_row[metric_key]) if baseline_row is not None else math.nan
+            relative_pct = (
+                100.0 * (float(means[model_idx]) - baseline) / max(abs(baseline), 1.0e-12)
+                if np.isfinite(baseline)
+                else math.nan
+            )
+            independent_satloss = (
+                _INDEPENDENT_SATLOSS6_LINE_MODE
+                and model_name in INDEPENDENT_SATLOSS6_MODELS
+            )
+            color = (
+                INDEPENDENT_SATLOSS6_COLORS[model_name]
+                if independent_satloss
+                else LINE_MODEL_COLORS.get(base_name, MODEL_COLORS.get(model_name, "#777777"))
+            )
+            is_satloss = model_name != base_name
+            hatch = "///" if is_satloss else ""
+            alpha = 0.52 if endpoint_idx == 0 else 0.92
+            bar = ax.bar(
+                x[model_idx] + (endpoint_idx - 0.5) * width,
+                means[model_idx],
+                width=width,
+                yerr=stds[model_idx] if show_std else None,
+                capsize=4,
+                color=color,
+                edgecolor="black",
+                linewidth=0.65,
+                alpha=alpha,
+                hatch=hatch,
+            )[0]
+            label_text = "n/a" if not np.isfinite(relative_pct) else f"{relative_pct:+.1f}%"
+            ax.text(
+                bar.get_x() + bar.get_width() / 2.0,
+                means[model_idx] * 1.12,
+                label_text,
+                ha="center",
+                va="bottom",
+                rotation=90,
+                fontsize=8,
+                clip_on=False,
+            )
+
+    if log_scale:
+        ax.set_yscale("log")
+    ax.set_xticks(x)
+    ax.set_xticklabels([MODEL_LABELS[model_name] for model_name in present_models], rotation=24, ha="right")
+    scale_label = "log scale" if log_scale else "linear scale"
+    ax.set_ylabel(f"{_metric_display_name(metric_key)} ({scale_label})")
+    ax.set_title(title)
+    ax.grid(axis="y", which="both", alpha=0.2)
+    ax.legend(
+        handles=[
+            Patch(facecolor="#999999", edgecolor="black", alpha=0.52, label=endpoint_labels[0]),
+            Patch(facecolor="#999999", edgecolor="black", alpha=0.92, label=endpoint_labels[1]),
+            Patch(facecolor="#999999", edgecolor="black", hatch="///", label="SATLOSS variant"),
+            Patch(facecolor="none", edgecolor="none", label="Labels: % vs vanilla at minimum intensity"),
+        ],
+        loc="upper left",
+        fontsize=9,
+        framealpha=0.92,
+    )
+    if all_values:
+        ax.set_ylim(bottom=max(min(all_values) * 0.65, 1.0e-8))
+    fig.savefig(out_path, dpi=260)
     plt.close(fig)
 
 
@@ -2463,9 +2722,6 @@ def main():
     ood_shift_defs = [
         ("sine_y", "sinusoidal_axis_mixture_wor", "sine-y", {"axis": 1}),
         ("sine_x", "sinusoidal_axis_mixture_wor", "sine-x", {"axis": 0}),
-        ("radial_shell", "radial_shell_mixture_wor", "radial-shell", {}),
-        ("z_end", "axis_end_mixture_wor", "z-end", {"axis": 2}),
-        ("corner_focus", "corner_focus_mixture_wor", "corner-focus", {}),
     ]
     for shift_idx, (shift_name, shift_kind, shift_label, extra_info) in enumerate(ood_shift_defs):
         if shift_name not in active_shift_set:
@@ -2758,9 +3014,6 @@ def main():
         distribution_weights = {
             "sine_y": sinusoidal_axis_probabilities(surf_coords_full, axis=1),
             "sine_x": sinusoidal_axis_probabilities(surf_coords_full, axis=0),
-            "radial_shell": radial_shell_probabilities(surf_coords_full),
-            "z_end": axis_end_probabilities(surf_coords_full, axis=2),
-            "corner_focus": corner_focus_probabilities(surf_coords_full),
         }
         model_full_geo_log_density_by_name: Dict[str, torch.Tensor] = {}
         for model_name, spec in model_specs.items():
@@ -2825,9 +3078,6 @@ def main():
                         )
                     elif mode_info["kind"] in {
                         "sinusoidal_axis_mixture_wor",
-                        "radial_shell_mixture_wor",
-                        "axis_end_mixture_wor",
-                        "corner_focus_mixture_wor",
                     }:
                         target_weights = distribution_weights[str(mode_info["distribution_key"])]
                         if input_sampling_with_replacement:
@@ -2895,9 +3145,6 @@ def main():
                     if model_name in DRAG_RANK_MODELS and mode_info["kind"] in {
                         "inverse_density_wor",
                         "sinusoidal_axis_mixture_wor",
-                        "radial_shell_mixture_wor",
-                        "axis_end_mixture_wor",
-                        "corner_focus_mixture_wor",
                     }:
                         full_pred_surf_batch, _ = predict_view_batch(
                             model_name=model_name,
@@ -3165,24 +3412,9 @@ def main():
         mode_name for mode_name, mode_info in mode_defs.items()
         if mode_info["kind"] == "sinusoidal_axis_mixture_wor" and mode_info["distribution_key"] == "sine_x"
     ]
-    radial_mode_order = [
-        mode_name for mode_name, mode_info in mode_defs.items()
-        if mode_info["kind"] == "radial_shell_mixture_wor"
-    ]
-    z_end_mode_order = [
-        mode_name for mode_name, mode_info in mode_defs.items()
-        if mode_info["kind"] == "axis_end_mixture_wor"
-    ]
-    corner_mode_order = [
-        mode_name for mode_name, mode_info in mode_defs.items()
-        if mode_info["kind"] == "corner_focus_mixture_wor"
-    ]
     sine_mode_order = sine_y_mode_order
     sine_mode_xs = [float(mode_defs[mode_name]["mix_fraction"]) for mode_name in sine_mode_order]
     sine_x_mode_xs = [float(mode_defs[mode_name]["mix_fraction"]) for mode_name in sine_x_mode_order]
-    radial_mode_xs = [float(mode_defs[mode_name]["mix_fraction"]) for mode_name in radial_mode_order]
-    z_end_mode_xs = [float(mode_defs[mode_name]["mix_fraction"]) for mode_name in z_end_mode_order]
-    corner_mode_xs = [float(mode_defs[mode_name]["mix_fraction"]) for mode_name in corner_mode_order]
     # Keep the legacy plot-job construction safe when a user disables beta or
     # sine-y. Those jobs are filtered below, but their argument lists still
     # need a harmless aligned fallback so they do not index an empty list.
@@ -3190,6 +3422,17 @@ def main():
     beta_plot_xs = beta_mode_xs or [0.0]
     sine_plot_order = sine_mode_order or ["aligned_uniform_wor"]
     sine_plot_xs = sine_mode_xs or [0.0]
+    endpoint_bar_specs = []
+    if len(beta_mode_order) == 2:
+        endpoint_bar_specs.append(("beta", beta_mode_order, ("beta=0", "beta=1")))
+    if len(sine_y_mode_order) == 2:
+        endpoint_bar_specs.append(
+            ("sine_y", sine_y_mode_order, tuple(f"sine-y={value:.2f}" for value in sine_mode_xs))
+        )
+    if len(sine_x_mode_order) == 2:
+        endpoint_bar_specs.append(
+            ("sine_x", sine_x_mode_order, tuple(f"sine-x={value:.2f}" for value in sine_x_mode_xs))
+        )
     plot_jobs = [
         (plot_density_shift_bars, (per_view_rows, out_root / "density_shift_validation.png", "Subset density-shift validation")),
         (plot_delta_bars, (run_delta_rows, "combined_physics_delta", out_root / "combined_physics_degradation_bars_all_models.png", f"Per-run degradation under strongest shift ({strongest_mode})")),
@@ -3286,7 +3529,7 @@ def main():
                         family_sine_curve_rows,
                         "combined_physics_rel_l2",
                         out_root / f"{family_key}_combined_physics_sine_y_curve.png",
-                        f"{family_title}: sinusoidal-y severity curve (combined physics)",
+                        f"{family_title}: sinusoidal-y intensity (combined physics)",
                         family_models,
                         sine_mode_order,
                         sine_mode_xs,
@@ -3299,7 +3542,7 @@ def main():
                         family_sine_curve_rows,
                         "combined_global_rel_l2",
                         out_root / f"{family_key}_combined_global_sine_y_curve.png",
-                        f"{family_title}: sinusoidal-y severity curve (combined global)",
+                        f"{family_title}: sinusoidal-y intensity (combined global)",
                         family_models,
                         sine_mode_order,
                         sine_mode_xs,
@@ -3357,7 +3600,7 @@ def main():
                         sine_mode_order,
                         sine_mode_xs,
                         out_root / f"{family_key}_combined_physics_percentage_worsening_sine.png",
-                        f"{family_title}: percentage worsening versus sine shift",
+                        f"{family_title}: percentage worsening versus sinusoidal-y intensity",
                         "Sinusoidal-y intensity",
                         True,
                     ),
@@ -3385,7 +3628,7 @@ def main():
                         sine_mode_order,
                         sine_mode_xs,
                         out_root / f"{family_key}_combined_physics_percentage_worsening_sine_mean_only.png",
-                        f"{family_title}: percentage worsening versus sine shift (mean only)",
+                        f"{family_title}: percentage worsening versus sinusoidal-y intensity (mean only)",
                         "Sinusoidal-y intensity",
                         False,
                     ),
@@ -3481,7 +3724,7 @@ def main():
                     (
                         family_sine_curve_rows, "combined_physics_rel_l2",
                         out_root / f"{family_key}_combined_physics_sine_y_curve_mean_only.png",
-                        f"{family_title}: sine-y severity curve (mean only)", family_models,
+                        f"{family_title}: sinusoidal-y intensity (mean only)", family_models,
                         sine_mode_order, sine_mode_xs, "Sinusoidal-y intensity", False,
                     ),
                 ),
@@ -3569,14 +3812,43 @@ def main():
             ]
         )
 
+    # Add absolute aggregate-error bars alongside the relative-worsening
+    # figures.  These are deliberately based on combined metrics rather than
+    # individual fields, so the plots answer both "how bad is the error?" and
+    # "how much did it worsen?".
+    absolute_bar_metrics = (("combined_global_rel_l2", "combined_global"),)
+    absolute_bar_modes = (
+        ("aligned_uniform_wor", "aligned"),
+        (strongest_mode, "strongest_shift"),
+    )
+    for family_key, family_models in FAMILY_GROUPS.items():
+        family_models = [m for m in family_models if m in model_specs]
+        if not family_models:
+            continue
+        family_title = " vs ".join(MODEL_LABELS[m] for m in family_models)
+        family_aggregate_rows = [r for r in aggregate_rows if r["model_name"] in family_models]
+        for metric_key, metric_slug in absolute_bar_metrics:
+            for mode_name, mode_slug in absolute_bar_modes:
+                plot_jobs.append(
+                    (
+                        plot_absolute_average_error_bars,
+                        (
+                            family_aggregate_rows,
+                            metric_key,
+                            mode_name,
+                            family_models,
+                            out_root / f"{family_key}_{metric_slug}_absolute_error_{mode_slug}_bars.png",
+                            f"{family_title}: {metric_slug.replace('_', ' ')} absolute error ({mode_slug.replace('_', ' ')})",
+                            True,
+                        ),
+                    )
+                )
+
     # Mirror the dedicated shift plots inside each active family.  The mode
     # grids above contain every active mode, while these curves and heatmaps
     # keep the new shifts comparable to the historical beta/sine plots.
     family_extra_shift_plot_groups = [
         ("sine_x", sine_x_mode_order, sine_x_mode_xs, "Sinusoidal-x intensity"),
-        ("radial_shell", radial_mode_order, radial_mode_xs, "Radial-shell intensity"),
-        ("z_end", z_end_mode_order, z_end_mode_xs, "Z-end intensity"),
-        ("corner_focus", corner_mode_order, corner_mode_xs, "Corner-focus intensity"),
     ]
     for family_key, family_models in FAMILY_GROUPS.items():
         family_models = [m for m in family_models if m in model_specs]
@@ -3706,8 +3978,34 @@ def main():
                 ]
             )
 
-    # One all-model view complements the family-specific figures. It is
-    # intentionally generated only for headline metrics to remain readable.
+    # Endpoint bars replace two-point severity curves.  Labels are signed
+    # relative errors against the vanilla model at minimum intensity.
+    for family_key, family_models in FAMILY_GROUPS.items():
+        family_models = [m for m in family_models if m in model_specs]
+        if not family_models:
+            continue
+        family_title = " vs ".join(MODEL_LABELS[m] for m in family_models)
+        family_aggregate_rows = [r for r in aggregate_rows if r["model_name"] in family_models]
+        for shift_slug, shift_modes, shift_labels in endpoint_bar_specs:
+            for metric_key, metric_slug in absolute_bar_metrics:
+                plot_jobs.append(
+                    (
+                        plot_endpoint_error_bars,
+                        (
+                            family_aggregate_rows,
+                            metric_key,
+                            shift_modes,
+                            shift_labels,
+                            family_models,
+                            out_root / f"{family_key}_{metric_slug}_endpoint_bars_{shift_slug}_log.png",
+                            f"{family_title}: {metric_slug.replace('_', ' ')} endpoint error ({shift_slug})",
+                            True,
+                        ),
+                    )
+                )
+
+    # The rendered comparison is intentionally limited to one all-model view
+    # with aggregate metrics so the endpoint figures remain readable.
     all_models = [m for m in MODEL_ORDER if m in model_specs]
     all_rows = [r for r in per_run_mode_rows if r["model_name"] in all_models]
     all_aggregate_rows = [r for r in aggregate_rows if r["model_name"] in all_models]
@@ -3734,8 +4032,8 @@ def main():
             (plot_metric_grid, (all_rows, VOLUME_FIELD_METRIC_KEYS, mode_order, all_models, out_root / "all_models_volume_fields_by_mode_mean_only.png", "All compared models: volume fields by mode (mean only)", 2, False)),
             (plot_numeric_mode_curve_with_band, (all_beta_rows, "combined_physics_rel_l2", out_root / "all_models_combined_physics_beta_curve.png", "All compared models: beta severity curve", all_models, beta_mode_order, beta_mode_xs, "Inverse-density beta", True)),
             (plot_numeric_mode_curve_with_band, (all_beta_rows, "combined_physics_rel_l2", out_root / "all_models_combined_physics_beta_curve_mean_only.png", "All compared models: beta severity curve (mean only)", all_models, beta_mode_order, beta_mode_xs, "Inverse-density beta", False)),
-            (plot_numeric_mode_curve_with_band, (all_sine_rows, "combined_physics_rel_l2", out_root / "all_models_combined_physics_sine_y_curve.png", "All compared models: sinusoidal-y severity curve", all_models, sine_mode_order, sine_mode_xs, "Sinusoidal-y intensity", True)),
-            (plot_numeric_mode_curve_with_band, (all_sine_rows, "combined_physics_rel_l2", out_root / "all_models_combined_physics_sine_y_curve_mean_only.png", "All compared models: sinusoidal-y severity curve (mean only)", all_models, sine_mode_order, sine_mode_xs, "Sinusoidal-y intensity", False)),
+            (plot_numeric_mode_curve_with_band, (all_sine_rows, "combined_physics_rel_l2", out_root / "all_models_combined_physics_sine_y_curve.png", "All compared models: sinusoidal-y intensity", all_models, sine_mode_order, sine_mode_xs, "Sinusoidal-y intensity", True)),
+            (plot_numeric_mode_curve_with_band, (all_sine_rows, "combined_physics_rel_l2", out_root / "all_models_combined_physics_sine_y_curve_mean_only.png", "All compared models: sinusoidal-y intensity (mean only)", all_models, sine_mode_order, sine_mode_xs, "Sinusoidal-y intensity", False)),
             (plot_delta_bars, (run_delta_rows, "combined_physics_delta", out_root / "all_models_combined_physics_degradation_bars_mean_only.png", f"All compared models: strongest-shift degradation (mean only)", False)),
             (plot_delta_bars, (run_delta_rows, "combined_physics_delta", out_root / "all_models_combined_physics_degradation_bars.png", f"All compared models: strongest-shift degradation", True)),
             (plot_comprehensive_dashboard, (all_rows, all_models, mode_order, out_root / "all_models_comprehensive_dashboard.png", "All compared models: dashboard", True)),
@@ -3747,19 +4045,39 @@ def main():
             (plot_delta_severity_curve, (aggregate_rows, "combined_physics_rel_l2", all_models, beta_mode_order, beta_mode_xs, out_root / "all_models_combined_physics_delta_vs_beta.png", "All compared models: degradation versus beta", True)),
             (plot_delta_severity_curve, (aggregate_rows, "combined_physics_rel_l2", all_models, beta_mode_order, beta_mode_xs, out_root / "all_models_combined_physics_delta_vs_beta_mean_only.png", "All compared models: degradation versus beta (mean only)", False)),
             (plot_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", all_models, beta_mode_order, beta_mode_xs, out_root / "all_models_combined_physics_percentage_worsening_beta.png", "All compared models: percentage worsening versus beta", "Inverse-density beta", True)),
-            (plot_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", all_models, sine_mode_order, sine_mode_xs, out_root / "all_models_combined_physics_percentage_worsening_sine.png", "All compared models: percentage worsening versus sine shift", "Sinusoidal-y intensity", True)),
+            (plot_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", all_models, sine_mode_order, sine_mode_xs, out_root / "all_models_combined_physics_percentage_worsening_sine.png", "All compared models: percentage worsening versus sinusoidal-y intensity", "Sinusoidal-y intensity", True)),
             (plot_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", all_models, beta_mode_order, beta_mode_xs, out_root / "all_models_combined_physics_percentage_worsening_beta_mean_only.png", "All compared models: percentage worsening versus beta (mean only)", "Inverse-density beta", False)),
-            (plot_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", all_models, sine_mode_order, sine_mode_xs, out_root / "all_models_combined_physics_percentage_worsening_sine_mean_only.png", "All compared models: percentage worsening versus sine shift (mean only)", "Sinusoidal-y intensity", False)),
+            (plot_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", all_models, sine_mode_order, sine_mode_xs, out_root / "all_models_combined_physics_percentage_worsening_sine_mean_only.png", "All compared models: percentage worsening versus sinusoidal-y intensity (mean only)", "Sinusoidal-y intensity", False)),
             (plot_percentage_degradation_heatmap, (all_percentage_rows, "combined_physics_rel_l2", all_models, beta_mode_order, out_root / "all_models_combined_physics_percentage_worsening_beta_heatmap.png", "All compared models: percentage worsening beta heatmap")),
             (plot_percentage_degradation_heatmap, (all_percentage_rows, "combined_physics_rel_l2", all_models, sine_mode_order, out_root / "all_models_combined_physics_percentage_worsening_sine_heatmap.png", "All compared models: percentage worsening sine heatmap")),
             (plot_percentage_degradation_bars, (all_percentage_rows, "combined_physics_rel_l2", beta_plot_order[-1], all_models, out_root / "all_models_combined_physics_percentage_worsening_beta_max_bars.png", f"All compared models: percentage worsening at beta={beta_plot_xs[-1]:.2f}", True)),
             (plot_percentage_degradation_bars, (all_percentage_rows, "combined_physics_rel_l2", sine_plot_order[-1], all_models, out_root / "all_models_combined_physics_percentage_worsening_sine_max_bars.png", f"All compared models: percentage worsening at sine={sine_plot_xs[-1]:.2f}", True)),
             (plot_family_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", FAMILY_GROUPS, all_models, beta_mode_order, beta_mode_xs, out_root / "all_families_combined_physics_percentage_worsening_beta.png", "Between families: percentage worsening versus beta", "Inverse-density beta", True)),
-            (plot_family_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", FAMILY_GROUPS, all_models, sine_mode_order, sine_mode_xs, out_root / "all_families_combined_physics_percentage_worsening_sine.png", "Between families: percentage worsening versus sine shift", "Sinusoidal-y intensity", True)),
+            (plot_family_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", FAMILY_GROUPS, all_models, sine_mode_order, sine_mode_xs, out_root / "all_families_combined_physics_percentage_worsening_sine.png", "Between families: percentage worsening versus sinusoidal-y intensity", "Sinusoidal-y intensity", True)),
             (plot_family_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", FAMILY_GROUPS, all_models, beta_mode_order, beta_mode_xs, out_root / "all_families_combined_physics_percentage_worsening_beta_mean_only.png", "Between families: percentage worsening versus beta (mean only)", "Inverse-density beta", False)),
-            (plot_family_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", FAMILY_GROUPS, all_models, sine_mode_order, sine_mode_xs, out_root / "all_families_combined_physics_percentage_worsening_sine_mean_only.png", "Between families: percentage worsening versus sine shift (mean only)", "Sinusoidal-y intensity", False)),
+            (plot_family_percentage_degradation_curve, (all_percentage_rows, "combined_physics_rel_l2", FAMILY_GROUPS, all_models, sine_mode_order, sine_mode_xs, out_root / "all_families_combined_physics_percentage_worsening_sine_mean_only.png", "Between families: percentage worsening versus sinusoidal-y intensity (mean only)", "Sinusoidal-y intensity", False)),
         ]
     )
+
+    for shift_slug, shift_modes, shift_labels in endpoint_bar_specs:
+        for metric_key, metric_slug in absolute_bar_metrics:
+            for log_scale, scale_slug in ((True, "log"), (False, "linear")):
+                plot_jobs.append(
+                    (
+                        plot_endpoint_error_bars,
+                        (
+                            all_aggregate_rows,
+                            metric_key,
+                            shift_modes,
+                            shift_labels,
+                            all_models,
+                            out_root / f"all_models_{metric_slug}_endpoint_bars_{shift_slug}_{scale_slug}.png",
+                            f"All compared models: {metric_slug.replace('_', ' ')} endpoint error ({shift_slug}, {scale_slug} scale)",
+                            True,
+                            log_scale,
+                        ),
+                    )
+                )
 
     # Add dedicated all-model curves for every non-beta distribution shift.
     # The general mode grids already include these modes, but separate curves
@@ -3767,9 +4085,6 @@ def main():
     # existing beta and sine-y plots.
     extra_shift_plot_groups = [
         ("sine_x", sine_x_mode_order, sine_x_mode_xs, "Sinusoidal-x intensity"),
-        ("radial_shell", radial_mode_order, radial_mode_xs, "Radial-shell intensity"),
-        ("z_end", z_end_mode_order, z_end_mode_xs, "Z-end intensity"),
-        ("corner_focus", corner_mode_order, corner_mode_xs, "Corner-focus intensity"),
     ]
     for shift_slug, shift_modes, shift_xs, shift_label in extra_shift_plot_groups:
         if not shift_modes:
@@ -3974,9 +4289,6 @@ def main():
             )
         drag_extra_groups = [
             ("sine_x", sine_x_mode_order, "sine-x"),
-            ("radial_shell", radial_mode_order, "radial-shell"),
-            ("z_end", z_end_mode_order, "z-end"),
-            ("corner_focus", corner_mode_order, "corner-focus"),
         ]
         for shift_slug, mode_order_for_shift, shift_label in drag_extra_groups:
             for mode_name in mode_order_for_shift:
@@ -3997,10 +4309,37 @@ def main():
                 )
 
     def keep_plot_job(job) -> bool:
-        """Drop legacy shift-specific plots whose shift was disabled."""
+        """Keep only all-model aggregate plots and distribution diagnostics."""
         _func, func_args = job
         output_names = [arg.name for arg in func_args if isinstance(arg, Path)]
         output_name = " ".join(output_names)
+
+        # The metric CSVs still retain field-level values for auditability,
+        # but the rendered comparison should contain only aggregate metrics.
+        # Family-specific figures are intentionally omitted because the user
+        # requested one cross-model comparison view.
+        is_all_model_combined_plot = "all_models_combined_global_" in output_name
+        is_density_diagnostic = "density_shift_validation.png" in output_name
+        if not (is_all_model_combined_plot or is_density_diagnostic):
+            return False
+
+        # There are only two severities, so line charts and dedicated
+        # worsening figures add visual noise.  The endpoint bar plots carry
+        # the signed percentage labels instead.
+        if _func.__name__ in {
+            "plot_numeric_mode_curve_with_band",
+            "plot_ranked_curve_with_band",
+            "plot_delta_bars",
+            "plot_delta_severity_curve",
+            "plot_percentage_degradation_curve",
+            "plot_percentage_degradation_heatmap",
+            "plot_percentage_degradation_bars",
+            "plot_family_percentage_degradation_curve",
+            "plot_paired_statistics",
+        }:
+            return False
+        if _func.__name__ == "plot_metric_heatmap":
+            return False
         if "beta" not in active_shift_set and "beta" in output_name:
             return False
         if "sine_y" not in active_shift_set and (
@@ -4009,6 +4348,8 @@ def main():
             or ("worsening_sine_" in output_name and "sine_x" not in output_name)
             or "ranked_sine_" in output_name
         ):
+            return False
+        if "sine_x" not in active_shift_set and "sine_x" in output_name:
             return False
         return True
 
@@ -4048,9 +4389,6 @@ def main():
     sampling_distribution_weights = {
         "sine_y": sinusoidal_axis_probabilities(sampling_input_surf_coords, axis=1),
         "sine_x": sinusoidal_axis_probabilities(sampling_input_surf_coords, axis=0),
-        "radial_shell": radial_shell_probabilities(sampling_input_surf_coords),
-        "z_end": axis_end_probabilities(sampling_input_surf_coords, axis=2),
-        "corner_focus": corner_focus_probabilities(sampling_input_surf_coords),
     }
 
     gt_pressure = np.asarray(rep_surf_gt_full[:, 0], dtype=np.float32)
@@ -4293,13 +4631,15 @@ def main():
         (
             ("sine_y", 1, "y"),
             ("sine_x", 0, "x"),
-            ("radial_shell", None, "radial"),
-            ("z_end", 2, "z"),
-            ("corner_focus", None, "corner"),
         )
     ):
         if shift_name not in active_shift_set:
             continue
+        shift_feature_values, shift_weights, shift_feature_label = _spatial_shift_feature_values(
+            sampling_input_surf_coords,
+            shift_name,
+        )
+        endpoint_sampled_points: Dict[float, np.ndarray] = {}
         for mix_fraction in sine_mix_levels:
             sampling_rng = np.random.default_rng(
                 np.random.SeedSequence(
@@ -4313,10 +4653,19 @@ def main():
                 sampling_rng,
             )
             sampled_points = sampling_input_surf_coords[sample_idx]
+            endpoint_sampled_points[float(mix_fraction)] = sampled_points
             sample_vtk_path = out_root / (
                 f"drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_ood_{shift_name}_mix_{float(mix_fraction):.2f}.vtk"
             )
-            write_polydata_vtk(sample_vtk_path, sampled_points, {})
+            write_polydata_vtk(
+                sample_vtk_path,
+                sampled_points,
+                {
+                    "shift_intensity": np.full((sampled_points.shape[0],), float(mix_fraction), dtype=np.float32),
+                    "shift_feature_value": shift_feature_values[sample_idx].astype(np.float32, copy=False),
+                    "shift_probability_weight": shift_weights[sample_idx].astype(np.float32, copy=False),
+                },
+            )
             sampling_vtk_paths.append(str(sample_vtk_path))
             if coordinate_axis is not None:
                 sample_hist_path = out_root / (
@@ -4335,6 +4684,21 @@ def main():
                     coordinate_name=coordinate_label,
                 )
                 sampling_histogram_paths.append(str(sample_hist_path))
+
+        endpoint_plot_path = out_root / (
+            f"drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_ood_{shift_name}_endpoint_distribution.png"
+        )
+        save_spatial_shift_endpoint_plot(
+            endpoint_plot_path,
+            shift_name,
+            sampling_input_surf_coords,
+            endpoint_sampled_points,
+            title=(
+                f"Run {vtk_run_id}: {SHIFT_LABELS[shift_name]}\n"
+                f"endpoint comparison (zero vs maximum intensity, feature={shift_feature_label})"
+            ),
+        )
+        sampling_histogram_paths.append(str(endpoint_plot_path))
 
     payload = {
         "args": vars(args),
@@ -4355,12 +4719,7 @@ def main():
             "active_shifts": active_shifts,
             "ood_modes": [
                 name for name, info in mode_defs.items()
-                if info["kind"] in {
-                    "sinusoidal_axis_mixture_wor",
-                    "radial_shell_mixture_wor",
-                    "axis_end_mixture_wor",
-                    "corner_focus_mixture_wor",
-                }
+                if info["kind"] == "sinusoidal_axis_mixture_wor"
             ],
             "ood_sine_axes": ["x", "y"],
             "ood_sine_mix_levels": sine_mix_levels,
@@ -4414,8 +4773,8 @@ def main():
         "- The aligned mode mirrors each model's training-time top-level geometry sampler and preserves its own encoder input budget unless you explicitly override `--input-points`; the dataset default uses uniform sampling with replacement for unseeded sub-budget geometry views.",
         f"- Beta-shift modes use inverse-density sampling without replacement at betas `{shift_betas}` and keep the same point budget.",
         f"- Sampling shifts are computed with the requested CLI density estimator `{density_estimator}`, but density-aware models receive density tensors from their own training config when available.",
-        "- Additional out-of-distribution modes use controlled mixtures of uniform sampling with sinusoidal-x, sinusoidal-y, radial-shell, z-end, and corner-focus spatial probability fields. They keep the same point budget and do not mask or delete a region.",
-        "- Each spatial-shift intensity runs from `0.0` to `0.5` and uses the same number of severity steps as `--shift-betas`.",
+        "- Spatial modes use controlled mixtures of uniform sampling with the restored sinusoidal-x/y fields. They keep the same point budget and do not mask or delete a region.",
+        "- Each remeshing intensity is evaluated only at the two endpoints `0.0` and `1.0`; intermediate intensities are intentionally not sampled.",
         "- For every OOD mixture severity `s`, the sampler takes exactly `round(s * K)` points from the shifted probability field and the remaining points uniformly from the leftover pool, so the severity has an exact point-count interpretation.",
         "- If `beta=0` is included in the shifted list, it acts as a uniform-without-replacement sanity-check mode and should match the aligned mode up to sampling randomness.",
         "- Internal model behavior is not overridden beyond safe batched-query chunking. In particular, each model keeps its own trained latent-anchor logic and encoder-block 16k subsampling behavior.",
@@ -4433,8 +4792,10 @@ def main():
         "- If a model still cannot complete the full-Audi visualization export safely, it is skipped only for this VTK step and recorded in the results payload.",
         f"- Surface-query directory for the Audi pressure-field export: `{vtk_surface_query_dir}`",
         f"- Separate point-cloud VTKs are exported from DrivAerML test run `{vtk_run_id}` for each active inverse-density beta and spatial-distribution mode, using the largest active encoder budget `{sampling_budget}` so you can directly inspect each representative input distribution.",
+        "- Each spatial-shift VTK stores the endpoint intensity, the shift-specific diagnostic coordinate, and the unnormalized spatial probability weight for every sampled point.",
         "- Each inverse-density beta sampled-point VTK also gets a separate PNG histogram of the sampled density distribution, with a log-count y-axis and no percentile trimming.",
-        "- Each sine-x/sine-y sampled-point VTK gets a coordinate-distribution histogram; radial-shell and z-end shifts receive sampled-point VTKs without masking.",
+        "- Each sinusoidal-x/y sampled-point VTK gets a coordinate-distribution histogram and endpoint distribution plot.",
+        f"- Each active spatial shift also gets `{sampling_budget}`-point endpoint distribution plots comparing intensity `0.0` with `1.0` using a shift-specific PDF and accumulation diagnostic.",
         "",
         "## Aggregation",
         "- First aggregate multiple independently sampled views within each `(run, model, mode)` tuple.",
@@ -4459,20 +4820,15 @@ def main():
         "- `aggregate_metrics.csv`: across-run means/stds for every model and sampling mode.",
         "- `robustness_summary.csv`: strongest-shift robustness summary.",
         "- `paired_statistics.csv`: paired run-level deltas, quantiles, 95% CIs, and normal-approximation p-values.",
-        "- `*_mean_only.png`: central-value plots without standard-deviation whiskers/bands.",
-        "- The corresponding non-`mean_only` plots visualize across-run/view standard deviations.",
-        "- `*_paired_statistics_*.png`: paired effect-size plots with 95% confidence intervals.",
-        "- `*_heatmap.png`: model-by-sampling-mode error heatmaps.",
-        "- `*_ratio_heatmap.png`: model-by-sampling-mode ratios relative to aligned sampling.",
-        "- `*_distribution_boxplot.png`: per-run error distributions at the strongest shift.",
-        "- `*_delta_vs_beta.png`: degradation relative to aligned sampling across beta severity.",
+        "- Rendered model-error PNGs are limited to all-model `combined_global` aggregate comparisons.",
+        "- Combined-global endpoint bars use a log y-axis, standard-deviation whiskers, and signed percentage labels versus the vanilla minimum-intensity error.",
+        "- Field-level values remain available in the CSV files, but their plots and all family-specific plots are intentionally omitted.",
         "- `audi_surface_pressure_predictions.vtk`: full Audi surface pressure ground truth plus every active model's pressure prediction and per-point error fields.",
         "- `results.json`: machine-readable summary including any representative-VTK model skips.",
-        "- `smart_family_surface_drag_force_x_ranked_beta_*.png`: full-surface drag curves for SMART, SMART-SATLOSS3, and SMART-SATLOSS5, sorted by ground-truth drag within each beta mode.",
-        "- `smart_family_surface_drag_force_x_ranked_sine_*.png`: full-surface drag curves for SMART, SMART-SATLOSS3, and SMART-SATLOSS5, sorted by ground-truth drag within each sine-y mode.",
         f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_*.vtk`: sampled `{sampling_budget}` input points for each inverse-density beta from one evaluated DrivAerML test run.",
         f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_*_density_hist.png`: density-distribution histogram for each sampled input-point VTK.",
         f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_ood_sine_[xy]_mix_*_[xy]_hist.png`: coordinate histograms for the sine-x and sine-y sampled input-point VTKs.",
+        f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_ood_*_endpoint_distribution.png`: endpoint distribution plots for every active spatial shift.",
     ]
     )
     (out_root / "workflow.md").write_text("\n".join(workflow_lines), encoding="utf-8")
@@ -4488,7 +4844,7 @@ def main():
         f"- Strongest shift mode: `{strongest_mode}`",
         f"- Shift betas: `{shift_betas}`",
         f"- Active sampling shifts: `{active_shifts}`",
-        f"- OOD sampling modes: progressive uniform-to-sine-x, sine-y, radial-shell, z-end, and corner-focus mixtures, with severities `{sine_mix_levels}`",
+        f"- OOD sampling modes: endpoint-only uniform-to-sinusoidal-x/y mixtures, with intensities `{sine_mix_levels}`",
         f"- Fixed benchmark query subsets per run: `{surface_query_points}` surface + `{volume_query_points}` volume",
         "- SMART-family drag plots are sorted by full-surface ground-truth drag instead of severity to reduce visual noise.",
         f"- Representative VTK surface query source: `{vtk_surface_query_dir}`",

@@ -1,0 +1,44 @@
+defaults:
+  - drivaerml_satloss6
+  - _self_
+
+experiment:
+  name: "DrivAerML_SMART_SATLOSS7"
+  model_name: "SMART_SATLOSS7"
+  model_tag: ""
+  epochs: 150
+
+  # SATLOSS7 is intentionally weight-only initialized from SATLOSS6. The
+  # optimizer, scheduler, AMP scaler, and task-weight state start fresh.
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False
+
+  # Keep the full preprocessed cloud as the source and use the same two
+  # 131K view budgets as SATLOSS6. The source cloud is larger than 131K, so
+  # beta/sine shifts remain effective without changing the fair input budget.
+  num_body_points: 0
+  view_geometry_points: 131072
+  eval_view_geometry_points: 131072
+  shared_shift_view_geometry_points: 131072
+  train_shared_shift_sampling_mode: "random_beta_sine"
+  shared_shift_family_probabilities: [0.3333333333, 0.3333333333, 0.3333333334]
+  shared_shift_beta_min: 0.0
+  shared_shift_beta_max: 1.0
+  shared_shift_sine_min: 0.0
+  shared_shift_sine_max: 1.0
+
+  # The two supervised view losses and symmetric prediction matching are the
+  # only terms used by the default SATLOSS7 objective.
+  use_prediction_consistency: True
+  prediction_consistency_weight: 1.0
+  prediction_consistency_smooth_l1_beta: 0.1
+  prediction_consistency_symmetric_detached: True
+  prediction_consistency_average_groups: True
+  consistency_warmup_epochs: 0
+  fuse_consistency_views: True
+
+  task_weighting_method: "fixed_sum"
+  config_task_base_weights: [0.2, 0.2, 0.6]
+  fixed_sum_use_view_losses: True
+  use_learned_task_weighting: False

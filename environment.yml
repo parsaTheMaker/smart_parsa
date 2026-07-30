@@ -24,6 +24,7 @@ dependencies:
   - openssl=3.5.1=h7b32b05_0
   - pip=25.1.1=pyh8b19718_0
   - python=3.11.12=h9e4cc4f_0_cpython
+  - numpy=2.1.2
   - readline=8.2=h8c095d6_2
   - setuptools=80.9.0=pyhff2d567_0
   - tk=8.6.13=noxft_hd72426e_102
@@ -71,7 +72,6 @@ dependencies:
       - multidict==6.6.3
       - narwhals==2.5.0
       - networkx==3.3
-      - numpy==2.1.2
       - nvidia-cublas-cu12==12.4.5.8
       - nvidia-cuda-cupti-cu12==12.4.127
       - nvidia-cuda-nvrtc-cu12==12.4.127
@@ -103,6 +103,7 @@ dependencies:
       - pysocks==1.7.1
       - python-dateutil==2.9.0.post0
       - pyvista==0.45.2
+      - pyacvd==0.4.0
       - pyyaml==6.0.2
       - requests==2.32.4
       - rotary-embedding-torch==0.9.1

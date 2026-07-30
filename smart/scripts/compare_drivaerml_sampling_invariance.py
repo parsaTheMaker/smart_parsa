@@ -31,7 +31,7 @@ import sys
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Sequence, Tuple
 
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-codex")
 
@@ -106,19 +106,25 @@ MODEL_ORDER = [
     "SMART_SATLOSS6_GRADNORM",
     "SMART_SATLOSS6_CONFIG_FULL",
     "SMART_SATLOSS6_CONFIG_LAYER",
+    "SMART_SATLOSS7",
     "TRANSOLVERPP",
     "TRANSOLVERPP_SATLOSS3",
     "TRANSOLVERPP_SATLOSS6",
+    "TRANSOLVERPP_SATLOSS7",
     "POINTNET2_SSG",
     "POINTNET2_SSG_SATLOSS6",
+    "POINTNET2_SSG_SATLOSS7",
     "POINT_GNN",
     "POINT_GNN_SATLOSS6",
     "LNO",
     "LNO_SATLOSS6",
+    "LNO_SATLOSS7",
     "MSPT",
     "MSPT_SATLOSS6",
+    "MSPT_SATLOSS7",
     "POINT_TRANSFORMER_V3",
     "POINT_TRANSFORMER_V3_SATLOSS6",
+    "POINT_TRANSFORMER_V3_SATLOSS7",
 ]
 MODEL_LABELS = {
     "SMART": "SMART",
@@ -134,19 +140,25 @@ MODEL_LABELS = {
     "SMART_SATLOSS6_GRADNORM": "SMART-SATLOSS6-GRADNORM",
     "SMART_SATLOSS6_CONFIG_FULL": "SMART-SATLOSS6-ConFIG-FULL",
     "SMART_SATLOSS6_CONFIG_LAYER": "SMART-SATLOSS6-ConFIG-LAYER",
+    "SMART_SATLOSS7": "SMART-SATLOSS",
     "TRANSOLVERPP": "TransolverPP",
     "TRANSOLVERPP_SATLOSS3": "TransolverPP-SATLOSS3",
     "TRANSOLVERPP_SATLOSS6": "TransolverPP-SATLOSS6",
+    "TRANSOLVERPP_SATLOSS7": "TransolverPP-SATLOSS",
     "POINTNET2_SSG": "PointNet++-SSG",
     "POINTNET2_SSG_SATLOSS6": "PointNet++-SSG-SATLOSS6",
+    "POINTNET2_SSG_SATLOSS7": "PointNet++-SSG-SATLOSS",
     "POINT_GNN": "Point-GNN",
     "POINT_GNN_SATLOSS6": "Point-GNN-SATLOSS6",
     "LNO": "LNO",
     "LNO_SATLOSS6": "LNO-SATLOSS6",
+    "LNO_SATLOSS7": "LNO-SATLOSS",
     "MSPT": "MSPT",
     "MSPT_SATLOSS6": "MSPT-SATLOSS6",
+    "MSPT_SATLOSS7": "MSPT-SATLOSS",
     "POINT_TRANSFORMER_V3": "PointTransformerV3",
     "POINT_TRANSFORMER_V3_SATLOSS6": "PointTransformerV3-SATLOSS6",
+    "POINT_TRANSFORMER_V3_SATLOSS7": "PointTransformerV3-SATLOSS",
 }
 MODEL_COLORS = {
     "SMART": "#6C6F7D",
@@ -162,19 +174,25 @@ MODEL_COLORS = {
     "SMART_SATLOSS6_GRADNORM": "#FF7F0E",
     "SMART_SATLOSS6_CONFIG_FULL": "#9467BD",
     "SMART_SATLOSS6_CONFIG_LAYER": "#17BECF",
+    "SMART_SATLOSS7": "#4C78A8",
     "TRANSOLVERPP": "#6C6F7D",
     "TRANSOLVERPP_SATLOSS3": "#E45756",
     "TRANSOLVERPP_SATLOSS6": "#FF9896",
+    "TRANSOLVERPP_SATLOSS7": "#FFBB78",
     "POINTNET2_SSG": "#17BECF",
     "POINTNET2_SSG_SATLOSS6": "#2CA02C",
+    "POINTNET2_SSG_SATLOSS7": "#98DF8A",
     "POINT_GNN": "#8C564B",
     "POINT_GNN_SATLOSS6": "#E377C2",
     "LNO": "#E45756",
     "LNO_SATLOSS6": "#F58518",
+    "LNO_SATLOSS7": "#FFBB78",
     "MSPT": "#BCBD22",
     "MSPT_SATLOSS6": "#9467BD",
+    "MSPT_SATLOSS7": "#C5B0D5",
     "POINT_TRANSFORMER_V3": "#1B9E77",
     "POINT_TRANSFORMER_V3_SATLOSS6": "#66A61E",
+    "POINT_TRANSFORMER_V3_SATLOSS7": "#A6D854",
 }
 # Standard Matplotlib tab10 colors for line plots.  These are intentionally
 # separate from the broader chart palette used by bars and heatmaps.
@@ -243,6 +261,7 @@ FAMILY_GROUPS = OrderedDict(
                 "SMART_SATLOSS6_GRADNORM",
                 "SMART_SATLOSS6_CONFIG_FULL",
                 "SMART_SATLOSS6_CONFIG_LAYER",
+                "SMART_SATLOSS7",
             ],
         ),
         (
@@ -254,23 +273,23 @@ FAMILY_GROUPS = OrderedDict(
                 "SMART_SATLOSS6_CONFIG_LAYER",
             ],
         ),
-        ("transolverpp_family", ["TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6"]),
-        ("pointnet2_ssg_family", ["POINTNET2_SSG", "POINTNET2_SSG_SATLOSS6"]),
+        ("transolverpp_family", ["TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6", "TRANSOLVERPP_SATLOSS7"]),
+        ("pointnet2_ssg_family", ["POINTNET2_SSG", "POINTNET2_SSG_SATLOSS6", "POINTNET2_SSG_SATLOSS7"]),
         ("point_gnn_family", ["POINT_GNN", "POINT_GNN_SATLOSS6"]),
-        ("lno_family", ["LNO", "LNO_SATLOSS6"]),
-        ("mspt_family", ["MSPT", "MSPT_SATLOSS6"]),
-        ("point_transformer_v3_family", ["POINT_TRANSFORMER_V3", "POINT_TRANSFORMER_V3_SATLOSS6"]),
+        ("lno_family", ["LNO", "LNO_SATLOSS6", "LNO_SATLOSS7"]),
+        ("mspt_family", ["MSPT", "MSPT_SATLOSS6", "MSPT_SATLOSS7"]),
+        ("point_transformer_v3_family", ["POINT_TRANSFORMER_V3", "POINT_TRANSFORMER_V3_SATLOSS6", "POINT_TRANSFORMER_V3_SATLOSS7"]),
     ]
 )
 FAMILY_TITLES = {
     "smart_family": "SMART vs SMART-DOWNSAMPLE vs SMART-GAUSSIAN-BALL-MASKED vs SMART-BOX-MASKED vs SMART-SATLOSS3 vs SMART-SATLOSS4 vs SMART-SATLOSS5 vs SMART-SATLOSS5-NOPM vs SMART-SATLOSS6 vs SATLOSS6 weighting variants",
     "smart_satloss6_weighting_family": "SMART-SATLOSS6-FIXEDSUM vs SMART-SATLOSS6-GRADNORM vs SMART-SATLOSS6-ConFIG-FULL vs SMART-SATLOSS6-ConFIG-LAYER",
-    "transolverpp_family": "TransolverPP vs TransolverPP-SATLOSS3 vs TransolverPP-SATLOSS6",
-    "pointnet2_ssg_family": "PointNet++ SSG vs PointNet++ SSG-SATLOSS6",
+    "transolverpp_family": "TransolverPP vs TransolverPP-SATLOSS3 vs TransolverPP-SATLOSS6 vs TransolverPP-SATLOSS",
+    "pointnet2_ssg_family": "PointNet++ SSG vs PointNet++ SSG-SATLOSS6 vs PointNet++ SSG-SATLOSS",
     "point_gnn_family": "Point-GNN vs Point-GNN-SATLOSS6",
-    "lno_family": "LNO vs LNO-SATLOSS6",
-    "mspt_family": "MSPT vs MSPT-SATLOSS6",
-    "point_transformer_v3_family": "PointTransformerV3 vs PointTransformerV3-SATLOSS6",
+    "lno_family": "LNO vs LNO-SATLOSS6 vs LNO-SATLOSS",
+    "mspt_family": "MSPT vs MSPT-SATLOSS6 vs MSPT-SATLOSS",
+    "point_transformer_v3_family": "PointTransformerV3 vs PointTransformerV3-SATLOSS6 vs PointTransformerV3-SATLOSS",
 }
 VTK_PRESSURE_MODELS = [
     "SMART",
@@ -286,18 +305,25 @@ VTK_PRESSURE_MODELS = [
     "SMART_SATLOSS6_GRADNORM",
     "SMART_SATLOSS6_CONFIG_FULL",
     "SMART_SATLOSS6_CONFIG_LAYER",
+    "SMART_SATLOSS7",
     "TRANSOLVERPP",
     "TRANSOLVERPP_SATLOSS3",
+    "TRANSOLVERPP_SATLOSS6",
+    "TRANSOLVERPP_SATLOSS7",
     "POINTNET2_SSG",
     "POINTNET2_SSG_SATLOSS6",
+    "POINTNET2_SSG_SATLOSS7",
     "POINT_GNN",
     "POINT_GNN_SATLOSS6",
     "LNO",
     "LNO_SATLOSS6",
+    "LNO_SATLOSS7",
     "MSPT",
     "MSPT_SATLOSS6",
+    "MSPT_SATLOSS7",
     "POINT_TRANSFORMER_V3",
     "POINT_TRANSFORMER_V3_SATLOSS6",
+    "POINT_TRANSFORMER_V3_SATLOSS7",
 ]
 
 
@@ -326,19 +352,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smart-satloss6-gradnorm-config", default="drivaerml_satloss6_gradnorm")
     p.add_argument("--smart-satloss6-config-full-config", default="drivaerml_satloss6_config_full")
     p.add_argument("--smart-satloss6-config-layer-config", default="drivaerml_satloss6_config")
+    p.add_argument("--smart-satloss7-config", "--smart-satloss-config", dest="smart_satloss7_config", default="drivaerml_satloss7")
     p.add_argument("--transolverpp-config", default="drivaerml_transolverpp")
     p.add_argument("--transolverpp-satloss3-config", default="drivaerml_transolverpp_satloss3")
     p.add_argument("--transolverpp-satloss6-config", default="drivaerml_transolverpp_satloss6")
+    p.add_argument("--transolverpp-satloss7-config", "--transolverpp-satloss-config", dest="transolverpp_satloss7_config", default="drivaerml_transolverpp_satloss7")
     p.add_argument("--pointnet2-ssg-config", default="drivaerml_pointnet2_ssg")
     p.add_argument("--pointnet2-ssg-satloss6-config", default="drivaerml_pointnet2_ssg_satloss6")
+    p.add_argument("--pointnet2-ssg-satloss7-config", "--pointnet2-ssg-satloss-config", dest="pointnet2_ssg_satloss7_config", default="drivaerml_pointnet2_ssg_satloss7")
     p.add_argument("--point-gnn-config", default="drivaerml_point_gnn")
     p.add_argument("--point-gnn-satloss6-config", default="drivaerml_point_gnn_satloss6")
     p.add_argument("--lno-config", default="drivaerml_lno")
     p.add_argument("--lno-satloss6-config", default="drivaerml_lno_satloss6")
+    p.add_argument("--lno-satloss7-config", "--lno-satloss-config", dest="lno_satloss7_config", default="drivaerml_lno_satloss7")
     p.add_argument("--mspt-config", default="drivaerml_mspt")
     p.add_argument("--mspt-satloss6-config", default="drivaerml_mspt_satloss6")
+    p.add_argument("--mspt-satloss7-config", "--mspt-satloss-config", dest="mspt_satloss7_config", default="drivaerml_mspt_satloss7")
     p.add_argument("--point-transformer-v3-config", default="drivaerml_point_transformer_v3")
     p.add_argument("--point-transformer-v3-satloss6-config", default="drivaerml_point_transformer_v3_satloss6")
+    p.add_argument("--point-transformer-v3-satloss7-config", "--point-transformer-v3-satloss-config", dest="point_transformer_v3_satloss7_config", default="drivaerml_point_transformer_v3_satloss7")
     p.add_argument("--smart-checkpoint", default=None)
     p.add_argument(
         "--smart-downsample-checkpoint",
@@ -362,19 +394,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smart-satloss6-gradnorm-checkpoint", default=None)
     p.add_argument("--smart-satloss6-config-full-checkpoint", default=None)
     p.add_argument("--smart-satloss6-config-layer-checkpoint", default=None)
+    p.add_argument("--smart-satloss7-checkpoint", "--smart-satloss-checkpoint", dest="smart_satloss7_checkpoint", default=None)
     p.add_argument("--transolverpp-checkpoint", default=None)
     p.add_argument("--transolverpp-satloss3-checkpoint", default=None)
     p.add_argument("--transolverpp-satloss6-checkpoint", default=None)
+    p.add_argument("--transolverpp-satloss7-checkpoint", "--transolverpp-satloss-checkpoint", dest="transolverpp_satloss7_checkpoint", default=None)
     p.add_argument("--pointnet2-ssg-checkpoint", default=None)
     p.add_argument("--pointnet2-ssg-satloss6-checkpoint", default=None)
+    p.add_argument("--pointnet2-ssg-satloss7-checkpoint", "--pointnet2-ssg-satloss-checkpoint", dest="pointnet2_ssg_satloss7_checkpoint", default=None)
     p.add_argument("--point-gnn-checkpoint", default=None)
     p.add_argument("--point-gnn-satloss6-checkpoint", default=None)
     p.add_argument("--lno-checkpoint", default=None)
     p.add_argument("--lno-satloss6-checkpoint", default=None)
+    p.add_argument("--lno-satloss7-checkpoint", "--lno-satloss-checkpoint", dest="lno_satloss7_checkpoint", default=None)
     p.add_argument("--mspt-checkpoint", default=None)
     p.add_argument("--mspt-satloss6-checkpoint", default=None)
+    p.add_argument("--mspt-satloss7-checkpoint", "--mspt-satloss-checkpoint", dest="mspt_satloss7_checkpoint", default=None)
     p.add_argument("--point-transformer-v3-checkpoint", default=None)
     p.add_argument("--point-transformer-v3-satloss6-checkpoint", default=None)
+    p.add_argument("--point-transformer-v3-satloss7-checkpoint", "--point-transformer-v3-satloss-checkpoint", dest="point_transformer_v3_satloss7_checkpoint", default=None)
     p.add_argument("--num-runs", type=int, default=8, help="Number of test runs to evaluate.")
     p.add_argument("--run-ids", default=None, help="Optional comma-separated explicit run ids.")
     p.add_argument("--seed", type=int, default=42)
@@ -422,6 +460,24 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--vtk-run-id", type=int, default=None, help="Representative run id for the full-surface VTK export. Default: first evaluated run.")
     p.add_argument("--vtk-surface-query-dir", default="/home/parsa/smart_parsa/CFD_audi/run_100/audi", help="Directory containing external surface_coords/normals/pressure/WSS NPY files for representative VTK export.")
+    p.add_argument(
+        "--surface-vtp-dir",
+        default="/mnt/ssdraid/parsa/drivaerml_surface_vtp",
+        help="Legacy original-surface VTP root; not used when the aligned preprocessed cloud is the baseline.",
+    )
+    p.add_argument(
+        "--decimated-vtp-dir",
+        default="/mnt/ssdraid/parsa/drivaerml_surface_vtp_decimated",
+        help="Root containing decimated geometry-only VTPs under run_<id>/drivaer_<id>_faces_div{5,40}.vtp.",
+    )
+    p.add_argument(
+        "--active-geometry-sources",
+        default="none",
+        help=(
+            "Comma-separated decimated VTP sources: decimated_div5,decimated_div10. "
+            "The aligned preprocessed cloud is the non-decimated baseline; use all to enable both."
+        ),
+    )
     p.add_argument("--plot-workers", type=int, default=max(1, min(6, (os.cpu_count() or 1) // 2)), help="Worker count for CPU-side plot generation.")
     p.add_argument("--surface-query-points", type=int, default=0, help="Fixed surface query budget for all models. Use 0 to auto-pick the minimum training budget across compared models.")
     p.add_argument("--volume-query-points", type=int, default=0, help="Fixed volume query budget for all models. Use 0 to auto-pick the minimum training budget across compared models.")
@@ -548,19 +604,25 @@ def choose_ckpt(config, explicit: str | None) -> str:
         "SMART_SATLOSS6_GRADNORM": "smart-satloss6-gradnorm-",
         "SMART_SATLOSS6_CONFIG_FULL": "smart-satloss6-config-full-",
         "SMART_SATLOSS6_CONFIG_LAYER": "smart-satloss6-config-layer-",
+        "SMART_SATLOSS7": "smart-satloss7-",
         "TRANSOLVERPP": "transolverpp-",
         "TRANSOLVERPP_SATLOSS3": "transolverpp-satloss3-",
         "TRANSOLVERPP_SATLOSS6": "transolverpp-satloss6-",
+        "TRANSOLVERPP_SATLOSS7": "transolverpp-satloss7-",
         "POINTNET2_SSG": "pointnet2-ssg-",
         "POINTNET2_SSG_SATLOSS6": "pointnet2-ssg-satloss6-",
+        "POINTNET2_SSG_SATLOSS7": "pointnet2-ssg-satloss7-",
         "POINT_GNN": "point-gnn-",
         "POINT_GNN_SATLOSS6": "point-gnn-satloss6-",
         "LNO": "lno-",
         "LNO_SATLOSS6": "lno-satloss6-",
+        "LNO_SATLOSS7": "lno-satloss7-",
         "MSPT": "mspt-",
         "MSPT_SATLOSS6": "mspt-satloss6-",
+        "MSPT_SATLOSS7": "mspt-satloss7-",
         "POINT_TRANSFORMER_V3": "point-transformer-v3-",
         "POINT_TRANSFORMER_V3_SATLOSS6": "point-transformer-v3-satloss6-",
+        "POINT_TRANSFORMER_V3_SATLOSS7": "point-transformer-v3-satloss7-",
     }
     required_prefix = prefix_map.get(str(config.model_name), f"{model_slug}-")
     dataset_slug = str(config.dataset).lower()
@@ -616,19 +678,20 @@ def build_model(config, ckpt_path: str, device: torch.device, batched_query_subr
         "SMART_SATLOSS6_GRADNORM",
         "SMART_SATLOSS6_CONFIG_FULL",
         "SMART_SATLOSS6_CONFIG_LAYER",
+        "SMART_SATLOSS7",
     }:
         model = SMART(**base_kwargs, **arch)
-    elif model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6"}:
+    elif model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6", "TRANSOLVERPP_SATLOSS7"}:
         model = TransolverPP(**base_kwargs, **arch)
-    elif model_name in {"POINTNET2_SSG", "POINTNET2_SSG_SATLOSS6"}:
+    elif model_name in {"POINTNET2_SSG", "POINTNET2_SSG_SATLOSS6", "POINTNET2_SSG_SATLOSS7"}:
         model = PointNet2SSG(**base_kwargs, **arch)
     elif model_name in {"POINT_GNN", "POINT_GNN_SATLOSS6"}:
         model = PointGNN(**base_kwargs, **arch)
-    elif model_name in {"LNO", "LNO_SATLOSS6"}:
+    elif model_name in {"LNO", "LNO_SATLOSS6", "LNO_SATLOSS7"}:
         model = LNO(**base_kwargs, **arch)
-    elif model_name in {"MSPT", "MSPT_SATLOSS6"}:
+    elif model_name in {"MSPT", "MSPT_SATLOSS6", "MSPT_SATLOSS7"}:
         model = MSPT(**base_kwargs, **arch)
-    elif model_name in {"POINT_TRANSFORMER_V3", "POINT_TRANSFORMER_V3_SATLOSS6"}:
+    elif model_name in {"POINT_TRANSFORMER_V3", "POINT_TRANSFORMER_V3_SATLOSS6", "POINT_TRANSFORMER_V3_SATLOSS7"}:
         model = PointTransformerV3(**base_kwargs, **arch)
     else:
         raise ValueError(f"Unsupported model_name for this evaluator: {model_name}")
@@ -732,6 +795,13 @@ SHIFT_LABELS = {
     "sine_x": "Sinusoidal-x intensity",
 }
 
+GEOMETRY_SOURCE_ORDER = ("decimated_div5", "decimated_div10")
+GEOMETRY_SOURCE_LABELS = {
+    "decimated_div5": "Decimated VTP div5",
+    "decimated_div10": "Decimated VTP div10",
+}
+GEOMETRY_BBOX_TOLERANCE = 2.5e-3
+
 
 def parse_active_shifts(text: str) -> List[str]:
     """Parse active shift names while preserving the canonical plot order."""
@@ -759,6 +829,80 @@ def parse_active_shifts(text: str) -> List[str]:
     if not active:
         raise ValueError("At least one sampling shift must be active.")
     return active
+
+
+def parse_active_geometry_sources(text: str) -> List[str]:
+    """Parse optional geometry-source tests without changing beta/sine tests."""
+    raw = [item.strip().lower().replace("-", "_") for item in str(text).split(",") if item.strip()]
+    if not raw or raw == ["none"]:
+        return []
+    aliases = {
+        "all": GEOMETRY_SOURCE_ORDER,
+        "decimated": GEOMETRY_SOURCE_ORDER,
+        "div5": ("decimated_div5",),
+        "div10": ("decimated_div10",),
+    }
+    expanded: List[str] = []
+    for item in raw:
+        if item in aliases:
+            expanded.extend(aliases[item])
+        elif item in GEOMETRY_SOURCE_ORDER:
+            expanded.append(item)
+        else:
+            valid = ", ".join((*GEOMETRY_SOURCE_ORDER, "all", "none"))
+            raise ValueError(f"Unknown geometry source {item!r}. Valid values: {valid}.")
+    return [source for source in GEOMETRY_SOURCE_ORDER if source in set(expanded)]
+
+
+def geometry_source_vtp_path(source: str, run_id: int, surface_vtp_dir: Path, decimated_vtp_dir: Path) -> Path:
+    run_id = int(run_id)
+    if source == "decimated_div5":
+        return decimated_vtp_dir / f"run_{run_id}" / f"drivaer_{run_id}_faces_div5.vtp"
+    if source == "decimated_div10":
+        return decimated_vtp_dir / f"run_{run_id}" / f"drivaer_{run_id}_faces_div10.vtp"
+    raise ValueError(f"Unsupported geometry source: {source}")
+
+
+def read_vtp_points(path: Path) -> np.ndarray:
+    """Read only point coordinates from a geometry-only VTP."""
+    try:
+        import vtk
+        from vtk.util.numpy_support import vtk_to_numpy
+    except Exception as exc:  # pragma: no cover - environment-specific
+        raise RuntimeError("VTP geometry tests require VTK Python bindings.") from exc
+    reader = vtk.vtkXMLPolyDataReader()
+    reader.SetFileName(str(path))
+    reader.Update()
+    polydata = reader.GetOutput()
+    if polydata is None or polydata.GetPoints() is None:
+        raise RuntimeError(f"VTP has no points: {path}")
+    points = np.asarray(vtk_to_numpy(polydata.GetPoints().GetData()), dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] == 0:
+        raise RuntimeError(f"VTP has invalid point coordinates: {path}, shape={points.shape}")
+    if not np.isfinite(points).all():
+        raise RuntimeError(f"VTP contains non-finite point coordinates: {path}")
+    return np.ascontiguousarray(points)
+
+
+def validate_geometry_source_bbox(
+    source_points: np.ndarray,
+    reference_points: np.ndarray,
+    source_name: str,
+    run_id: int,
+    tolerance: float = GEOMETRY_BBOX_TOLERANCE,
+) -> None:
+    """Ensure VTP coordinates stay in the preprocessed training frame."""
+    source = np.asarray(source_points, dtype=np.float64)
+    reference = np.asarray(reference_points, dtype=np.float64)
+    source_bbox = np.concatenate([source.min(axis=0), source.max(axis=0)])
+    reference_bbox = np.concatenate([reference.min(axis=0), reference.max(axis=0)])
+    delta = float(np.max(np.abs(source_bbox - reference_bbox)))
+    if delta > float(tolerance):
+        raise ValueError(
+            f"{source_name} VTP run_{int(run_id)} is not in the preprocessed coordinate frame: "
+            f"max bbox difference={delta:.6g} > tolerance={float(tolerance):.6g}. "
+            "Do not normalize this source with the training bounds until the geometry export is corrected."
+        )
 
 
 def sample_uniform_weighted_mixture_without_replacement(
@@ -1164,6 +1308,44 @@ def save_sampling_y_histogram(
     plt.close(fig)
 
 
+def save_geometry_source_distribution_plot(
+    path: Path,
+    reference_points_xyz: np.ndarray,
+    sampled_points_by_source: Dict[str, np.ndarray],
+    title: str,
+) -> None:
+    """Show normalized x/y/z marginals for the VTP source samples."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    reference = np.asarray(reference_points_xyz, dtype=np.float64)
+    if reference.ndim != 2 or reference.shape[1] != 3:
+        raise ValueError("reference_points_xyz must have shape [N, 3]")
+    mins = np.min(reference, axis=0)
+    maxs = np.max(reference, axis=0)
+    span = np.clip(maxs - mins, 1.0e-12, None)
+    reference = np.clip((reference - mins) / span, 0.0, 1.0)
+    fig, axes = plt.subplots(1, 3, figsize=(15.0, 4.8), constrained_layout=True)
+    colors = {
+        "decimated_div5": "#F28E2B",
+        "decimated_div10": "#E15759",
+    }
+    labels = {"decimated_div5": "VTP div5", "decimated_div10": "VTP div10"}
+    axis_labels = ("x", "y", "z")
+    for axis, ax in enumerate(axes):
+        ax.hist(reference[:, axis], bins=50, density=True, histtype="step", color="#777777", linewidth=1.5, label="preprocessed reference")
+        for source_name, points in sampled_points_by_source.items():
+            sample = np.asarray(points, dtype=np.float64)
+            sample = np.clip((sample - mins) / span, 0.0, 1.0)
+            ax.hist(sample[:, axis], bins=50, density=True, histtype="step", linewidth=1.8, color=colors[source_name], label=labels[source_name])
+        ax.set_xlabel(f"Normalized {axis_labels[axis]}")
+        ax.set_ylabel("Probability density")
+        ax.grid(alpha=0.2)
+        if axis == 0:
+            ax.legend(fontsize=8, loc="best")
+    fig.suptitle(title, fontsize=15)
+    fig.savefig(path, dpi=260)
+    plt.close(fig)
+
+
 def _spatial_shift_feature_values(
     points_xyz: np.ndarray,
     shift_name: str,
@@ -1431,6 +1613,7 @@ def predict_audi_surface_pressure(
             "SMART_SATLOSS6_GRADNORM",
             "SMART_SATLOSS6_CONFIG_FULL",
             "SMART_SATLOSS6_CONFIG_LAYER",
+            "SMART_SATLOSS7",
         }:
             intermediate_latent_geometries, latent_geo_pos = model.encode(geo_b, None)
 
@@ -1440,7 +1623,7 @@ def predict_audi_surface_pressure(
 
             return decode_chunk
 
-        if model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6"}:
+        if model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6", "TRANSOLVERPP_SATLOSS7"}:
             def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
                 pred_surf, _ = model.inference(geo_b, chunk, dummy_vol_b, None)
                 return pred_surf[:, :, 0]
@@ -1476,8 +1659,14 @@ def predict_audi_surface_pressure(
     return pred_surf
 
 
-def select_run_ids(test_ids: Iterable[int], num_runs: int, run_ids_arg: str | None, seed: int) -> List[int]:
-    test_ids = sorted(int(x) for x in test_ids)
+def select_run_ids(
+    test_ids: Iterable[int],
+    num_runs: int,
+    run_ids_arg: str | None,
+    seed: int,
+    candidate_ids: Iterable[int] | None = None,
+) -> List[int]:
+    test_ids = sorted(int(x) for x in (candidate_ids if candidate_ids is not None else test_ids))
     if run_ids_arg:
         chosen = [int(x.strip()) for x in run_ids_arg.split(",") if x.strip()]
         missing = [x for x in chosen if x not in test_ids]
@@ -1583,6 +1772,8 @@ def resolve_eval_sampling_mode(cfg, mode_kind: str) -> str:
         return str(getattr(cfg, "eval_aligned_sampling_mode", "uniform_wor"))
     if mode_kind == "inverse_density_wor":
         return str(getattr(cfg, "eval_shifted_sampling_mode", "inverse_density_wor"))
+    if mode_kind == "geometry_vtp":
+        return "vtp_uniform_wor"
     return str(getattr(cfg, "eval_shifted_sampling_mode", "sinusoidal_axis_mixture_wor"))
 
 
@@ -1640,6 +1831,9 @@ def mode_display_name(mode_name: str) -> str:
             "sine_y": "sine-y",
         }[shift_match.group(1)]
         return f"{shift_name} intensity={float(shift_match.group(2)):.2f}"
+    geometry_match = re.match(r"geometry_(decimated_div5|decimated_div10)$", str(mode_name))
+    if geometry_match:
+        return GEOMETRY_SOURCE_LABELS[geometry_match.group(1)]
     return mode_name
 
 
@@ -1673,8 +1867,13 @@ def aggregate_rows_by_keys(rows: List[Dict[str, object]], group_keys: Sequence[s
         agg["num_records"] = len(grows)
         for key in metric_keys:
             vals = np.array([float(r[key]) for r in grows], dtype=np.float64)
-            agg[key] = float(np.mean(vals))
-            agg[f"{key}_std"] = float(np.std(vals))
+            finite = vals[np.isfinite(vals)]
+            if finite.size:
+                agg[key] = float(np.mean(finite))
+                agg[f"{key}_std"] = float(np.std(finite))
+            else:
+                agg[key] = math.nan
+                agg[f"{key}_std"] = math.nan
         out.append(agg)
     return out
 
@@ -1728,6 +1927,12 @@ def mode_color(mode_name: str) -> str:
             "sine_y": plt.cm.YlOrBr,
         }[shift_match.group(1)]
         return matplotlib.colors.to_hex(cmap(norm))
+    geometry_colors = {
+        "geometry_decimated_div5": "#F28E2B",
+        "geometry_decimated_div10": "#E15759",
+    }
+    if mode_name in geometry_colors:
+        return geometry_colors[mode_name]
     return "#999999"
 
 
@@ -2055,12 +2260,270 @@ def plot_absolute_average_error_bars(
     plt.close(fig)
 
 
+def plot_geometry_source_bars(
+    aggregate_rows: List[Dict[str, object]],
+    metric_key: str,
+    source_modes: Sequence[str],
+    model_order: Sequence[str],
+    out_path: Path,
+    title: str,
+    show_std: bool = True,
+    log_scale: bool = True,
+) -> None:
+    """Compare the aligned preprocessed input against decimated VTP inputs."""
+    mode_order = ["aligned_uniform_wor", *source_modes]
+    row_map = {(str(row["model_name"]), str(row["sampling_mode"])): row for row in aggregate_rows}
+    present_models = [
+        model_name
+        for model_name in model_order
+        if all((model_name, mode_name) in row_map for mode_name in mode_order)
+    ]
+    if not present_models:
+        return
+
+    x = np.arange(len(present_models), dtype=np.float64)
+    width = 0.82 / float(len(mode_order))
+    fig, ax = plt.subplots(figsize=(max(13.0, 1.55 * len(present_models)), 7.4), constrained_layout=True)
+    source_hatches = ["", "..", "///", "xxx"]
+    source_alphas = [0.42, 0.68, 0.82, 0.96]
+    all_values: List[float] = []
+    for mode_idx, mode_name in enumerate(mode_order):
+        means = np.asarray(
+            [max(float(row_map[(model_name, mode_name)][metric_key]), 1.0e-12) for model_name in present_models],
+            dtype=np.float64,
+        )
+        stds = np.asarray(
+            [max(float(row_map[(model_name, mode_name)].get(f"{metric_key}_std", 0.0)), 0.0) for model_name in present_models],
+            dtype=np.float64,
+        )
+        if log_scale:
+            stds = np.minimum(stds, means * 0.8)
+        all_values.extend(means.tolist())
+        for model_idx, model_name in enumerate(present_models):
+            color, linestyle = model_line_visuals(model_name)
+            bar = ax.bar(
+                x[model_idx] + (mode_idx - 0.5 * (len(mode_order) - 1)) * width,
+                means[model_idx],
+                width=width,
+                yerr=stds[model_idx] if show_std else None,
+                capsize=3,
+                color=color,
+                edgecolor="black",
+                linewidth=0.55,
+                alpha=source_alphas[mode_idx],
+                hatch=source_hatches[mode_idx],
+            )[0]
+            if mode_idx > 0:
+                baseline = float(row_map[(model_name, "aligned_uniform_wor")][metric_key])
+                pct = 100.0 * (float(means[model_idx]) - baseline) / max(abs(baseline), 1.0e-12)
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    means[model_idx] * (1.10 if log_scale else 1.02),
+                    f"{pct:+.1f}%",
+                    ha="center",
+                    va="bottom",
+                    rotation=90,
+                    fontsize=7,
+                    clip_on=False,
+                )
+    if log_scale:
+        ax.set_yscale("log")
+    ax.set_xticks(x)
+    ax.set_xticklabels([MODEL_LABELS[model_name] for model_name in present_models], rotation=24, ha="right")
+    ax.set_ylabel(f"{_metric_display_name(metric_key)} ({'log' if log_scale else 'linear'} scale)")
+    ax.set_title(title)
+    ax.grid(axis="y", which="both", alpha=0.2)
+    source_handles = [
+        Patch(facecolor="#BDBDBD", edgecolor="black", alpha=source_alphas[idx], hatch=source_hatches[idx], label=mode_display_name(mode_name))
+        for idx, mode_name in enumerate(mode_order)
+    ]
+    source_handles.append(Patch(facecolor="none", edgecolor="none", label="Labels: % vs aligned preprocessed input"))
+    ax.legend(handles=source_handles, loc="upper left", fontsize=9, framealpha=0.92)
+    if all_values:
+        ax.set_ylim(bottom=max(min(all_values) * 0.65, 1.0e-8))
+    fig.savefig(out_path, dpi=260)
+    plt.close(fig)
+
+
 def _vanilla_model_name(model_name: str) -> str:
     match = re.match(
         r"^(.*)_SATLOSS\d+(?:_(?:NOPM|FIXEDSUM|GRADNORM|CONFIG_FULL|CONFIG_LAYER))?$",
         str(model_name),
     )
     return match.group(1) if match else str(model_name)
+
+
+SATLOSS_ENDPOINT_PAIRS = (
+    ("SMART", "SMART_SATLOSS7"),
+    ("TRANSOLVERPP", "TRANSOLVERPP_SATLOSS7"),
+    ("POINTNET2_SSG", "POINTNET2_SSG_SATLOSS7"),
+    ("LNO", "LNO_SATLOSS7"),
+    ("MSPT", "MSPT_SATLOSS7"),
+    ("POINT_TRANSFORMER_V3", "POINT_TRANSFORMER_V3_SATLOSS7"),
+)
+
+
+def build_endpoint_mode_names(
+    mode_defs: Mapping[str, Mapping[str, object]],
+    active_geometry_sources: Sequence[str],
+) -> List[str]:
+    """Keep only maximum beta/sine intensities and the largest decimation."""
+    selected: set[str] = set()
+    for distribution_key in ("beta", "sine_y", "sine_x"):
+        candidates = [
+            mode_name
+            for mode_name, info in mode_defs.items()
+            if (
+                (distribution_key == "beta" and info.get("kind") == "inverse_density_wor")
+                or (
+                    distribution_key != "beta"
+                    and info.get("kind") == "sinusoidal_axis_mixture_wor"
+                    and info.get("distribution_key") == distribution_key
+                )
+            )
+        ]
+        if candidates:
+            severity_key = "beta" if distribution_key == "beta" else "mix_fraction"
+            selected.add(max(candidates, key=lambda name: float(mode_defs[name][severity_key])))
+    if "decimated_div10" in active_geometry_sources:
+        selected.add("geometry_decimated_div10")
+    return [mode_name for mode_name in mode_defs if mode_name in selected]
+
+
+def build_satloss_endpoint_improvement_rows(
+    aggregate_rows: List[Dict[str, object]],
+    active_model_names: Sequence[str],
+    endpoint_specs: Sequence[Tuple[str, str]],
+    metric_key: str,
+) -> List[Dict[str, object]]:
+    """Return positive percentages when SATLOSS beats its vanilla counterpart."""
+    active_models = set(active_model_names)
+    row_map = {
+        (str(row["model_name"]), str(row["sampling_mode"])): row
+        for row in aggregate_rows
+    }
+    rows: List[Dict[str, object]] = []
+    for vanilla_name, satloss_name in SATLOSS_ENDPOINT_PAIRS:
+        if vanilla_name not in active_models or satloss_name not in active_models:
+            continue
+        result: Dict[str, object] = {
+            "model_name": vanilla_name,
+            "model_label": MODEL_LABELS[vanilla_name],
+            "satloss_model_name": satloss_name,
+        }
+        for column_key, mode_name in endpoint_specs:
+            vanilla_row = row_map.get((vanilla_name, mode_name))
+            satloss_row = row_map.get((satloss_name, mode_name))
+            if vanilla_row is None or satloss_row is None:
+                result[column_key] = math.nan
+                continue
+            vanilla_error = float(vanilla_row[metric_key])
+            satloss_error = float(satloss_row[metric_key])
+            result[column_key] = 100.0 * (vanilla_error - satloss_error) / max(abs(vanilla_error), 1.0e-12)
+        rows.append(result)
+    return rows
+
+
+def satloss_endpoint_label(column_key: str, mode_name: str) -> str:
+    labels = {
+        "beta_1": "beta 1",
+        "sine_y_1": "sine-y 1",
+        "sine_x_1": "sine-x 1",
+        "decimation_5": "decimation 5",
+        "decimation_10": "decimation 10",
+    }
+    return labels.get(column_key, mode_display_name(mode_name))
+
+
+def write_satloss_endpoint_table(
+    rows: List[Dict[str, object]],
+    endpoint_specs: Sequence[Tuple[str, str]],
+    csv_path: Path,
+    markdown_path: Path,
+) -> None:
+    """Write the SATLOSS-versus-vanilla endpoint table in CSV and Markdown."""
+    fieldnames = ["model_name", "model_label", "satloss_model_name"] + [key for key, _ in endpoint_specs]
+    write_csv(csv_path, rows, fieldnames)
+    header = ["Model"] + [satloss_endpoint_label(key, mode_name) for key, mode_name in endpoint_specs]
+    lines = [
+        "# SATLOSS improvement versus vanilla",
+        "",
+        "Positive values mean SATLOSS has lower combined-global relative L2 error than vanilla.",
+        "",
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join("---" for _ in header) + " |",
+    ]
+    for row in rows:
+        values = [str(row["model_label"])]
+        values.extend(
+            "n/a" if not np.isfinite(float(row[key])) else f"{float(row[key]):+.2f}%"
+            for key, _ in endpoint_specs
+        )
+        lines.append("| " + " | ".join(values) + " |")
+    markdown_path.parent.mkdir(parents=True, exist_ok=True)
+    markdown_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def plot_satloss_endpoint_improvement_bars(
+    rows: List[Dict[str, object]],
+    endpoint_specs: Sequence[Tuple[str, str]],
+    out_path: Path,
+    title: str,
+) -> None:
+    """Plot SATLOSS improvement percentages for only the requested endpoints."""
+    if not rows or not endpoint_specs:
+        return
+    present_rows = [
+        row for row in rows
+        if any(np.isfinite(float(row[key])) for key, _ in endpoint_specs)
+    ]
+    if not present_rows:
+        return
+    x = np.arange(len(endpoint_specs), dtype=np.float64)
+    width = 0.82 / float(len(present_rows))
+    fig, ax = plt.subplots(
+        figsize=(max(12.0, 2.2 * len(endpoint_specs)), 7.2),
+        constrained_layout=True,
+    )
+    for row_idx, row in enumerate(present_rows):
+        values = np.asarray([float(row[key]) for key, _ in endpoint_specs], dtype=np.float64)
+        values = np.nan_to_num(values, nan=0.0)
+        color = LINE_MODEL_COLORS.get(str(row["model_name"]), MODEL_COLORS[str(row["model_name"])])
+        bars = ax.bar(
+            x + (row_idx - 0.5 * (len(present_rows) - 1)) * width,
+            values,
+            width=width,
+            color=color,
+            edgecolor="black",
+            linewidth=0.6,
+            alpha=0.9,
+            label=str(row["model_label"]),
+        )
+        for bar, value in zip(bars, values):
+            if np.isfinite(value):
+                y = value + (1.5 if value >= 0.0 else -1.5)
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    y,
+                    f"{value:+.1f}%",
+                    ha="center",
+                    va="bottom" if value >= 0.0 else "top",
+                    rotation=90,
+                    fontsize=8,
+                )
+    ax.axhline(0.0, color="black", linewidth=1.0)
+    ax.set_xticks(x)
+    ax.set_xticklabels(
+        [satloss_endpoint_label(key, mode_name) for key, mode_name in endpoint_specs],
+        rotation=18,
+        ha="right",
+    )
+    ax.set_ylabel("SATLOSS improvement versus vanilla (%)")
+    ax.set_title(title)
+    ax.grid(axis="y", alpha=0.2)
+    ax.legend(fontsize=9, ncol=2, loc="best")
+    fig.savefig(out_path, dpi=260)
+    plt.close(fig)
 
 
 def plot_endpoint_error_bars(
@@ -2180,7 +2643,11 @@ def plot_density_shift_bars(per_view_rows: List[Dict[str, object]], out_path: Pa
     means = []
     stds = []
     for mode_name in mode_order:
-        vals = np.array([float(r["subset_log_density_mean"]) for r in per_view_rows if r["sampling_mode"] == mode_name], dtype=np.float64)
+        vals = np.array(
+            [float(r["subset_log_density_mean"]) for r in per_view_rows if r["sampling_mode"] == mode_name],
+            dtype=np.float64,
+        )
+        vals = vals[np.isfinite(vals)]
         means.append(float(np.mean(vals)) if vals.size else math.nan)
         stds.append(float(np.std(vals)) if vals.size else math.nan)
     fig, ax = plt.subplots(figsize=(9.2, 5.4), constrained_layout=True)
@@ -2676,19 +3143,25 @@ def main():
             ("SMART_SATLOSS6_GRADNORM", args.smart_satloss6_gradnorm_config),
             ("SMART_SATLOSS6_CONFIG_FULL", args.smart_satloss6_config_full_config),
             ("SMART_SATLOSS6_CONFIG_LAYER", args.smart_satloss6_config_layer_config),
+            ("SMART_SATLOSS7", args.smart_satloss7_config),
             ("TRANSOLVERPP", args.transolverpp_config),
             ("TRANSOLVERPP_SATLOSS3", args.transolverpp_satloss3_config),
             ("TRANSOLVERPP_SATLOSS6", args.transolverpp_satloss6_config),
+            ("TRANSOLVERPP_SATLOSS7", args.transolverpp_satloss7_config),
             ("POINTNET2_SSG", args.pointnet2_ssg_config),
             ("POINTNET2_SSG_SATLOSS6", args.pointnet2_ssg_satloss6_config),
+            ("POINTNET2_SSG_SATLOSS7", args.pointnet2_ssg_satloss7_config),
             ("POINT_GNN", args.point_gnn_config),
             ("POINT_GNN_SATLOSS6", args.point_gnn_satloss6_config),
             ("LNO", args.lno_config),
             ("LNO_SATLOSS6", args.lno_satloss6_config),
+            ("LNO_SATLOSS7", args.lno_satloss7_config),
             ("MSPT", args.mspt_config),
             ("MSPT_SATLOSS6", args.mspt_satloss6_config),
+            ("MSPT_SATLOSS7", args.mspt_satloss7_config),
             ("POINT_TRANSFORMER_V3", args.point_transformer_v3_config),
             ("POINT_TRANSFORMER_V3_SATLOSS6", args.point_transformer_v3_satloss6_config),
+            ("POINT_TRANSFORMER_V3_SATLOSS7", args.point_transformer_v3_satloss7_config),
         ]
     )
     configs = OrderedDict((model_name, load_cfg(cfg_name)) for model_name, cfg_name in config_name_map.items())
@@ -2702,7 +3175,12 @@ def main():
     sine_mix_levels = sine_mix_levels_from_shift_betas(shift_betas)
     active_shifts = parse_active_shifts(args.active_shifts)
     active_shift_set = set(active_shifts)
+    active_geometry_sources = parse_active_geometry_sources(args.active_geometry_sources)
     print(f"Active sampling shifts: {', '.join(active_shifts)}")
+    print(
+        "Active VTP geometry sources: "
+        + (", ".join(active_geometry_sources) if active_geometry_sources else "none")
+    )
     mode_defs = OrderedDict()
     mode_defs["aligned_uniform_wor"] = {
         "kind": "uniform_wor",
@@ -2740,6 +3218,19 @@ def main():
                 **extra_info,
             }
 
+    next_mode_id = len(mode_defs)
+    for source_idx, source_name in enumerate(active_geometry_sources):
+        mode_defs[f"geometry_{source_name}"] = {
+            "kind": "geometry_vtp",
+            "beta": math.nan,
+            "geometry_source": source_name,
+            "description": (
+                f"Uniform point sampling from {GEOMETRY_SOURCE_LABELS[source_name]} "
+                "instead of the preprocessed surface point cloud."
+            ),
+            "id": next_mode_id + source_idx,
+        }
+
     checkpoint_arg_map = {
         "SMART": args.smart_checkpoint,
         "SMART_DOWNSAMPLE": args.smart_downsample_checkpoint,
@@ -2754,19 +3245,25 @@ def main():
         "SMART_SATLOSS6_GRADNORM": args.smart_satloss6_gradnorm_checkpoint,
         "SMART_SATLOSS6_CONFIG_FULL": args.smart_satloss6_config_full_checkpoint,
         "SMART_SATLOSS6_CONFIG_LAYER": args.smart_satloss6_config_layer_checkpoint,
+        "SMART_SATLOSS7": args.smart_satloss7_checkpoint,
         "TRANSOLVERPP": args.transolverpp_checkpoint,
         "TRANSOLVERPP_SATLOSS3": args.transolverpp_satloss3_checkpoint,
         "TRANSOLVERPP_SATLOSS6": args.transolverpp_satloss6_checkpoint,
+        "TRANSOLVERPP_SATLOSS7": args.transolverpp_satloss7_checkpoint,
         "POINTNET2_SSG": args.pointnet2_ssg_checkpoint,
         "POINTNET2_SSG_SATLOSS6": args.pointnet2_ssg_satloss6_checkpoint,
+        "POINTNET2_SSG_SATLOSS7": args.pointnet2_ssg_satloss7_checkpoint,
         "POINT_GNN": args.point_gnn_checkpoint,
         "POINT_GNN_SATLOSS6": args.point_gnn_satloss6_checkpoint,
         "LNO": args.lno_checkpoint,
         "LNO_SATLOSS6": args.lno_satloss6_checkpoint,
+        "LNO_SATLOSS7": args.lno_satloss7_checkpoint,
         "MSPT": args.mspt_checkpoint,
         "MSPT_SATLOSS6": args.mspt_satloss6_checkpoint,
+        "MSPT_SATLOSS7": args.mspt_satloss7_checkpoint,
         "POINT_TRANSFORMER_V3": args.point_transformer_v3_checkpoint,
         "POINT_TRANSFORMER_V3_SATLOSS6": args.point_transformer_v3_satloss6_checkpoint,
+        "POINT_TRANSFORMER_V3_SATLOSS7": args.point_transformer_v3_satloss7_checkpoint,
     }
     requested_model_names = [model_name for model_name in MODEL_ORDER if checkpoint_arg_map[model_name] is not None]
     if not requested_model_names:
@@ -2830,7 +3327,37 @@ def main():
         geometry_density_cache_dtype=density_cache_dtype,
     )
 
-    run_ids = select_run_ids(dataset.test_ids, args.num_runs, args.run_ids, args.seed)
+    surface_vtp_dir = Path(args.surface_vtp_dir).expanduser().resolve()
+    decimated_vtp_dir = Path(args.decimated_vtp_dir).expanduser().resolve()
+    geometry_candidate_ids: set[int] | None = None
+    if active_geometry_sources:
+        geometry_candidate_ids = {int(run_id) for run_id in dataset.test_ids}
+        for source_name in active_geometry_sources:
+            source_ids = {
+                int(path.parent.name.split("_", 1)[1])
+                for path in (
+                    geometry_source_vtp_path(source_name, run_id, surface_vtp_dir, decimated_vtp_dir)
+                    for run_id in dataset.test_ids
+                )
+                if path.is_file()
+            }
+            geometry_candidate_ids.intersection_update(source_ids)
+        if not geometry_candidate_ids:
+            raise FileNotFoundError(
+                "No test-split runs contain every requested geometry source: "
+                f"{active_geometry_sources}. Check --surface-vtp-dir and --decimated-vtp-dir."
+            )
+        print(
+            f"VTP geometry tests available on {len(geometry_candidate_ids)} test runs; "
+            f"selecting from the common completed subset."
+        )
+    run_ids = select_run_ids(
+        dataset.test_ids,
+        args.num_runs,
+        args.run_ids,
+        args.seed,
+        candidate_ids=geometry_candidate_ids,
+    )
     print(f"Evaluating run ids: {run_ids}")
     vtk_run_id = int(args.vtk_run_id) if args.vtk_run_id is not None else int(run_ids[0])
     if vtk_run_id not in run_ids:
@@ -2988,6 +3515,21 @@ def main():
         surf_gt_full = np.concatenate([surf_p, surf_n, surf_wx, surf_wy, surf_wz], axis=1)
         full_drag_force_gt = compute_surface_drag_force_x(surf_gt_full, surf_area_full)
 
+        geometry_source_points: Dict[str, np.ndarray] = {}
+        geometry_source_norm: Dict[str, torch.Tensor] = {}
+        for source_name in active_geometry_sources:
+            source_path = geometry_source_vtp_path(source_name, run_id, surface_vtp_dir, decimated_vtp_dir)
+            source_points = read_vtp_points(source_path)
+            validate_geometry_source_bbox(source_points, surf_coords_full, source_name, run_id)
+            geometry_source_points[source_name] = source_points
+            geometry_source_norm[source_name] = normalize_pos(
+                torch.from_numpy(source_points), min_pos, max_pos
+            )
+            print(
+                f"run_{run_id} {source_name}: {source_points.shape[0]} source points "
+                f"from {source_path.name}"
+            )
+
         vol_coords_full = np.load(run_dir / "volume_coords.npy").astype(np.float32, copy=False)
         vol_p = np.load(run_dir / "volume_pMeanTrim.npy").astype(np.float32, copy=False).reshape(-1, 1)
         vol_u = np.load(run_dir / "volume_UMeanTrim.npy").astype(np.float32, copy=False)
@@ -3061,10 +3603,22 @@ def main():
                 if model_density_source is not None:
                     sampling_density_np = model_density_source.to(dtype=torch.float32).numpy()
                 idx_list: List[np.ndarray] = []
+                geo_view_source = None
+                if mode_info["kind"] == "geometry_vtp":
+                    geo_view_source = geometry_source_points[str(mode_info["geometry_source"])]
+                    sampling_density_np = None
                 subset_density_stats: List[Dict[str, float]] = []
                 for view_idx in range(views_per_mode):
                     rng = np.random.default_rng(np.random.SeedSequence([args.seed, int(run_id), int(mode_info["id"]), int(view_idx)]))
-                    if mode_info["kind"] == "uniform_wor":
+                    if mode_info["kind"] == "geometry_vtp":
+                        if geo_view_source.shape[0] < model_input_points:
+                            raise ValueError(
+                                f"{mode_info['geometry_source']} run_{run_id} has only "
+                                f"{geo_view_source.shape[0]} points, below the configured "
+                                f"{model_name} input budget {model_input_points}."
+                            )
+                        idx = sample_uniform_without_replacement(geo_view_source.shape[0], model_input_points, rng)
+                    elif mode_info["kind"] == "uniform_wor":
                         idx = (
                             sample_uniform_with_replacement(surf_coords_full.shape[0], model_input_points, rng)
                             if input_sampling_with_replacement
@@ -3091,15 +3645,25 @@ def main():
                     else:
                         raise ValueError(f"Unsupported sampling kind: {mode_info['kind']}")
                     idx_list.append(idx)
-                    subset = sampling_density_np[idx]
-                    subset_density_stats.append(
-                        {
-                            "subset_log_density_mean": float(np.mean(subset)),
-                            "subset_log_density_std": float(np.std(subset)),
-                            "subset_log_density_p05": float(np.percentile(subset, 5)),
-                            "subset_log_density_p95": float(np.percentile(subset, 95)),
-                        }
-                    )
+                    if sampling_density_np is None:
+                        subset_density_stats.append(
+                            {
+                                "subset_log_density_mean": math.nan,
+                                "subset_log_density_std": math.nan,
+                                "subset_log_density_p05": math.nan,
+                                "subset_log_density_p95": math.nan,
+                            }
+                        )
+                    else:
+                        subset = sampling_density_np[idx]
+                        subset_density_stats.append(
+                            {
+                                "subset_log_density_mean": float(np.mean(subset)),
+                                "subset_log_density_std": float(np.std(subset)),
+                                "subset_log_density_p05": float(np.percentile(subset, 5)),
+                                "subset_log_density_p95": float(np.percentile(subset, 95)),
+                            }
+                        )
                 model_surface_query_points = int(per_model_query_budgets[model_name]["surface"])
                 model_volume_query_points = int(per_model_query_budgets[model_name]["volume"])
                 surf_query_idx = surf_query_idx_master[:model_surface_query_points]
@@ -3114,7 +3678,11 @@ def main():
                 for batch_start in range(0, views_per_mode, view_batch_size):
                     batch_stop = min(batch_start + view_batch_size, views_per_mode)
                     batch_indices = idx_list[batch_start:batch_stop]
-                    geo_view_tensors = [full_surf_query_norm[torch.from_numpy(idx)] for idx in batch_indices]
+                    if mode_info["kind"] == "geometry_vtp":
+                        source_norm = geometry_source_norm[str(mode_info["geometry_source"])]
+                        geo_view_tensors = [source_norm[torch.from_numpy(idx)] for idx in batch_indices]
+                    else:
+                        geo_view_tensors = [full_surf_query_norm[torch.from_numpy(idx)] for idx in batch_indices]
                     geo_views_norm = torch.stack(geo_view_tensors, dim=0)
                     if model_uses_density(model_name):
                         density_source = model_full_geo_log_density_by_name[model_name]
@@ -3188,7 +3756,10 @@ def main():
                                 "sampling_mode_id": int(mode_info["id"]),
                                 "checkpoint": model_specs[model_name]["checkpoint"],
                                 "input_points": int(batch_indices[local_idx].shape[0]),
-                                "input_sampling_with_replacement": bool(input_sampling_with_replacement),
+                                "input_sampling_with_replacement": bool(
+                                    False if mode_info["kind"] == "geometry_vtp" else input_sampling_with_replacement
+                                ),
+                                "geometry_source": str(mode_info.get("geometry_source", "preprocessed_surface")),
                                 "configured_eval_sampling_mode": configured_sampling_mode,
                                 "sampling_density_estimator": (
                                     model_internal_density_specs.get(model_name, {}).get("estimator", density_estimator)
@@ -3198,7 +3769,11 @@ def main():
                                 ),
                                 "surface_query_points": model_surface_query_points,
                                 "volume_query_points": model_volume_query_points,
-                                "full_log_density_mean": float(np.mean(sampling_density_np)),
+                                "full_log_density_mean": (
+                                    float(np.mean(sampling_density_np))
+                                    if sampling_density_np is not None
+                                    else float("nan")
+                                ),
                                 "surface_drag_force_x_gt": float(surf_drag_force_gt),
                                 "surface_drag_force_x_pred": float(surf_drag_force_pred),
                                 "surface_drag_force_x_full_gt": float(full_drag_force_gt),
@@ -3240,6 +3815,7 @@ def main():
         "checkpoint",
         "input_points",
         "input_sampling_with_replacement",
+        "geometry_source",
         "configured_eval_sampling_mode",
         "sampling_density_estimator",
         "sampling_density_knn_k",
@@ -3388,11 +3964,17 @@ def main():
     )
 
     percentage_metric_keys = HEADLINE_METRIC_KEYS + SURFACE_FIELD_METRIC_KEYS + VOLUME_FIELD_METRIC_KEYS
-    percentage_rows = build_percentage_degradation_rows(
+    all_percentage_rows = build_percentage_degradation_rows(
         per_run_mode_rows,
         evaluated_model_names,
         percentage_metric_keys,
     )
+    percentage_endpoint_mode_names = build_endpoint_mode_names(mode_defs, active_geometry_sources)
+    percentage_endpoint_mode_set = set(percentage_endpoint_mode_names)
+    percentage_rows = [
+        row for row in all_percentage_rows
+        if str(row["sampling_mode"]) in percentage_endpoint_mode_set
+    ]
     write_csv(
         out_root / "percentage_degradation_metrics.csv",
         percentage_rows,
@@ -4010,6 +4592,42 @@ def main():
     all_rows = [r for r in per_run_mode_rows if r["model_name"] in all_models]
     all_aggregate_rows = [r for r in aggregate_rows if r["model_name"] in all_models]
     all_percentage_rows = [r for r in percentage_rows if r["model_name"] in all_models]
+
+    satloss_endpoint_specs: List[Tuple[str, str]] = []
+    if beta_mode_order:
+        beta_endpoint = max(beta_mode_order, key=lambda name: float(mode_defs[name]["beta"]))
+        satloss_endpoint_specs.append(("beta_1", beta_endpoint))
+    if sine_y_mode_order:
+        sine_y_endpoint = max(sine_y_mode_order, key=lambda name: float(mode_defs[name]["mix_fraction"]))
+        satloss_endpoint_specs.append(("sine_y_1", sine_y_endpoint))
+    if sine_x_mode_order:
+        sine_x_endpoint = max(sine_x_mode_order, key=lambda name: float(mode_defs[name]["mix_fraction"]))
+        satloss_endpoint_specs.append(("sine_x_1", sine_x_endpoint))
+    if "geometry_decimated_div5" in mode_defs:
+        satloss_endpoint_specs.append(("decimation_5", "geometry_decimated_div5"))
+    if "geometry_decimated_div10" in mode_defs:
+        satloss_endpoint_specs.append(("decimation_10", "geometry_decimated_div10"))
+    satloss_endpoint_rows = build_satloss_endpoint_improvement_rows(
+        all_aggregate_rows,
+        all_models,
+        satloss_endpoint_specs,
+        "combined_global_rel_l2",
+    )
+    satloss_table_csv = out_root / "all_models_combined_global_satloss_endpoint_improvement.csv"
+    satloss_table_md = out_root / "all_models_combined_global_satloss_endpoint_improvement.md"
+    satloss_table_png = out_root / "all_models_combined_global_satloss_endpoint_improvement.png"
+    write_satloss_endpoint_table(
+        satloss_endpoint_rows,
+        satloss_endpoint_specs,
+        satloss_table_csv,
+        satloss_table_md,
+    )
+    plot_satloss_endpoint_improvement_bars(
+        satloss_endpoint_rows,
+        satloss_endpoint_specs,
+        satloss_table_png,
+        "SATLOSS improvement versus vanilla at endpoint shifts",
+    )
     all_beta_rows = maybe_apply_linechart_test_offset(
         all_aggregate_rows,
         beta_mode_order,
@@ -4073,7 +4691,27 @@ def main():
                             all_models,
                             out_root / f"all_models_{metric_slug}_endpoint_bars_{shift_slug}_{scale_slug}.png",
                             f"All compared models: {metric_slug.replace('_', ' ')} endpoint error ({shift_slug}, {scale_slug} scale)",
-                            True,
+                            False,
+                            log_scale,
+                        ),
+                    )
+                )
+
+    geometry_mode_order = [f"geometry_{source_name}" for source_name in active_geometry_sources]
+    if geometry_mode_order:
+        for metric_key, metric_slug in (("combined_global_rel_l2", "combined_global"),):
+            for log_scale, scale_slug in ((True, "log"), (False, "linear")):
+                plot_jobs.append(
+                    (
+                        plot_geometry_source_bars,
+                        (
+                            all_aggregate_rows,
+                            metric_key,
+                            geometry_mode_order,
+                            all_models,
+                            out_root / f"all_models_{metric_slug}_geometry_sources_bars_{scale_slug}.png",
+                            f"All compared models: {metric_slug.replace('_', ' ')} by geometry source ({scale_slug} scale)",
+                            False,
                             log_scale,
                         ),
                     )
@@ -4512,6 +5150,55 @@ def main():
         )
         sampling_histogram_paths.append(str(overlay_linear_path))
 
+    geometry_sampling_vtk_paths: List[str] = []
+    geometry_sampling_plot_paths: List[str] = []
+    geometry_vtk_run_id = int(vtk_run_id)
+    if active_geometry_sources:
+        if not all(
+            geometry_source_vtp_path(source_name, geometry_vtk_run_id, surface_vtp_dir, decimated_vtp_dir).is_file()
+            for source_name in active_geometry_sources
+        ):
+            geometry_vtk_run_id = int(run_ids[0])
+        source_sampled_points: Dict[str, np.ndarray] = {}
+        for source_idx, source_name in enumerate(active_geometry_sources):
+            source_path = geometry_source_vtp_path(source_name, geometry_vtk_run_id, surface_vtp_dir, decimated_vtp_dir)
+            source_points = read_vtp_points(source_path)
+            reference_points = np.load(
+                Path(smart_cfg.data_path) / f"run_{geometry_vtk_run_id}" / "surface_coords.npy"
+            ).astype(np.float32, copy=False)
+            validate_geometry_source_bbox(source_points, reference_points, source_name, geometry_vtk_run_id)
+            if source_points.shape[0] < sampling_budget:
+                raise ValueError(
+                    f"Representative {source_name} VTP run_{geometry_vtk_run_id} has "
+                    f"{source_points.shape[0]} points, below the largest active model input budget {sampling_budget}."
+                )
+            source_rng = np.random.default_rng(
+                np.random.SeedSequence([args.seed, geometry_vtk_run_id, 777700, source_idx])
+            )
+            source_idx_array = sample_uniform_without_replacement(source_points.shape[0], sampling_budget, source_rng)
+            sampled_points = source_points[source_idx_array]
+            source_sampled_points[source_name] = sampled_points
+            source_vtk_path = out_root / (
+                f"drivaerml_test_run_{geometry_vtk_run_id}_input_points_{sampling_budget}_"
+                f"geometry_{source_name}.vtk"
+            )
+            write_polydata_vtk(source_vtk_path, sampled_points, {})
+            geometry_sampling_vtk_paths.append(str(source_vtk_path))
+        geometry_plot_path = out_root / (
+            f"drivaerml_test_run_{geometry_vtk_run_id}_input_points_{sampling_budget}_"
+            "geometry_sources_distribution.png"
+        )
+        save_geometry_source_distribution_plot(
+            geometry_plot_path,
+            reference_points,
+            source_sampled_points,
+            title=(
+                f"Run {geometry_vtk_run_id}: VTP geometry-source input distributions "
+                f"({sampling_budget} sampled points)"
+            ),
+        )
+        geometry_sampling_plot_paths.append(str(geometry_plot_path))
+
     representative_view2_sampling_vtk_paths: List[str] = []
     if "SMART_DOWNSAMPLE" in model_specs:
         downsample_cfg = model_specs["SMART_DOWNSAMPLE"]["config"]
@@ -4724,6 +5411,10 @@ def main():
             "ood_sine_axes": ["x", "y"],
             "ood_sine_mix_levels": sine_mix_levels,
             "ood_distribution_shifts": [shift for shift in active_shifts if shift != "beta"],
+            "active_geometry_sources": active_geometry_sources,
+            "surface_vtp_dir": str(surface_vtp_dir),
+            "decimated_vtp_dir": str(decimated_vtp_dir),
+            "geometry_test_common_subset_size": len(geometry_candidate_ids) if geometry_candidate_ids is not None else 0,
             "views_per_mode": views_per_mode,
             "view_batch_size": view_batch_size,
             "model_repeats": int(args.model_repeats),
@@ -4741,6 +5432,12 @@ def main():
             "representative_sampling_point_source_run_id": vtk_run_id,
             "representative_sampling_point_vtks": sampling_vtk_paths,
             "representative_sampling_point_histograms": sampling_histogram_paths,
+            "representative_geometry_sampling_vtks": geometry_sampling_vtk_paths,
+            "representative_geometry_sampling_plots": geometry_sampling_plot_paths,
+            "representative_geometry_vtk_run_id": geometry_vtk_run_id if active_geometry_sources else None,
+            "satloss_endpoint_table_csv": str(satloss_table_csv),
+            "satloss_endpoint_table_markdown": str(satloss_table_md),
+            "satloss_endpoint_table_plot": str(satloss_table_png),
             "representative_view2_sampling_vtks": representative_view2_sampling_vtk_paths,
             "audi_vtk_skipped_models": audi_vtk_skipped_models,
             "encoder_budget_mismatches": encoder_budget_mismatch_models,
@@ -4774,6 +5471,9 @@ def main():
         f"- Beta-shift modes use inverse-density sampling without replacement at betas `{shift_betas}` and keep the same point budget.",
         f"- Sampling shifts are computed with the requested CLI density estimator `{density_estimator}`, but density-aware models receive density tensors from their own training config when available.",
         "- Spatial modes use controlled mixtures of uniform sampling with the restored sinusoidal-x/y fields. They keep the same point budget and do not mask or delete a region.",
+        "- Geometry-source modes are separate tests: the aligned preprocessed cloud is the baseline, while additional inputs are sampled from completed geometry-only div5/div10 VTPs. Beta/sine modes never read VTPs.",
+        "- VTP geometry coordinates are validated against the matching preprocessed run bounding box before normalization; the accepted tolerance is 2.5e-3 in world-coordinate units.",
+        "- VTP geometry-source modes use uniform sampling without replacement from decimated VTP vertices, then the sampled coordinates are normalized with the same global training bounds used by the models.",
         "- Each remeshing intensity is evaluated only at the two endpoints `0.0` and `1.0`; intermediate intensities are intentionally not sampled.",
         "- For every OOD mixture severity `s`, the sampler takes exactly `round(s * K)` points from the shifted probability field and the remaining points uniformly from the leftover pool, so the severity has an exact point-count interpretation.",
         "- If `beta=0` is included in the shifted list, it acts as a uniform-without-replacement sanity-check mode and should match the aligned mode up to sampling randomness.",
@@ -4821,7 +5521,8 @@ def main():
         "- `robustness_summary.csv`: strongest-shift robustness summary.",
         "- `paired_statistics.csv`: paired run-level deltas, quantiles, 95% CIs, and normal-approximation p-values.",
         "- Rendered model-error PNGs are limited to all-model `combined_global` aggregate comparisons.",
-        "- Combined-global endpoint bars use a log y-axis, standard-deviation whiskers, and signed percentage labels versus the vanilla minimum-intensity error.",
+        "- Combined-global endpoint bars use a log y-axis and signed percentage labels; standard-deviation whiskers are disabled for the rendered endpoint and geometry-source bars.",
+        "- Percentage outputs keep only beta maximum, sine-y maximum, sine-x maximum, and div10. The SATLOSS endpoint table additionally includes div5 and reports improvement as `(vanilla error - SATLOSS error) / vanilla error`.",
         "- Field-level values remain available in the CSV files, but their plots and all family-specific plots are intentionally omitted.",
         "- `audi_surface_pressure_predictions.vtk`: full Audi surface pressure ground truth plus every active model's pressure prediction and per-point error fields.",
         "- `results.json`: machine-readable summary including any representative-VTK model skips.",
@@ -4829,6 +5530,10 @@ def main():
         f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_inverse_density_beta_*_density_hist.png`: density-distribution histogram for each sampled input-point VTK.",
         f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_ood_sine_[xy]_mix_*_[xy]_hist.png`: coordinate histograms for the sine-x and sine-y sampled input-point VTKs.",
         f"- `drivaerml_test_run_{vtk_run_id}_input_points_{sampling_budget}_ood_*_endpoint_distribution.png`: endpoint distribution plots for every active spatial shift.",
+        f"- `drivaerml_test_run_<run>_input_points_{sampling_budget}_geometry_*.vtk`: representative input samples from the active decimated VTP geometries.",
+        f"- `drivaerml_test_run_<run>_input_points_{sampling_budget}_geometry_sources_distribution.png`: normalized x/y/z distribution comparison against the matching preprocessed geometry.",
+        "- `all_models_combined_global_geometry_sources_bars_log.png` and `_linear.png`: aggregate errors for aligned, div5, and div10 inputs; percentages are relative to each model's aligned error.",
+        "- `all_models_combined_global_satloss_endpoint_improvement.csv`, `.md`, and `.png`: endpoint-only SATLOSS-versus-vanilla relative improvement table and plot.",
     ]
     )
     (out_root / "workflow.md").write_text("\n".join(workflow_lines), encoding="utf-8")

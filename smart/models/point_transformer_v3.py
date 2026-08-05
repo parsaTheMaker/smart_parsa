@@ -104,6 +104,37 @@ def _query_local_geometry_features(
     return torch.stack(output, dim=0)
 
 
+def _subsample_local_geometry_support(geometry_coords, geometry_features, geometry_batch, max_points):
+    """Keep a deterministic, spatially ordered support set for query KNN.
+
+    PTv3 still encodes every input point. This only limits the auxiliary
+    query interpolation support, avoiding an unnecessarily quadratic KNN over
+    all decoded geometry points.
+    """
+    max_points = int(max_points)
+    if max_points <= 0 or geometry_coords.numel() == 0:
+        return geometry_coords, geometry_features, geometry_batch
+
+    selected = []
+    batch_size = int(geometry_batch.max().item()) + 1
+    for batch_index in range(batch_size):
+        batch_indices = torch.nonzero(geometry_batch == batch_index, as_tuple=False).flatten()
+        count = int(batch_indices.numel())
+        if count <= max_points:
+            selected.append(batch_indices)
+            continue
+        support_count = max_points
+        relative = (torch.arange(support_count, device=batch_indices.device, dtype=torch.long) * count) // support_count
+        selected.append(batch_indices.index_select(0, relative))
+
+    selected = torch.cat(selected, dim=0)
+    return (
+        geometry_coords.index_select(0, selected),
+        geometry_features.index_select(0, selected),
+        geometry_batch.index_select(0, selected),
+    )
+
+
 class _DropPath(nn.Module):
     def __init__(self, drop_prob=0.0):
         super().__init__()
@@ -666,6 +697,7 @@ class PointTransformerV3(nn.Module):
         local_query_neighbors=4,
         local_query_chunk_size=8192,
         use_local_query_features=True,
+        subsampled_geometry_points=0,
         dropout=0.0,
         geometry_input_scale=1.0,
         voxel_density_power=0.0,
@@ -689,6 +721,7 @@ class PointTransformerV3(nn.Module):
         self.local_query_neighbors = max(1, int(local_query_neighbors))
         self.local_query_chunk_size = max(1, int(local_query_chunk_size))
         self.use_local_query_features = bool(use_local_query_features)
+        self.subsampled_geometry_points = max(0, int(subsampled_geometry_points))
         self.backbone = _PTv3Backbone(
             in_channels=int(in_channels), order=order, stride=stride,
             enc_depths=enc_depths, enc_channels=enc_channels, enc_heads=enc_heads,
@@ -890,11 +923,19 @@ class PointTransformerV3(nn.Module):
                 and geometry_features is not None
                 and geometry_batch is not None
             ):
+                local_geometry_coords, local_geometry_features, local_geometry_batch = (
+                    _subsample_local_geometry_support(
+                        geometry_coords,
+                        geometry_features,
+                        geometry_batch,
+                        self.subsampled_geometry_points,
+                    )
+                )
                 local_features = _query_local_geometry_features(
                     queries,
-                    geometry_coords,
-                    geometry_features,
-                    geometry_batch,
+                    local_geometry_coords,
+                    local_geometry_features,
+                    local_geometry_batch,
                     neighbors=self.local_query_neighbors,
                     chunk_size=self.local_query_chunk_size,
                 ).float()

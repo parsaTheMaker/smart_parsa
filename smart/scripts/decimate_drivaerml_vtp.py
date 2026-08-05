@@ -26,6 +26,7 @@ import json
 import math
 import multiprocessing as mp
 import os
+import queue
 import re
 import signal
 import time
@@ -95,6 +96,7 @@ def parse_args() -> argparse.Namespace:
             "voxel_quadric_clustering",
             "quadric_decimation",
             "isotropic_remeshing",
+            "isotropic_gpu",
         ),
         default="decimate_pro",
         help=(
@@ -149,6 +151,31 @@ def parse_args() -> argparse.Namespace:
             "Pre-reduce with VTK to this multiple of the target triangle count "
             "before ACVD (default: 1.25)."
         ),
+    )
+    parser.add_argument(
+        "--gpu-device",
+        default="cuda:0",
+        help="Single CUDA device for --method isotropic_gpu (default: cuda:0).",
+    )
+    parser.add_argument(
+        "--gpu-devices",
+        default=None,
+        help=(
+            "Comma-separated CUDA devices for --method isotropic_gpu, one fixed worker per device, "
+            "for example cuda:0,cuda:1. Overrides --gpu-device."
+        ),
+    )
+    parser.add_argument(
+        "--gpu-adjustments",
+        type=int,
+        default=3,
+        help="CUDA voxel-size feedback steps for --method isotropic_gpu (default: 3).",
+    )
+    parser.add_argument(
+        "--gpu-face-chunk-size",
+        type=int,
+        default=1_048_576,
+        help="Faces processed per CUDA remapping chunk (default: 1048576).",
     )
     parser.add_argument(
         "--runs",
@@ -340,6 +367,182 @@ def run_isotropic_remeshing(
     return output
 
 
+def _gpu_voxel_remesh(torch, points, faces, voxel_size, face_chunk_size):
+    """CUDA voxel-centroid remeshing for one voxel size.
+
+    All expensive point assignment, centroid accumulation, face remapping, and
+    duplicate-face removal remain on CUDA. The returned tensors are still on
+    CUDA so the caller can adjust the voxel size without round-tripping data.
+    """
+    bounds_min = points.amin(dim=0)
+    cell_index = torch.floor((points - bounds_min) / float(voxel_size)).to(torch.int64)
+    _unique_cells, point_cluster = torch.unique(cell_index, dim=0, return_inverse=True)
+    cluster_count = int(_unique_cells.shape[0])
+    if cluster_count < 4:
+        raise RuntimeError("CUDA voxel remeshing collapsed the surface to fewer than four cells.")
+    del cell_index, _unique_cells
+
+    centroids = torch.zeros((cluster_count, 3), device=points.device, dtype=torch.float32)
+    centroids.index_add_(0, point_cluster, points)
+    counts = torch.bincount(point_cluster, minlength=cluster_count).to(dtype=torch.float32)
+    centroids = centroids / counts.clamp_min(1.0).unsqueeze(1)
+
+    max_key = torch.iinfo(torch.int64).max
+    if cluster_count > int(max_key ** (1.0 / 3.0)):
+        raise RuntimeError("CUDA voxel cluster index range is too large for exact face keys.")
+    face_keys = []
+    num_faces = int(faces.shape[0])
+    for start in range(0, num_faces, int(face_chunk_size)):
+        mapped = point_cluster[faces[start:start + int(face_chunk_size)]]
+        mapped = torch.sort(mapped, dim=1).values
+        valid = (mapped[:, 0] < mapped[:, 1]) & (mapped[:, 1] < mapped[:, 2])
+        mapped = mapped[valid]
+        if mapped.numel() > 0:
+            key = (mapped[:, 0] * cluster_count + mapped[:, 1]) * cluster_count + mapped[:, 2]
+            face_keys.append(key)
+        del mapped, valid
+    if not face_keys:
+        raise RuntimeError("CUDA voxel remeshing produced no non-degenerate faces.")
+    unique_keys = torch.unique(torch.cat(face_keys), sorted=True)
+    del face_keys, point_cluster, counts
+    square = cluster_count * cluster_count
+    face_a = unique_keys // square
+    remainder = unique_keys - face_a * square
+    face_b = remainder // cluster_count
+    face_c = remainder - face_b * cluster_count
+    remapped_faces = torch.stack((face_a, face_b, face_c), dim=1).to(torch.int64)
+    # Voxel vertex merging can make more than two source triangles share an
+    # edge. Remove only the excess incident triangles on CUDA so the output
+    # does not contain non-manifold edges before it is handed back to VTK.
+    num_output_vertices = cluster_count
+    edge_pairs = torch.stack(
+        (
+            remapped_faces[:, [0, 1]],
+            remapped_faces[:, [1, 2]],
+            remapped_faces[:, [0, 2]],
+        ),
+        dim=1,
+    ).reshape(-1, 2)
+    edge_pairs = torch.sort(edge_pairs, dim=1).values
+    edge_keys = edge_pairs[:, 0] * num_output_vertices + edge_pairs[:, 1]
+    order = torch.argsort(edge_keys)
+    sorted_keys = edge_keys[order]
+    unique_edge_keys, edge_counts = torch.unique_consecutive(sorted_keys, return_counts=True)
+    edge_starts = torch.cumsum(edge_counts, dim=0) - edge_counts
+    edge_rank = torch.arange(sorted_keys.numel(), device=faces.device) - torch.repeat_interleave(
+        edge_starts, edge_counts
+    )
+    allowed_occurrences = edge_rank < 2
+    face_ids = torch.arange(remapped_faces.shape[0], device=faces.device).repeat_interleave(3)[order]
+    keep_faces = torch.ones(remapped_faces.shape[0], device=faces.device, dtype=torch.int8)
+    keep_faces.scatter_reduce_(
+        0,
+        face_ids,
+        allowed_occurrences.to(torch.int8),
+        reduce="amin",
+        include_self=True,
+    )
+    keep_faces = keep_faces.bool()
+    remapped_faces = remapped_faces[keep_faces]
+    del (
+        edge_pairs,
+        edge_keys,
+        order,
+        sorted_keys,
+        unique_edge_keys,
+        edge_counts,
+        edge_starts,
+        edge_rank,
+        allowed_occurrences,
+        face_ids,
+        keep_faces,
+    )
+    if remapped_faces.shape[0] == 0:
+        raise RuntimeError("CUDA manifold cleanup removed every triangle.")
+    used_clusters, compact_faces = torch.unique(
+        remapped_faces.reshape(-1), sorted=True, return_inverse=True
+    )
+    output_points = centroids[used_clusters]
+    output_faces = compact_faces.reshape(-1, 3)
+    del unique_keys, face_a, face_b, face_c, remainder, remapped_faces, used_clusters, compact_faces, centroids
+    return output_points, output_faces
+
+
+def run_isotropic_gpu(vtk, vtk_to_numpy, polydata, target_edge_length: float, target_triangles: float, args):
+    """GPU-native uniform surface remeshing using CUDA voxel centroids."""
+    try:
+        import torch
+        from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
+    except Exception as exc:  # pragma: no cover - environment-specific
+        raise RuntimeError("PyTorch and VTK NumPy bindings are required for isotropic_gpu.") from exc
+    if not torch.cuda.is_available():
+        raise RuntimeError("--method isotropic_gpu requires a CUDA-capable PyTorch runtime.")
+    if args.gpu_adjustments <= 0 or args.gpu_face_chunk_size <= 0:
+        raise ValueError("GPU adjustment and face chunk sizes must be positive.")
+
+    device = torch.device(args.gpu_device)
+    if device.type != "cuda":
+        raise ValueError(f"--gpu-device must be CUDA, got {args.gpu_device!r}.")
+    try:
+        torch.cuda.get_device_properties(device)
+    except Exception as exc:
+        raise RuntimeError(f"Cannot access CUDA device {args.gpu_device!r}.") from exc
+
+    points_np = np.asarray(vtk_to_numpy(polydata.GetPoints().GetData()), dtype=np.float32)
+    raw_cells = np.asarray(vtk_to_numpy(polydata.GetPolys().GetData()))
+    if raw_cells.size == 0 or raw_cells.size % 4 != 0 or not np.all(raw_cells[::4] == 3):
+        raise RuntimeError("isotropic_gpu requires triangle-only input.")
+    faces_np = np.ascontiguousarray(raw_cells.reshape(-1, 4)[:, 1:], dtype=np.int64)
+    del raw_cells
+    points = torch.as_tensor(points_np, device=device, dtype=torch.float32)
+    faces = torch.as_tensor(faces_np, device=device, dtype=torch.int64)
+    del points_np, faces_np
+
+    target_triangles = float(target_triangles)
+    voxel_size = float(target_edge_length)
+    output_points = output_faces = None
+    for _attempt in range(int(args.gpu_adjustments)):
+        if output_points is not None:
+            del output_points, output_faces
+        output_points, output_faces = _gpu_voxel_remesh(
+            torch,
+            points,
+            faces,
+            voxel_size,
+            args.gpu_face_chunk_size,
+        )
+        actual_triangles = max(int(output_faces.shape[0]), 1)
+        if _attempt + 1 < int(args.gpu_adjustments):
+            correction = float(np.clip(math.sqrt(actual_triangles / target_triangles), 0.65, 1.55))
+            if abs(actual_triangles / target_triangles - 1.0) < 0.04:
+                break
+            voxel_size *= correction
+
+    output_points_cpu = output_points.detach().cpu().numpy().astype(np.float32, copy=False)
+    output_faces_cpu = output_faces.detach().cpu().numpy().astype(np.int64, copy=False)
+    del output_points, output_faces, points, faces
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+
+    result = vtk.vtkPolyData()
+    vtk_points = vtk.vtkPoints()
+    vtk_points.SetData(numpy_to_vtk(output_points_cpu, deep=True))
+    result.SetPoints(vtk_points)
+    id_dtype = np.int64 if vtk.vtkIdTypeArray().GetDataTypeSize() == 8 else np.int32
+    connectivity = np.empty((output_faces_cpu.shape[0], 4), dtype=id_dtype)
+    connectivity[:, 0] = 3
+    connectivity[:, 1:] = output_faces_cpu
+    cells = vtk.vtkCellArray()
+    cells.SetCells(
+        int(output_faces_cpu.shape[0]),
+        numpy_to_vtkIdTypeArray(connectivity.reshape(-1), deep=True),
+    )
+    result.SetPolys(cells)
+    result.BuildCells()
+    del output_points_cpu, output_faces_cpu, connectivity
+    return geometry_only(vtk, result)
+
+
 def run_quadric_decimation_to_triangles(vtk, polydata, target_triangles: int):
     """Fast compiled VTK seed reduction used before ACVD clustering."""
     source_triangles = int(polydata.GetNumberOfPolys())
@@ -464,12 +667,16 @@ def process_input(vtk, vtk_to_numpy, input_path: Path, args, factors, calibrated
     current = original
     current_factor = 1
     source_surface_area = None
-    if args.method == "isotropic_remeshing":
+    if args.method in {"isotropic_remeshing", "isotropic_gpu"}:
         source_surface_area = surface_area(vtk, original)
 
     # ACVD is fastest at the coarse targets. Process those first so a long
     # full-mesh input reports useful progress before the finest target runs.
-    factor_sequence = sorted(factors, reverse=True) if args.method == "isotropic_remeshing" else factors
+    factor_sequence = (
+        sorted(factors, reverse=True)
+        if args.method in {"isotropic_remeshing", "isotropic_gpu"}
+        else factors
+    )
     for factor in factor_sequence:
         output_path = args.output_dir / input_path.parent.name / f"{input_path.stem}_faces_div{factor}.vtp"
         if output_path.is_file() and not args.overwrite:
@@ -525,6 +732,24 @@ def process_input(vtk, vtk_to_numpy, input_path: Path, args, factors, calibrated
                 vtk,
                 original,
                 source_triangles,
+                target_edge_length,
+                target_triangles,
+                args,
+            )
+        elif args.method == "isotropic_gpu":
+            target_triangles = max(4.0, float(source_triangles) / float(factor))
+            target_edge_length = math.sqrt(
+                4.0 * float(source_surface_area) / (math.sqrt(3.0) * target_triangles)
+            )
+            print(
+                f"[run {input_path.parent.name}] factor={factor} "
+                f"backend=cuda target_edge={target_edge_length:.6g} starting",
+                flush=True,
+            )
+            decimated = run_isotropic_gpu(
+                vtk,
+                vtk_to_numpy,
+                original,
                 target_edge_length,
                 target_triangles,
                 args,
@@ -601,6 +826,34 @@ def process_worker(payload):
         return [{"input": str(input_path), "status": "failed", "error": repr(exc)}]
 
 
+def process_gpu_worker(gpu_device, input_paths, args, factors, calibrated, result_queue):
+    """Run one fixed worker per CUDA device without sharing a GPU between workers."""
+    args.gpu_device = gpu_device
+    try:
+        import torch
+
+        torch.cuda.set_device(torch.device(gpu_device))
+        vtk, vtk_to_numpy = require_vtk()
+    except Exception as exc:
+        for input_path in input_paths:
+            result_queue.put(
+                {
+                    "input": str(input_path),
+                    "records": [{"input": str(input_path), "status": "failed", "error": repr(exc)}],
+                }
+            )
+        return
+
+    for input_path in input_paths:
+        try:
+            records = process_input(vtk, vtk_to_numpy, input_path, args, factors, calibrated)
+        except Exception as exc:
+            records = [{"input": str(input_path), "status": "failed", "error": repr(exc)}]
+        for record in records:
+            record.setdefault("gpu_device", gpu_device)
+        result_queue.put({"input": str(input_path), "records": records})
+
+
 def ignore_sigint_in_worker():
     # The parent owns Ctrl+C handling and terminates the pool explicitly.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -616,8 +869,29 @@ def main() -> int:
         raise ValueError("--isotropic-iso-tries must be positive.")
     if args.isotropic_seed_triangle_multiplier < 1.0:
         raise ValueError("--isotropic-seed-triangle-multiplier must be at least 1.0.")
+    if args.gpu_adjustments <= 0:
+        raise ValueError("--gpu-adjustments must be positive.")
+    if args.gpu_face_chunk_size <= 0:
+        raise ValueError("--gpu-face-chunk-size must be positive.")
     if args.workers <= 0:
         raise ValueError("--workers must be positive.")
+    gpu_devices = []
+    if args.gpu_devices:
+        gpu_devices = [item.strip() for item in str(args.gpu_devices).split(",") if item.strip()]
+    elif args.method == "isotropic_gpu":
+        gpu_devices = [str(args.gpu_device).strip()]
+    if args.method == "isotropic_gpu":
+        if not gpu_devices or any(not item.startswith("cuda") for item in gpu_devices):
+            raise ValueError("--gpu-devices/--gpu-device must contain CUDA devices, e.g. cuda:0,cuda:1.")
+        if len(set(gpu_devices)) != len(gpu_devices):
+            raise ValueError("--gpu-devices must not contain duplicate CUDA devices.")
+        if args.workers != len(gpu_devices):
+            print(
+                f"[gpu] Using one fixed worker per CUDA device: workers={len(gpu_devices)} "
+                f"(requested {args.workers}).",
+                flush=True,
+            )
+            args.workers = len(gpu_devices)
     worker_caps = {
         "isotropic_remeshing": 4,
         "voxel_quadric_clustering": 2,
@@ -648,6 +922,8 @@ def main() -> int:
         f"Processing with {args.workers} worker(s); each worker loads one input once "
         "and chains all requested factors."
     )
+    if args.method == "isotropic_gpu":
+        print(f"CUDA workers: {', '.join(gpu_devices)} (one process pinned to each device)")
 
     all_records = []
     failed = []
@@ -663,6 +939,54 @@ def main() -> int:
                 print(f"[failed] {input_path}: {exc}", flush=True)
                 if args.fail_fast:
                     break
+    elif args.method == "isotropic_gpu":
+        context = mp.get_context("spawn")
+        result_queue = context.Queue()
+        assignments = [inputs[index::len(gpu_devices)] for index in range(len(gpu_devices))]
+        processes = [
+            context.Process(
+                target=process_gpu_worker,
+                args=(gpu_device, assigned_inputs, args, factors, calibrated, result_queue),
+            )
+            for gpu_device, assigned_inputs in zip(gpu_devices, assignments)
+            if assigned_inputs
+        ]
+        for process in processes:
+            process.start()
+        remaining = len(inputs)
+        try:
+            with tqdm(total=len(inputs), desc="VTP geometries", dynamic_ncols=True) as progress:
+                while remaining:
+                    try:
+                        message = result_queue.get(timeout=1.0)
+                    except queue.Empty:
+                        if not any(process.is_alive() for process in processes):
+                            raise RuntimeError("All GPU workers exited before reporting every geometry.")
+                        continue
+                    records = message["records"]
+                    all_records.extend(records)
+                    newly_failed = [record for record in records if record.get("status") == "failed"]
+                    if newly_failed:
+                        failed.extend(newly_failed)
+                        if args.fail_fast:
+                            raise RuntimeError(newly_failed[0].get("error", "GPU worker failed."))
+                    remaining -= 1
+                    progress.update(1)
+        except KeyboardInterrupt:
+            print("\n[interrupt] Ctrl+C received; terminating GPU workers...", flush=True)
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+            for process in processes:
+                process.join()
+            raise SystemExit(130)
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                process.join()
+            result_queue.close()
+            result_queue.join_thread()
     else:
         context = mp.get_context("spawn")
         payloads = [(input_path, args, factors, calibrated) for input_path in inputs]
@@ -708,7 +1032,13 @@ def main() -> int:
         "isotropic_iterations": args.isotropic_iterations,
         "isotropic_iso_tries": args.isotropic_iso_tries,
         "isotropic_seed_triangle_multiplier": args.isotropic_seed_triangle_multiplier,
-        "isotropic_backend": "pyacvd_acvd",
+        "gpu_device": args.gpu_device,
+        "gpu_devices": gpu_devices if args.method == "isotropic_gpu" else [],
+        "gpu_adjustments": args.gpu_adjustments,
+        "gpu_face_chunk_size": args.gpu_face_chunk_size,
+        "isotropic_backend": "pyacvd_acvd" if args.method == "isotropic_remeshing" else (
+            "cuda_voxel_centroid" if args.method == "isotropic_gpu" else None
+        ),
         "validate_output": bool(args.validate_output),
         "validate_topology": bool(args.validate_topology),
         "wall_seconds": time.perf_counter() - wall_t0,

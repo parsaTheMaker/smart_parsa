@@ -48,6 +48,9 @@ class AhmedMLDatasetV2(Dataset):
         geometry_epoch_seeded_sampling=False,
         return_sample_info=False,
         return_half_precision=False,
+        domain_split_json="",
+        domain_split_train_cluster=0,
+        domain_split_test_cluster=1,
     ):
         geo_label = "all" if int(geometry_points) == 0 else str(int(geometry_points))
         surf_label = "all" if int(surface_points) == 0 else str(int(surface_points))
@@ -78,6 +81,9 @@ class AhmedMLDatasetV2(Dataset):
         self.geometry_epoch_seeded_sampling = bool(geometry_epoch_seeded_sampling)
         self.return_sample_info = bool(return_sample_info)
         self.return_half_precision = bool(return_half_precision)
+        self.domain_split_json = str(domain_split_json or "").strip()
+        self.domain_split_train_cluster = int(domain_split_train_cluster)
+        self.domain_split_test_cluster = int(domain_split_test_cluster)
         self._shared_epoch = mp.Value("i", 0, lock=False)
         self._geometry_density_ram_cache = OrderedDict()
         self._preprocessed_memmap_cache = OrderedDict()
@@ -236,6 +242,42 @@ class AhmedMLDatasetV2(Dataset):
         return train_ids, test_ids
 
     def _resolve_split_ids(self, split_seed, test_fraction):
+        if self.domain_split_json:
+            split_path = Path(self.domain_split_json).expanduser()
+            if not split_path.is_absolute():
+                split_path = Path.cwd() / split_path
+            if not split_path.is_file():
+                raise FileNotFoundError(f"Geometry domain split JSON not found: {split_path}")
+            with split_path.open("r", encoding="utf-8") as handle:
+                split = json.load(handle)
+            train_cluster = self.domain_split_train_cluster
+            test_cluster = self.domain_split_test_cluster
+            direction_key = f"train_cluster_{train_cluster}_test_cluster_{test_cluster}"
+            direction = split.get(direction_key)
+            if not isinstance(direction, dict):
+                raise ValueError(
+                    f"Geometry domain split JSON does not contain `{direction_key}`: {split_path}"
+                )
+            have = set(self.all_ids)
+            train_ids = [int(run_id) for run_id in direction.get("train_ids", [])]
+            test_ids = [int(run_id) for run_id in direction.get("test_ids", [])]
+            train_ids = [run_id for run_id in train_ids if run_id in have]
+            test_ids = [run_id for run_id in test_ids if run_id in have]
+            if not train_ids or not test_ids or set(train_ids).intersection(test_ids):
+                raise ValueError(
+                    f"Invalid geometry domain split `{direction_key}` in {split_path}: "
+                    f"train={len(train_ids)}, test={len(test_ids)}, overlap={set(train_ids).intersection(test_ids)}"
+                )
+            if set(train_ids).union(test_ids) != have:
+                raise ValueError(
+                    f"Geometry domain split `{direction_key}` does not cover all available runs: "
+                    f"split={len(set(train_ids).union(test_ids))}, available={len(have)}"
+                )
+            print(
+                f"[domain split] {direction_key}: train={len(train_ids)} runs, "
+                f"test={len(test_ids)} runs; role={'test' if self.if_test else 'train'}"
+            )
+            return train_ids, test_ids
         if self.preprocessed_mode:
             manifest_file = Path(self.file_path) / "preprocessed_manifest.json"
             try:

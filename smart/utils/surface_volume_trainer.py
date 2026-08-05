@@ -6,8 +6,12 @@ from timeit import default_timer
 import hydra
 import numpy as np
 import torch
+import torch.distributed as dist
 import wandb
 from omegaconf import DictConfig
+from torch.nn import DataParallel
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from tqdm.auto import tqdm
 
 from data.datasets import get_dataset
@@ -26,6 +30,48 @@ from utils.utils import (
 
 CANON_SURF_FIELDS = ["pressure", "normal_x", "normal_y"]
 CANON_VOL_FIELDS = ["pressure", "sdf", "velocity_x", "velocity_y"]
+
+
+def unwrap_model(model):
+    return model.module if isinstance(model, (DDP, DataParallel)) else model
+
+
+def setup_distributed():
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size <= 1:
+        return {"enabled": False, "rank": 0, "local_rank": 0, "world_size": 1}
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    if not torch.cuda.is_available():
+        raise RuntimeError("DDP training for the point-cloud models requires CUDA.")
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    return {"enabled": True, "rank": rank, "local_rank": local_rank, "world_size": world_size}
+
+
+def cleanup_distributed():
+    if dist.is_available() and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def average_distributed_metrics(metrics, sample_count, device):
+    keys = list(metrics)
+    values = torch.tensor(
+        [float(metrics[key]) for key in keys] + [float(sample_count)],
+        device=device,
+        dtype=torch.float64,
+    )
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    denominator = max(float(values[-1].item()), 1.0)
+    return {key: float(values[index].item()) / denominator for index, key in enumerate(keys)}
+
+
+def synchronized_step_valid(local_valid, device, distributed):
+    if not distributed:
+        return bool(local_valid)
+    flag = torch.tensor(1 if local_valid else 0, device=device, dtype=torch.int32)
+    dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+    return bool(flag.item())
 
 
 def init_metric_dict(surface_fields, volume_fields):
@@ -73,19 +119,19 @@ def gradient_diagnostics(model):
 
 
 def snapshot_model_buffers(model):
-    return {name: buffer.detach().clone() for name, buffer in model.named_buffers()}
+    return {name: buffer.detach().clone() for name, buffer in unwrap_model(model).named_buffers()}
 
 
 def restore_model_buffers(model, snapshot):
     if snapshot is None:
         return
-    for name, value in model.named_buffers():
+    for name, value in unwrap_model(model).named_buffers():
         if name in snapshot:
             value.copy_(snapshot[name])
 
 
 def model_buffers_are_finite(model):
-    return all(bool(torch.isfinite(buffer).all().item()) for buffer in model.buffers())
+    return all(bool(torch.isfinite(buffer).all().item()) for buffer in unwrap_model(model).buffers())
 
 
 def add_canonical_field_metrics(wandb_dict, split, surface_fields, volume_fields, metric_values=None):
@@ -286,7 +332,26 @@ class CudaPrefetchLoader:
 def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_density=False):
     config = cfg.experiment
     wandb_config = cfg.wandb
-    run = initialize_wandb(config, wandb_config)
+    multi_gpu_strategy = str(getattr(config, "multi_gpu_strategy", "single")).lower()
+    if multi_gpu_strategy not in {"single", "data_parallel", "ddp"}:
+        raise ValueError(
+            f"Unsupported vanilla multi_gpu_strategy={multi_gpu_strategy!r}; "
+            "use single, data_parallel, or ddp."
+        )
+    if multi_gpu_strategy == "data_parallel" and int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        raise RuntimeError(
+            "multi_gpu_strategy=data_parallel must be launched with plain python, not torchrun."
+        )
+    if multi_gpu_strategy == "ddp" and int(os.environ.get("WORLD_SIZE", "1")) <= 1:
+        raise RuntimeError("multi_gpu_strategy=ddp requires torchrun with at least two processes.")
+    dist_info = setup_distributed() if multi_gpu_strategy == "ddp" else {
+        "enabled": False,
+        "rank": 0,
+        "local_rank": 0,
+        "world_size": 1,
+    }
+    is_main = not dist_info["enabled"] or dist_info["rank"] == 0
+    run = initialize_wandb(config, wandb_config) if is_main else None
     device = initialize_gpu(config.random_seed, high_precision=False)
 
     gradient_norm = config.gradient_norm
@@ -294,7 +359,8 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
     precisions = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
     dtype = precisions.get(config.precision, torch.float16)
     amp = config.amp
-    print(gradient_norm, amp, dtype)
+    if is_main:
+        print(gradient_norm, amp, dtype)
 
     train_data, test_data, stats, spatial_dim, surf_channels, vol_channels, params_dim, fields = get_dataset(config)
 
@@ -306,14 +372,17 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
             vol_channels = 3
 
     apply_vanilla_field_subset()
-    print(f"[{config.model_name}] training signals -> surface: {fields['surface']} | volume: {fields['volume']}")
+    if is_main:
+        print(f"[{config.model_name}] training signals -> surface: {fields['surface']} | volume: {fields['volume']}")
 
     point_info = apply_naca4_auto_point_budget(config, train_data, for_cat=False)
     if point_info is not None:
-        print_point_budget(config.model_name, point_info)
+        if is_main:
+            print_point_budget(config.model_name, point_info)
         train_data, test_data, stats, spatial_dim, surf_channels, vol_channels, params_dim, fields = get_dataset(config)
         apply_vanilla_field_subset()
-        print(f"[{config.model_name}] training signals -> surface: {fields['surface']} | volume: {fields['volume']}")
+        if is_main:
+            print(f"[{config.model_name}] training signals -> surface: {fields['surface']} | volume: {fields['volume']}")
 
     use_surface_supervision = len(fields["surface"]) > 0
 
@@ -324,12 +393,30 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
         dl_common["prefetch_factor"] = prefetch_factor
         dl_common["persistent_workers"] = True
 
-    train_loader = torch.utils.data.DataLoader(train_data, shuffle=True, **dl_common)
-    test_loader = torch.utils.data.DataLoader(test_data, shuffle=False, **dl_common)
+    train_sampler = DistributedSampler(train_data, shuffle=True) if dist_info["enabled"] else None
+    test_sampler = DistributedSampler(test_data, shuffle=False) if dist_info["enabled"] else None
+    train_loader = torch.utils.data.DataLoader(
+        train_data,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        **dl_common,
+    )
+    test_loader = torch.utils.data.DataLoader(
+        test_data,
+        shuffle=False,
+        sampler=test_sampler,
+        **dl_common,
+    )
     cuda_batch_prefetch = bool(getattr(config, "cuda_batch_prefetch", False)) and device.type == "cuda"
     train_batch_source = CudaPrefetchLoader(train_loader, device) if cuda_batch_prefetch else train_loader
     test_batch_source = CudaPrefetchLoader(test_loader, device) if cuda_batch_prefetch else test_loader
-    print(f"[dataloader] cuda_batch_prefetch={cuda_batch_prefetch}")
+    if is_main:
+        print(
+            f"[dataloader] world_size={dist_info['world_size']}, "
+            f"num_workers_per_rank={config.num_workers}, "
+            f"prefetch_factor={prefetch_factor}, "
+            f"cuda_batch_prefetch={cuda_batch_prefetch}"
+        )
 
     mean_surf = stats[0][:surf_channels].to(device)
     std_surf = stats[1][:surf_channels].to(device)
@@ -353,6 +440,32 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
     print(f"Model kwargs: {merged_kwargs}")
     model = model_cls(**merged_kwargs).to(device)
     rollback_buffers = bool(getattr(model, "rollback_buffers_on_nonfinite", False))
+    if multi_gpu_strategy == "data_parallel" and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        visible_gpus = torch.cuda.device_count()
+        if int(config.batch_size) < visible_gpus:
+            print(
+                f"[multi-gpu warning] batch_size={int(config.batch_size)} is smaller than the number of visible GPUs "
+                f"({visible_gpus}); DataParallel will underutilize devices."
+            )
+        model = DataParallel(
+            model,
+            device_ids=list(range(visible_gpus)),
+            output_device=0,
+            dim=0,
+        )
+        if is_main:
+            print(f"[multi-gpu] Using DataParallel on {visible_gpus} GPUs.")
+    elif dist_info["enabled"]:
+        model = DDP(
+            model,
+            device_ids=[dist_info["local_rank"]],
+            output_device=dist_info["local_rank"],
+            broadcast_buffers=False,
+            gradient_as_bucket_view=True,
+            static_graph=True,
+        )
+        if is_main:
+            print(f"[multi-gpu] Using DDP on {dist_info['world_size']} GPUs.")
 
     resume_ckpt = str(getattr(config, "resume_ckpt", "")).strip()
     init_ckpt = str(getattr(config, "init_ckpt", "")).strip()
@@ -360,16 +473,20 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
     if resume_full_state and not resume_ckpt:
         raise ValueError("resume_full_state=True requires experiment.resume_ckpt to be set.")
     if not resume_full_state and resume_ckpt:
-        print(f"[init] Loading model weights from experiment.resume_ckpt={resume_ckpt}")
+        if is_main:
+            print(f"[init] Loading model weights from experiment.resume_ckpt={resume_ckpt}")
         load_partial_state_dict(model, resume_ckpt, device)
     elif not resume_full_state and init_ckpt:
-        print(f"[init] Loading model weights from experiment.init_ckpt={init_ckpt}")
+        if is_main:
+            print(f"[init] Loading model weights from experiment.init_ckpt={init_ckpt}")
         load_partial_state_dict(model, init_ckpt, device)
 
-    print(f"Total parameters: {count_model_params(model)}")
+    if is_main:
+        print(f"Total parameters: {count_model_params(model)}")
     model_checkpoint_name = get_model_checkpoint_name(config)
-    print(f"Checkpoint name: {model_checkpoint_name}")
-    if bool(getattr(config, "wandb_watch_model", False)):
+    if is_main:
+        print(f"Checkpoint name: {model_checkpoint_name}")
+    if run is not None and bool(getattr(config, "wandb_watch_model", False)):
         run.watch(model, log="all")
 
     scaler = make_grad_scaler(config)
@@ -395,21 +512,30 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
     log_every_n_steps = getattr(config, "log_every_n_steps", 10)
 
     try:
-        for ep in tqdm(range(start_epoch, config.epochs), desc="Epochs", dynamic_ncols=True):
+        for ep in tqdm(range(start_epoch, config.epochs), desc="Epochs", dynamic_ncols=True, disable=not is_main):
             t1 = default_timer()
             # Propagate the epoch to datasets that use epoch-seeded point sampling.
             if hasattr(train_data, "set_epoch"):
                 train_data.set_epoch(ep)
             if hasattr(test_data, "set_epoch"):
                 test_data.set_epoch(0)
+            if train_sampler is not None:
+                train_sampler.set_epoch(ep)
             train_losses = init_metric_dict(fields["surface"], fields["volume"])
             if track_gradient_diagnostics:
                 for key in ("gradient_norm_raw", "parameter_norm", "gradient_max_abs", "gradient_nonfinite"):
                     train_losses[key] = 0.0
             test_losses = init_metric_dict(fields["surface"], fields["volume"])
+            train_sample_count = 0
 
             model.train()
-            train_pbar = tqdm(train_batch_source, desc=f"Train {ep + 1}/{config.epochs}", leave=False, dynamic_ncols=True)
+            train_pbar = tqdm(
+                train_batch_source,
+                desc=f"Train {ep + 1}/{config.epochs}",
+                leave=False,
+                dynamic_ncols=True,
+                disable=not is_main,
+            )
             for batch_idx, batch in enumerate(train_pbar):
                 geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, geo_log_density = _parse_batch(batch, params_dim)
                 geo_mesh = geo_mesh.to(device)
@@ -442,8 +568,10 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                             if use_surface_supervision
                             else loss_fn(y_hat_vol.float(), vol_data.float())
                         )
-                    if not torch.isfinite(loss):
-                        print(f"[warn] Non-finite training loss at epoch {ep} batch {batch_idx}; skipping optimizer step.")
+                    loss_is_finite = bool(torch.isfinite(loss).item())
+                    if not synchronized_step_valid(loss_is_finite, device, dist_info["enabled"]):
+                        if is_main:
+                            print(f"[warn] Non-finite training loss at epoch {ep} batch {batch_idx}; skipping optimizer step.")
                         restore_model_buffers(model, buffer_snapshot)
                         optimizer.zero_grad(set_to_none=True)
                         if rollback_buffers:
@@ -454,11 +582,13 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                     if gradient_norm is not None or track_gradient_diagnostics:
                         scaler.unscale_(optimizer)
                     gradient_stats = gradient_diagnostics(model) if track_gradient_diagnostics else None
-                    if gradient_stats is not None and not gradient_stats["finite"]:
-                        print(
-                            f"[warn] Non-finite gradients at epoch {ep} batch {batch_idx}; "
-                            "skipping optimizer step and reducing AMP scale."
-                        )
+                    gradients_are_finite = gradient_stats is None or gradient_stats["finite"]
+                    if not synchronized_step_valid(gradients_are_finite, device, dist_info["enabled"]):
+                        if is_main:
+                            print(
+                                f"[warn] Non-finite gradients at epoch {ep} batch {batch_idx}; "
+                                "skipping optimizer step and reducing AMP scale."
+                            )
                         restore_model_buffers(model, buffer_snapshot)
                         optimizer.zero_grad(set_to_none=True)
                         scaler.update(new_scale=max(1.0, 0.5 * scaler.get_scale()))
@@ -484,15 +614,19 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                         if use_surface_supervision
                         else loss_fn(y_hat_vol.float(), vol_data.float())
                     )
-                    if not torch.isfinite(loss):
-                        print(f"[warn] Non-finite training loss at epoch {ep} batch {batch_idx}; skipping optimizer step.")
+                    loss_is_finite = bool(torch.isfinite(loss).item())
+                    if not synchronized_step_valid(loss_is_finite, device, dist_info["enabled"]):
+                        if is_main:
+                            print(f"[warn] Non-finite training loss at epoch {ep} batch {batch_idx}; skipping optimizer step.")
                         restore_model_buffers(model, buffer_snapshot)
                         optimizer.zero_grad(set_to_none=True)
                         continue
                     loss.backward()
                     gradient_stats = gradient_diagnostics(model) if track_gradient_diagnostics else None
-                    if gradient_stats is not None and not gradient_stats["finite"]:
-                        print(f"[warn] Non-finite gradients at epoch {ep} batch {batch_idx}; skipping optimizer step.")
+                    gradients_are_finite = gradient_stats is None or gradient_stats["finite"]
+                    if not synchronized_step_valid(gradients_are_finite, device, dist_info["enabled"]):
+                        if is_main:
+                            print(f"[warn] Non-finite gradients at epoch {ep} batch {batch_idx}; skipping optimizer step.")
                         restore_model_buffers(model, buffer_snapshot)
                         optimizer.zero_grad(set_to_none=True)
                         continue
@@ -510,6 +644,7 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                     gradient_stats = None
 
                 batch_size = surf_data.size(0)
+                train_sample_count += batch_size
                 train_losses["loss"] += loss.item() * batch_size
                 if gradient_stats is not None:
                     train_losses["gradient_norm_raw"] += gradient_stats["grad_norm"] * batch_size
@@ -531,7 +666,7 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                     accumulate_channel_metrics(train_losses, "rel_l2_vol", pred_vol_train, gt_vol_train, fields["volume"], rel_l2_loss_fn, batch_size)
 
                 global_step += 1
-                if batch_idx % log_every_n_steps == 0 or batch_idx == len(train_loader) - 1:
+                if run is not None and (batch_idx % log_every_n_steps == 0 or batch_idx == len(train_loader) - 1):
                     batch_log = {
                         "train/batch_loss": loss.item(),
                         "train/batch_rel_l2": (surface_loss + volume_loss).item(),
@@ -554,7 +689,14 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                     train_pbar.set_postfix(loss=f"{loss.item():.4f}", lr=f"{scheduler.get_last_lr()[0]:.2e}")
 
             model.eval()
-            test_pbar = tqdm(test_batch_source, desc=f"Eval  {ep + 1}/{config.epochs}", leave=False, dynamic_ncols=True)
+            test_sample_count = 0
+            test_pbar = tqdm(
+                test_batch_source,
+                desc=f"Eval  {ep + 1}/{config.epochs}",
+                leave=False,
+                dynamic_ncols=True,
+                disable=not is_main,
+            )
             with torch.no_grad():
                 for batch in test_pbar:
                     geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, geo_log_density = _parse_batch(batch, params_dim)
@@ -591,6 +733,7 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                     gt_vol = vol_data * std_vol + mean_vol
 
                     batch_size = surf_data.size(0)
+                    test_sample_count += batch_size
                     if use_surface_supervision:
                         batch_loss = combined_loss_fn(y_hat_surf.float(), y_hat_vol.float(), surf_data.float(), vol_data.float())
                         surface_rel_l2 = rel_l2_loss_fn(y_hat_surf.float(), surf_data.float())
@@ -608,18 +751,22 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                     accumulate_channel_metrics(test_losses, "rel_l2_vol", pred_vol, gt_vol, fields["volume"], rel_l2_loss_fn, batch_size)
                     test_pbar.set_postfix(loss=f"{batch_loss.item():.4f}")
 
-            for loss_name in train_losses.keys():
-                train_losses[loss_name] /= len(train_loader.dataset)
-            for loss_name in test_losses.keys():
-                test_losses[loss_name] /= len(test_loader.dataset)
+            if dist_info["enabled"]:
+                train_losses = average_distributed_metrics(train_losses, train_sample_count, device)
+                test_losses = average_distributed_metrics(test_losses, test_sample_count, device)
+            else:
+                for loss_name in train_losses.keys():
+                    train_losses[loss_name] /= len(train_loader.dataset)
+                for loss_name in test_losses.keys():
+                    test_losses[loss_name] /= len(test_loader.dataset)
 
-            if test_losses["rel_l2"] < loss_test_min:
+            if is_main and test_losses["rel_l2"] < loss_test_min:
                 loss_test_min = test_losses["rel_l2"]
                 torch.save({
                     "epoch": ep,
                     "global_step": global_step,
                     "best_rel_l2": loss_test_min,
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": unwrap_model(model).state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
                     "scaler_state_dict": scaler.state_dict(),
@@ -630,41 +777,48 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                     "metric_values": {k: v for k, v in test_losses.items() if k.startswith("rel_l2")},
                 }, "checkpoints/" + model_checkpoint_name + "_best.pt")
 
-            torch.save({
-                "epoch": ep,
-                "global_step": global_step,
-                "best_rel_l2": loss_test_min,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "scaler_state_dict": scaler.state_dict(),
-                "loss": test_losses["loss"],
-                "rel_l2_loss": test_losses["rel_l2"],
-                "surface_fields": fields["surface"],
-                "volume_fields": fields["volume"],
-                "metric_values": {k: v for k, v in test_losses.items() if k.startswith("rel_l2")},
-            }, "checkpoints/" + model_checkpoint_name + "_last.pt")
+            if is_main:
+                torch.save({
+                    "epoch": ep,
+                    "global_step": global_step,
+                    "best_rel_l2": loss_test_min,
+                    "model_state_dict": unwrap_model(model).state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                    "loss": test_losses["loss"],
+                    "rel_l2_loss": test_losses["rel_l2"],
+                    "surface_fields": fields["surface"],
+                    "volume_fields": fields["volume"],
+                    "metric_values": {k: v for k, v in test_losses.items() if k.startswith("rel_l2")},
+                }, "checkpoints/" + model_checkpoint_name + "_last.pt")
 
             t2 = default_timer()
-            print(f"epoch: {ep}, t2-t1 (epoch time): {t2-t1:.5f}, train loss: {train_losses['loss']:.5f}, test loss: {test_losses['loss']:.5f}")
-            wandb_dict = {"lr": scheduler.get_last_lr()[0]}
-            wandb_dict.update({f"train/{key}": value for key, value in train_losses.items()})
-            wandb_dict.update({f"test/{key}": value for key, value in test_losses.items()})
-            add_all_field_metrics(wandb_dict, "train", fields["surface"], fields["volume"], metric_values=train_losses)
-            add_all_field_metrics(wandb_dict, "test", fields["surface"], fields["volume"], metric_values=test_losses)
-            add_canonical_field_metrics(wandb_dict, "train", fields["surface"], fields["volume"], metric_values=train_losses)
-            add_canonical_field_metrics(wandb_dict, "test", fields["surface"], fields["volume"], metric_values=test_losses)
-            wandb_dict["meta/training_surface_signals"] = ",".join(fields["surface"])
-            wandb_dict["meta/training_volume_signals"] = ",".join(fields["volume"])
-            wandb.log(wandb_dict, step=global_step)
+            if is_main:
+                print(
+                    f"epoch: {ep}, t2-t1 (epoch time): {t2-t1:.5f}, "
+                    f"train loss: {train_losses['loss']:.5f}, test loss: {test_losses['loss']:.5f}"
+                )
+                wandb_dict = {"lr": scheduler.get_last_lr()[0]}
+                wandb_dict.update({f"train/{key}": value for key, value in train_losses.items()})
+                wandb_dict.update({f"test/{key}": value for key, value in test_losses.items()})
+                add_all_field_metrics(wandb_dict, "train", fields["surface"], fields["volume"], metric_values=train_losses)
+                add_all_field_metrics(wandb_dict, "test", fields["surface"], fields["volume"], metric_values=test_losses)
+                add_canonical_field_metrics(wandb_dict, "train", fields["surface"], fields["volume"], metric_values=train_losses)
+                add_canonical_field_metrics(wandb_dict, "test", fields["surface"], fields["volume"], metric_values=test_losses)
+                wandb_dict["meta/training_surface_signals"] = ",".join(fields["surface"])
+                wandb_dict["meta/training_volume_signals"] = ",".join(fields["volume"])
+                wandb.log(wandb_dict, step=global_step)
     finally:
-        best_ckpt = os.path.join("checkpoints", model_checkpoint_name + "_best.pt")
-        last_ckpt = os.path.join("checkpoints", model_checkpoint_name + "_last.pt")
-        if os.path.isfile(best_ckpt) or os.path.isfile(last_ckpt):
-            artifact = wandb.Artifact("model", type="model")
-            if os.path.isfile(best_ckpt):
-                artifact.add_file(best_ckpt)
-            if os.path.isfile(last_ckpt):
-                artifact.add_file(last_ckpt)
-            run.log_artifact(artifact)
-        run.finish()
+        if run is not None:
+            best_ckpt = os.path.join("checkpoints", model_checkpoint_name + "_best.pt")
+            last_ckpt = os.path.join("checkpoints", model_checkpoint_name + "_last.pt")
+            if os.path.isfile(best_ckpt) or os.path.isfile(last_ckpt):
+                artifact = wandb.Artifact("model", type="model")
+                if os.path.isfile(best_ckpt):
+                    artifact.add_file(best_ckpt)
+                if os.path.isfile(last_ckpt):
+                    artifact.add_file(last_ckpt)
+                run.log_artifact(artifact)
+            run.finish()
+        cleanup_distributed()

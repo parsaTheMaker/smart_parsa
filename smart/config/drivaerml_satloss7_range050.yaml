@@ -1,0 +1,15 @@
+defaults:
+  - drivaerml_satloss7
+  - _self_
+
+experiment:
+  name: "DrivAerML_SMART_SATLOSS7_RANGE_050"
+  model_name: "SMART_SATLOSS7_RANGE050"
+  model_tag: ""
+
+  # Ablation endpoint shared by all three SATLOSS7 shift families:
+  # beta, sine-y, and sine-x are each sampled from [0, 0.50].
+  shared_shift_beta_min: 0.0
+  shared_shift_beta_max: 0.5
+  shared_shift_sine_min: 0.0
+  shared_shift_sine_max: 0.5

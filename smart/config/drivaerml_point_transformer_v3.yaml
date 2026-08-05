@@ -59,6 +59,8 @@ experiment:
   init_ckpt: ""
   resume_ckpt: ""
   resume_full_state: false
+  # Plain-Python DataParallel is opt-in; the default keeps single-GPU behavior.
+  multi_gpu_strategy: "single"
   cuda_batch_prefetch: true
   geometry_epoch_seeded_sampling: true
   num_body_points: 131072

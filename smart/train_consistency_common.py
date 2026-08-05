@@ -776,6 +776,18 @@ def move_to_device(value, device):
     return value
 
 
+def move_batch_to_device(batch, device, keep_cpu_indices=()):
+    """Move a batch while retaining selected top-level values on the host."""
+    if not isinstance(batch, (list, tuple)) or not keep_cpu_indices:
+        return move_to_device(batch, device)
+    keep_cpu_indices = set(int(index) for index in keep_cpu_indices)
+    moved = [
+        value if index in keep_cpu_indices else move_to_device(value, device)
+        for index, value in enumerate(batch)
+    ]
+    return type(batch)(moved)
+
+
 def record_batch_stream(value, stream):
     if torch.is_tensor(value):
         if value.is_cuda:
@@ -791,9 +803,10 @@ def record_batch_stream(value, stream):
 
 
 class CudaPrefetchLoader:
-    def __init__(self, loader, device):
+    def __init__(self, loader, device, keep_cpu_indices=()):
         self.loader = loader
         self.device = device
+        self.keep_cpu_indices = tuple(keep_cpu_indices)
         self.enabled = device.type == "cuda" and torch.cuda.is_available()
         self.stream = torch.cuda.Stream(device=device) if self.enabled else None
 
@@ -816,7 +829,7 @@ class CudaPrefetchLoader:
                 next_batch = None
                 return
             with torch.cuda.stream(self.stream):
-                next_batch = move_to_device(batch, self.device)
+                next_batch = move_batch_to_device(batch, self.device, self.keep_cpu_indices)
 
         preload()
         while next_batch is not None:
@@ -1362,12 +1375,17 @@ def evaluate_loader(
     fixed_seed_offset,
     model_requires_density,
     cuda_batch_prefetch,
+    keep_cpu_indices=(),
 ):
     metrics = init_metric_dict(fields["surface"], fields["volume"])
     model.eval()
     sample_count = 0
 
-    eval_loader = CudaPrefetchLoader(loader, device) if cuda_batch_prefetch else loader
+    eval_loader = (
+        CudaPrefetchLoader(loader, device, keep_cpu_indices=keep_cpu_indices)
+        if cuda_batch_prefetch
+        else loader
+    )
     pbar = tqdm(eval_loader, desc=f"Eval {mode_name}", leave=False, dynamic_ncols=True, disable=not is_main_process())
     with torch.inference_mode():
         for batch_idx, batch in enumerate(pbar):
@@ -1508,16 +1526,12 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
     pin_memory = bool(getattr(config, "pin_memory", True))
     cuda_batch_prefetch = bool(getattr(config, "cuda_batch_prefetch", device.type == "cuda")) and device.type == "cuda"
     effective_num_workers = int(getattr(config, "num_workers", 0))
-    if dist_info["enabled"]:
-        effective_num_workers = 0
-        prefetch_factor = 2
-        pin_memory = False
     dl_common = dict(batch_size=config.batch_size, num_workers=effective_num_workers, pin_memory=pin_memory)
     if effective_num_workers > 0:
         dl_common["prefetch_factor"] = prefetch_factor
-        dl_common["persistent_workers"] = not dist_info["enabled"]
-        if dist_info["enabled"]:
-            dl_common["multiprocessing_context"] = "spawn"
+        # AhmedMLDatasetV2 stores the current epoch in a shared multiprocessing
+        # value, so persistent workers remain synchronized under DDP.
+        dl_common["persistent_workers"] = True
     if is_main_process():
         print(
             f"[dataloader] world_size={dist_info['world_size']}, "
@@ -1527,6 +1541,11 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             f"cuda_batch_prefetch={cuda_batch_prefetch}"
         )
 
+    keep_geometry_cpu_for_view_sampling = bool(
+        getattr(config, "keep_geometry_cpu_for_view_sampling", False)
+    )
+    geometry_cpu_indices = (0, 6) if params_dim > 0 else (0, 5)
+
     train_sampler = DistributedSampler(train_data, shuffle=True) if dist_info["enabled"] else None
     train_loader = torch.utils.data.DataLoader(
         train_data,
@@ -1534,9 +1553,16 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
         sampler=train_sampler,
         **dl_common,
     )
+    # Validation is also distributed.  Keeping the complete test set on rank
+    # 0 makes SATLOSS8 appear to hang after an epoch because PTv3 evaluates
+    # every held-out geometry, including the expensive local-query decoder,
+    # while all other ranks wait at the barrier.  Each rank evaluates a
+    # disjoint deterministic shard; evaluate_loader all-reduces the metrics.
+    test_sampler = DistributedSampler(test_data, shuffle=False) if dist_info["enabled"] else None
     test_loader = torch.utils.data.DataLoader(
         test_data,
         shuffle=False,
+        sampler=test_sampler,
         **dl_common,
     )
 
@@ -1864,7 +1890,15 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             train_losses = init_metric_tensor_dict(fields["surface"], fields["volume"], device, extra_keys=train_extra_keys)
             train_model.train()
             train_sample_count = 0
-            train_batch_source = CudaPrefetchLoader(train_loader, device) if cuda_batch_prefetch else train_loader
+            train_batch_source = (
+                CudaPrefetchLoader(
+                    train_loader,
+                    device,
+                    keep_cpu_indices=geometry_cpu_indices if keep_geometry_cpu_for_view_sampling else (),
+                )
+                if cuda_batch_prefetch
+                else train_loader
+            )
             train_pbar = tqdm(
                 train_batch_source,
                 desc=f"Train {ep + 1}/{config.epochs}",
@@ -2393,7 +2427,9 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
 
                 global_step += 1
                 should_log = batch_idx % log_every_n_steps == 0 or batch_idx == len(train_loader) - 1
-                if should_log and run is not None:
+                if should_log:
+                    # Every DDP rank must enter the reduction. Only the main
+                    # rank owns the W&B run and emits the resulting log.
                     log_scalars = distributed_average_scalars(
                         [
                             total_loss.item(),
@@ -2414,32 +2450,33 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             secondary_shift_intensity,
                         ]
                     )
-                    wandb.log(
-                        {
-                            "train/batch_loss": log_scalars[0],
-                            "train/batch_rel_l2": log_scalars[1],
-                            "train/batch_rel_l2_surf": log_scalars[2],
-                            "train/batch_rel_l2_vol": log_scalars[3],
-                            "train/batch_supervised_primary": log_scalars[4],
-                            "train/batch_supervised_secondary": log_scalars[5],
-                            "train/batch_supervised_mean": log_scalars[6],
-                            "train/batch_supervised_worst_soft": log_scalars[7],
-                            "train/batch_prediction_consistency": log_scalars[8],
-                            "train/batch_primary_inverse_density_fraction": log_scalars[9],
-                            "train/batch_primary_inverse_density_beta": log_scalars[10],
-                            "train/batch_secondary_inverse_density_fraction": log_scalars[11],
-                            "train/batch_secondary_inverse_density_beta": log_scalars[12],
-                            "train/batch_shared_shift_family_id": log_scalars[13],
-                            "train/batch_primary_shift_intensity": log_scalars[14],
-                            "train/batch_secondary_shift_intensity": log_scalars[15],
-                            "train/prediction_consistency_weight": pred_consistency_weight,
-                            "train/batch_amp_scale": float(scaler.get_scale()) if amp else 1.0,
-                            "lr": scheduler.get_last_lr()[0],
-                            "epoch": ep,
-                        },
-                        step=global_step,
-                    )
-                    if gradient_stats is not None:
+                    if run is not None:
+                        wandb.log(
+                            {
+                                "train/batch_loss": log_scalars[0],
+                                "train/batch_rel_l2": log_scalars[1],
+                                "train/batch_rel_l2_surf": log_scalars[2],
+                                "train/batch_rel_l2_vol": log_scalars[3],
+                                "train/batch_supervised_primary": log_scalars[4],
+                                "train/batch_supervised_secondary": log_scalars[5],
+                                "train/batch_supervised_mean": log_scalars[6],
+                                "train/batch_supervised_worst_soft": log_scalars[7],
+                                "train/batch_prediction_consistency": log_scalars[8],
+                                "train/batch_primary_inverse_density_fraction": log_scalars[9],
+                                "train/batch_primary_inverse_density_beta": log_scalars[10],
+                                "train/batch_secondary_inverse_density_fraction": log_scalars[11],
+                                "train/batch_secondary_inverse_density_beta": log_scalars[12],
+                                "train/batch_shared_shift_family_id": log_scalars[13],
+                                "train/batch_primary_shift_intensity": log_scalars[14],
+                                "train/batch_secondary_shift_intensity": log_scalars[15],
+                                "train/prediction_consistency_weight": pred_consistency_weight,
+                                "train/batch_amp_scale": float(scaler.get_scale()) if amp else 1.0,
+                                "lr": scheduler.get_last_lr()[0],
+                                "epoch": ep,
+                            },
+                            step=global_step,
+                        )
+                    if gradient_stats is not None and run is not None:
                         wandb.log(
                             {
                                 "train/batch_gradient_norm_raw": float(gradient_stats["grad_norm"].item()),
@@ -2473,8 +2510,9 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                         if use_prediction_consistency:
                             uncertainty_log_dict["train/batch_learned_weight_prediction_consistency"] = uncertainty_log_scalars[4]
                             uncertainty_log_dict["train/batch_learned_logit_prediction_consistency"] = uncertainty_log_scalars[5]
-                        wandb.log(uncertainty_log_dict, step=global_step)
-                    if external_gradnorm_info is not None:
+                        if run is not None:
+                            wandb.log(uncertainty_log_dict, step=global_step)
+                    if external_gradnorm_info is not None and run is not None:
                         wandb.log(
                             {
                                 "train/batch_external_gradnorm_loss": float(external_gradnorm_loss.item()),
@@ -2484,7 +2522,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             },
                             step=global_step,
                         )
-                    if config_diagnostics is not None:
+                    if config_diagnostics is not None and run is not None:
                         wandb.log(
                             {
                                 "train/batch_config_reference_grad_norm": float(config_diagnostics["reference_grad_norm"].item()),
@@ -2495,7 +2533,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             },
                             step=global_step,
                         )
-                    if config_full_diagnostics is not None:
+                    if config_full_diagnostics is not None and run is not None:
                         wandb.log(
                             {
                                 "train/batch_config_full_mean_grad_norm": float(config_full_diagnostics["mean_grad_norm"].item()),
@@ -2512,58 +2550,56 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
 
             if is_dist_enabled():
                 dist.barrier()
-            if is_main_process():
-                aligned_metrics = evaluate_loader(
-                    model=model,
-                    loader=test_loader,
-                    config=config,
-                    device=device,
-                    dtype=dtype,
-                    amp=amp,
-                    params_dim=params_dim,
-                    mean_surf=mean_surf,
-                    std_surf=std_surf,
-                    mean_vol=mean_vol,
-                    std_vol=std_vol,
-                    fields=fields,
-                    rel_l2_loss_fn=rel_l2_loss_fn,
-                    combined_loss_fn=combined_loss_fn,
-                    loss_fn=loss_fn,
-                    use_surface_supervision=use_surface_supervision,
-                    mode_name=str(getattr(config, "eval_aligned_sampling_mode", "uniform_wor")),
-                    num_view_points=eval_aligned_view_points,
-                    eval_subsampled_geometry_points=eval_aligned_subsampled_geometry_points,
-                    fixed_seed_offset=50000011,
-                    model_requires_density=model_requires_density,
-                    cuda_batch_prefetch=cuda_batch_prefetch,
-                )
-                shifted_metrics = evaluate_loader(
-                    model=model,
-                    loader=test_loader,
-                    config=config,
-                    device=device,
-                    dtype=dtype,
-                    amp=amp,
-                    params_dim=params_dim,
-                    mean_surf=mean_surf,
-                    std_surf=std_surf,
-                    mean_vol=mean_vol,
-                    std_vol=std_vol,
-                    fields=fields,
-                    rel_l2_loss_fn=rel_l2_loss_fn,
-                    combined_loss_fn=combined_loss_fn,
-                    loss_fn=loss_fn,
-                    use_surface_supervision=use_surface_supervision,
-                    mode_name=str(getattr(config, "eval_shifted_sampling_mode", "inverse_density_wor")),
-                    num_view_points=eval_shifted_view_points,
-                    eval_subsampled_geometry_points=eval_shifted_subsampled_geometry_points,
-                    fixed_seed_offset=70000029,
-                    model_requires_density=model_requires_density,
-                    cuda_batch_prefetch=cuda_batch_prefetch,
-                )
-            else:
-                aligned_metrics = init_metric_dict(fields["surface"], fields["volume"])
-                shifted_metrics = init_metric_dict(fields["surface"], fields["volume"])
+            aligned_metrics = evaluate_loader(
+                model=model,
+                loader=test_loader,
+                config=config,
+                device=device,
+                dtype=dtype,
+                amp=amp,
+                params_dim=params_dim,
+                mean_surf=mean_surf,
+                std_surf=std_surf,
+                mean_vol=mean_vol,
+                std_vol=std_vol,
+                fields=fields,
+                rel_l2_loss_fn=rel_l2_loss_fn,
+                combined_loss_fn=combined_loss_fn,
+                loss_fn=loss_fn,
+                use_surface_supervision=use_surface_supervision,
+                mode_name=str(getattr(config, "eval_aligned_sampling_mode", "uniform_wor")),
+                num_view_points=eval_aligned_view_points,
+                eval_subsampled_geometry_points=eval_aligned_subsampled_geometry_points,
+                fixed_seed_offset=50000011,
+                model_requires_density=model_requires_density,
+                cuda_batch_prefetch=cuda_batch_prefetch,
+                keep_cpu_indices=geometry_cpu_indices if keep_geometry_cpu_for_view_sampling else (),
+            )
+            shifted_metrics = evaluate_loader(
+                model=model,
+                loader=test_loader,
+                config=config,
+                device=device,
+                dtype=dtype,
+                amp=amp,
+                params_dim=params_dim,
+                mean_surf=mean_surf,
+                std_surf=std_surf,
+                mean_vol=mean_vol,
+                std_vol=std_vol,
+                fields=fields,
+                rel_l2_loss_fn=rel_l2_loss_fn,
+                combined_loss_fn=combined_loss_fn,
+                loss_fn=loss_fn,
+                use_surface_supervision=use_surface_supervision,
+                mode_name=str(getattr(config, "eval_shifted_sampling_mode", "inverse_density_wor")),
+                num_view_points=eval_shifted_view_points,
+                eval_subsampled_geometry_points=eval_shifted_subsampled_geometry_points,
+                fixed_seed_offset=70000029,
+                model_requires_density=model_requires_density,
+                cuda_batch_prefetch=cuda_batch_prefetch,
+                keep_cpu_indices=geometry_cpu_indices if keep_geometry_cpu_for_view_sampling else (),
+            )
             if is_dist_enabled():
                 dist.barrier()
 

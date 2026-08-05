@@ -1,0 +1,15 @@
+defaults:
+  - drivaerml_point_transformer_v3_satloss7
+  - _self_
+
+experiment:
+  name: "DrivAerML_POINT_TRANSFORMER_V3_SATLOSS8_GEOMETRY_DOMAIN"
+  model_name: "POINT_TRANSFORMER_V3_SATLOSS8"
+  model_tag: ""
+  epochs: 250
+  batch_size: 1
+  geometry_domain_split_json: "/home/parsa/smart_parsa/results/drivaerml_geometry_statistical_split/geometry_domain_split.json"
+  geometry_domain_split_train_cluster: 0
+  geometry_domain_split_test_cluster: 1
+  # Keep the full source geometry on CPU while constructing the 131k-point views.
+  keep_geometry_cpu_for_view_sampling: true

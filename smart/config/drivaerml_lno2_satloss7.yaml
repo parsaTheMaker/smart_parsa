@@ -1,0 +1,30 @@
+defaults:
+  - drivaerml_lno2_satloss6
+  - _self_
+
+experiment:
+  name: "DrivAerML_LNO2_SATLOSS7"
+  model_name: "LNO2_SATLOSS7"
+  epochs: 150
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False
+  shared_shift_view_geometry_points: 131072
+  train_shared_shift_sampling_mode: "random_beta_sine"
+  shared_shift_family_probabilities: [0.3333333333, 0.3333333333, 0.3333333334]
+  shared_shift_beta_min: 0.0
+  shared_shift_beta_max: 1.0
+  shared_shift_sine_min: 0.0
+  shared_shift_sine_max: 1.0
+  use_prediction_consistency: True
+  prediction_consistency_weight: 1.0
+  prediction_consistency_smooth_l1_beta: 0.1
+  prediction_consistency_symmetric_detached: True
+  prediction_consistency_average_groups: True
+  consistency_warmup_epochs: 0
+  fuse_consistency_views: True
+  task_weighting_method: "fixed_sum"
+  config_task_base_weights: [0.2, 0.2, 0.6]
+  fixed_sum_use_view_losses: True
+  use_learned_task_weighting: False
+

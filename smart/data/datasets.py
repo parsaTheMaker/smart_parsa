@@ -56,6 +56,15 @@ def get_dataset(config):
         if dataset == "DrivAerML":
             dataset_kwargs["require_preprocessed"] = True
             dataset_kwargs["geometry_epoch_seeded_sampling"] = bool(getattr(config, "geometry_epoch_seeded_sampling", False))
+            domain_split_json = str(getattr(config, "geometry_domain_split_json", "")).strip()
+            if domain_split_json:
+                dataset_kwargs["domain_split_json"] = domain_split_json
+                dataset_kwargs["domain_split_train_cluster"] = int(
+                    getattr(config, "geometry_domain_split_train_cluster", 0)
+                )
+                dataset_kwargs["domain_split_test_cluster"] = int(
+                    getattr(config, "geometry_domain_split_test_cluster", 1)
+                )
             dataset_kwargs["return_sample_info"] = getattr(config, "model_name", "") == "DARM"
             dataset_kwargs["return_half_precision"] = getattr(config, "model_name", "") == "DARM" and getattr(config, "precision", "") == "float16"
             model_name = getattr(config, "model_name", "")

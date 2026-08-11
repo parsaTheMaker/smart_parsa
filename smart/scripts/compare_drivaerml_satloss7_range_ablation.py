@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Compare SMART against the SATLOSS7 shift-range ablation checkpoints.
 
-The five evaluated checkpoints are the actual SMART baseline and SATLOSS7
-models trained with shared beta/sine ranges of 0.25, 0.50, 0.75, and 1.00.
+The evaluated checkpoints are the actual SMART baseline and SATLOSS7 models
+trained with shared beta ranges of 0.25, 0.50, 0.75, 1.00, 2.00, 3.00,
+and 5.00. The sine-mixture intensity is a probability and remains bounded
+to [0, 1] for every model.
 Every model receives the same run, query, and encoder-view samples for a given
 seed/mode. The only difference between ablation models is therefore the
 checkpoint and its training protocol.
@@ -78,6 +80,9 @@ MODEL_ORDER = (
     "SMART_SATLOSS7_RANGE050",
     "SMART_SATLOSS7_RANGE075",
     "SMART_SATLOSS7",
+    "SMART_SATLOSS7_RANGE200",
+    "SMART_SATLOSS7_RANGE300",
+    "SMART_SATLOSS7_RANGE500",
 )
 MODEL_LABELS = {
     "SMART": "SMART baseline",
@@ -85,6 +90,9 @@ MODEL_LABELS = {
     "SMART_SATLOSS7_RANGE050": "SATLOSS [0, 0.50]",
     "SMART_SATLOSS7_RANGE075": "SATLOSS [0, 0.75]",
     "SMART_SATLOSS7": "SATLOSS [0, 1.00]",
+    "SMART_SATLOSS7_RANGE200": "SATLOSS [0, 2.00]",
+    "SMART_SATLOSS7_RANGE300": "SATLOSS [0, 3.00]",
+    "SMART_SATLOSS7_RANGE500": "SATLOSS [0, 5.00]",
 }
 MODEL_COLORS = {
     "SMART": "#4C78A8",
@@ -92,6 +100,9 @@ MODEL_COLORS = {
     "SMART_SATLOSS7_RANGE050": "#F28E2B",
     "SMART_SATLOSS7_RANGE075": "#E15759",
     "SMART_SATLOSS7": "#7A5195",
+    "SMART_SATLOSS7_RANGE200": "#2F4B7C",
+    "SMART_SATLOSS7_RANGE300": "#A05195",
+    "SMART_SATLOSS7_RANGE500": "#D45087",
 }
 METRIC_KEYS = ("combined_global_rel_l2",)
 SHIFT_ORDER = ("beta", "sine_y", "sine_x")
@@ -218,6 +229,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shift-levels", default="0,0.25,0.5,0.75,1.0", help="Severity levels, including zero.")
+    parser.add_argument(
+        "--beta-levels",
+        default=None,
+        help="Optional beta severity levels. Overrides --shift-levels for beta and may exceed 1.",
+    )
+    parser.add_argument(
+        "--sine-levels",
+        default=None,
+        help="Optional sine-mixture levels. Overrides --shift-levels for sine shifts and must be in [0, 1].",
+    )
     parser.add_argument("--active-shifts", default="beta,sine_y,sine_x")
     parser.add_argument("--views-per-mode", type=int, default=2)
     parser.add_argument("--view-batch-size", type=int, default=2)
@@ -243,11 +264,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--range050-config", default="drivaerml_satloss7_range050")
     parser.add_argument("--range075-config", default="drivaerml_satloss7_range075")
     parser.add_argument("--satloss7-config", default="drivaerml_satloss7")
+    parser.add_argument("--range200-config", default="drivaerml_satloss7_range200")
+    parser.add_argument("--range300-config", default="drivaerml_satloss7_range300")
+    parser.add_argument("--range500-config", default="drivaerml_satloss7_range500")
     parser.add_argument("--smart-checkpoint", required=True)
     parser.add_argument("--range025-checkpoint", required=True)
     parser.add_argument("--range050-checkpoint", required=True)
     parser.add_argument("--range075-checkpoint", required=True)
     parser.add_argument("--satloss7-checkpoint", required=True)
+    parser.add_argument("--range200-checkpoint", required=True)
+    parser.add_argument("--range300-checkpoint", required=True)
+    parser.add_argument("--range500-checkpoint", required=True)
     parser.add_argument(
         "--output-dir",
         default=str(REPO_ROOT / "results/drivaerml_smart_satloss7_range_ablation_25runs"),
@@ -277,11 +304,18 @@ def resolve_devices(text: str) -> List[torch.device]:
 
 def parse_levels(text: str) -> List[float]:
     values = sorted({round(float(item.strip()), 8) for item in str(text).split(",") if item.strip()})
-    if not values or values[0] < 0.0 or values[-1] > 1.0:
-        raise ValueError("Shift levels must be within [0, 1].")
+    if not values or values[0] < 0.0:
+        raise ValueError("Shift levels must be non-negative.")
     if values[0] != 0.0:
         values.insert(0, 0.0)
     return values
+
+
+def levels_for_shift(levels: Sequence[float] | Mapping[str, Sequence[float]], shift: str) -> Sequence[float]:
+    """Return the configured severity levels for one shift family."""
+    if isinstance(levels, Mapping):
+        return levels.get(shift, ())
+    return levels
 
 
 def parse_shifts(text: str) -> List[str]:
@@ -388,6 +422,9 @@ def checkpoint_map(args: argparse.Namespace) -> OrderedDict[str, str]:
             ("SMART_SATLOSS7_RANGE050", args.range050_checkpoint),
             ("SMART_SATLOSS7_RANGE075", args.range075_checkpoint),
             ("SMART_SATLOSS7", args.satloss7_checkpoint),
+            ("SMART_SATLOSS7_RANGE200", args.range200_checkpoint),
+            ("SMART_SATLOSS7_RANGE300", args.range300_checkpoint),
+            ("SMART_SATLOSS7_RANGE500", args.range500_checkpoint),
         ]
     )
 
@@ -400,6 +437,9 @@ def config_map(args: argparse.Namespace) -> OrderedDict[str, str]:
             ("SMART_SATLOSS7_RANGE050", args.range050_config),
             ("SMART_SATLOSS7_RANGE075", args.range075_config),
             ("SMART_SATLOSS7", args.satloss7_config),
+            ("SMART_SATLOSS7_RANGE200", args.range200_config),
+            ("SMART_SATLOSS7_RANGE300", args.range300_config),
+            ("SMART_SATLOSS7_RANGE500", args.range500_config),
         ]
     )
 
@@ -444,7 +484,7 @@ def load_case(data_root: Path, run_id: int) -> Dict[str, np.ndarray]:
 
 def build_modes(
     active_shifts: Sequence[str],
-    levels: Sequence[float],
+    levels: Sequence[float] | Mapping[str, Sequence[float]],
     active_geometry_sources: Sequence[str],
 ) -> List[Dict[str, object]]:
     modes: List[Dict[str, object]] = [
@@ -458,7 +498,7 @@ def build_modes(
     ]
     mode_id = 1
     for shift in active_shifts:
-        for severity in levels:
+        for severity in levels_for_shift(levels, shift):
             if severity <= 0.0:
                 continue
             if shift == "beta":
@@ -792,14 +832,14 @@ def write_wide_metric_tables(
     percentage_aggregate: Sequence[Mapping[str, object]],
     metric: str,
     active_shifts: Sequence[str],
-    levels: Sequence[float],
+    levels: Sequence[float] | Mapping[str, Sequence[float]],
     active_geometry_sources: Sequence[str],
     include_std: bool = True,
 ) -> Dict[str, str]:
     """Write paper-facing absolute and paired-worsening tables."""
     conditions: List[tuple[str, str, float]] = []
     for shift in active_shifts:
-        for severity in levels:
+        for severity in levels_for_shift(levels, shift):
             if float(severity) > 0.0:
                 conditions.append((shift, f"{shift}_{severity:.2f}", float(severity)))
     for source in active_geometry_sources:
@@ -1273,7 +1313,19 @@ def main() -> None:
     if not math.isfinite(float(args.y_pad_fraction)) or float(args.y_pad_fraction) < 0.0:
         raise ValueError("--y-pad-fraction must be finite and non-negative.")
     args.active_shifts = parse_shifts(args.active_shifts)
-    levels = parse_levels(args.shift_levels)
+    common_levels = parse_levels(args.shift_levels)
+    beta_levels = parse_levels(args.beta_levels) if args.beta_levels is not None else common_levels
+    sine_levels = parse_levels(args.sine_levels) if args.sine_levels is not None else common_levels
+    if any(float(level) > 1.0 for level in sine_levels):
+        raise ValueError(
+            "Sine-mixture levels must be within [0, 1]. Use --beta-levels for beta endpoints above 1; "
+            "the sine sampler is a bounded mixture fraction."
+        )
+    levels: Dict[str, Sequence[float]] = {
+        "beta": beta_levels,
+        "sine_y": sine_levels,
+        "sine_x": sine_levels,
+    }
     geometry_factors = parse_geometry_decimation_factors(args.geometry_decimation_factors)
     args.active_geometry_sources = parse_active_geometry_sources(
         args.active_geometry_sources,
@@ -1304,7 +1356,13 @@ def main() -> None:
         + (", ".join(args.active_geometry_sources) if args.active_geometry_sources else "none")
     )
     print(f"Geometry factors: {', '.join(str(factor) for factor in geometry_factors)}")
-    print(f"Shift levels: {', '.join(f'{level:.2f}' for level in levels)}")
+    print(
+        "Shift levels: "
+        + "; ".join(
+            f"{shift}=" + ",".join(f"{level:.2f}" for level in levels_for_shift(levels, shift))
+            for shift in args.active_shifts
+        )
+    )
     print(f"Experiment preset: {args.experiment_preset}")
     print(f"Absolute plot scales: {', '.join(plot_scales)}; standard deviations: {_COMPUTE_PLOT_STD}")
     print(f"Plot font scale: {args.font_scale:.2f}")
@@ -1499,14 +1557,13 @@ def main() -> None:
     write_csv(output_dir / "paired_percentage_worsening.csv", percentage_rows)
     write_csv(output_dir / "aggregate_percentage_worsening.csv", percentage_aggregate)
 
-    endpoint = float(max(levels))
     # Geometry-source conditions are rendered only in the paired method plots
     # below; do not emit one redundant figure for every div5/div10 source.
     condition_names = list(args.active_shifts)
     combined_geometry_plot_paths: Dict[str, str] = {}
     for shift in condition_names:
         for metric in METRIC_KEYS:
-            condition_endpoint = endpoint if shift in args.active_shifts else 1.0
+            condition_endpoint = float(max(levels_for_shift(levels, shift)))
             for plot_scale in plot_scales:
                 plot_endpoint_bars(
                     aggregate,
@@ -1591,7 +1648,7 @@ def main() -> None:
         "configs": dict(config_map(args)),
         "checkpoints": dict(args.checkpoints),
         "active_shifts": list(args.active_shifts),
-        "shift_levels": levels,
+        "shift_levels": {shift: list(levels_for_shift(levels, shift)) for shift in SHIFT_ORDER},
         "run_ids": run_ids,
         "run_selection": str(args.run_selection),
         "top_selection_metric": str(args.top_selection_metric),

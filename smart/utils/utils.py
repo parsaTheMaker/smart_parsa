@@ -61,6 +61,11 @@ def infer_fields_from_config(config):
         return {"surface": ["pressure"], "volume": ["velocity_x", "velocity_y", "velocity_z"]}
     if dataset == "ShiftWing":
         return {"surface": ["pressure"], "volume": ["velocity_x", "velocity_y", "velocity_z"]}
+    if dataset == "ShiftSubmarine":
+        return {
+            "surface": ["pressure", "wall_shear_x", "wall_shear_y", "wall_shear_z"],
+            "volume": ["pressure", "velocity_x", "velocity_y", "velocity_z"],
+        }
     return None
 
 

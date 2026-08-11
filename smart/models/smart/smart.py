@@ -234,6 +234,23 @@ class Modulator(nn.Module):
         super().__init__()
         self.mlp = nn.Sequential(nn.Linear(cond_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, dim * 2))
         self.use_residual = use_residual
+        # Keep the original direct FiLM behavior as the default.  SHIFT-Crash
+        # opts into a bounded residual mode through its isolated adapter.
+        self.conditioning_mode = "direct"
+        self.conditioning_residual_scale = 1.0
+        self.conditioning_shift_scale = 1.0
+
+    def configure_conditioning(self, mode="direct", residual_scale=1.0, shift_scale=1.0):
+        mode = str(mode).lower().strip()
+        if mode not in {"direct", "residual", "bounded_residual"}:
+            raise ValueError(f"Unsupported conditioning mode: {mode!r}")
+        residual_scale = float(residual_scale)
+        shift_scale = float(shift_scale)
+        if residual_scale < 0.0 or shift_scale < 0.0:
+            raise ValueError("Conditioning scales must be non-negative.")
+        self.conditioning_mode = mode
+        self.conditioning_residual_scale = residual_scale
+        self.conditioning_shift_scale = shift_scale
 
     def forward(self, x, params):
         """Modulates the features x based on the conditioning parameters params.
@@ -246,8 +263,21 @@ class Modulator(nn.Module):
             Modulated features with shape (batch size, number points, dim).
         """
         scale, shift = torch.tensor_split(self.mlp(params), 2, dim=-1)
-        x = scale * x + shift if not self.use_residual else x + scale * x + shift
-        return x
+        # The conditioner produces one feature-wise vector per sample, while
+        # encoder/decoder activations may contain an additional point/latent
+        # axis.  Align that vector with the feature axis before broadcasting.
+        # Without this, a batch of two and 512 latent points compares the
+        # batch dimension against the latent-point dimension.
+        while scale.ndim < x.ndim:
+            scale = scale.unsqueeze(-2)
+            shift = shift.unsqueeze(-2)
+        if self.conditioning_mode == "bounded_residual":
+            scale = torch.tanh(scale) * self.conditioning_residual_scale
+            shift = torch.tanh(shift) * self.conditioning_shift_scale
+            return x + scale * x + shift
+        if self.conditioning_mode == "residual" or self.use_residual:
+            return x + scale * x + shift
+        return scale * x + shift
 
 
 class SimulationParamModulatedMLP(nn.Module):
@@ -257,17 +287,18 @@ class SimulationParamModulatedMLP(nn.Module):
         dim: Dimensionality of the input and output features.
         hidden_dim: Dimensionality of the hidden layer of the MLP.
         cond_dim: Dimensionality of the conditioning parameters.
+        cond_hidden_dim: Width of the conditioning bottleneck.
         dropout: Dropout rate. Default is 0.1.
         use_residual: If true, use residual connection in modulation. Default is False.
     """
 
-    def __init__(self, dim, hidden_dim, cond_dim, dropout=0.1, use_residual=False):
+    def __init__(self, dim, hidden_dim, cond_dim, cond_hidden_dim=128, dropout=0.1, use_residual=False):
         super().__init__()
         self.norm = nn.LayerNorm(dim, eps=1e-6)
         self.linear1 = nn.Linear(dim, hidden_dim)
         self.non_linearity = nn.GELU()
         self.linear2 = nn.Linear(hidden_dim, dim)
-        self.modulator = Modulator(hidden_dim, cond_dim, use_residual=use_residual)
+        self.modulator = Modulator(hidden_dim, cond_dim, hidden_dim=cond_hidden_dim, use_residual=use_residual)
         
 
     def forward(self, x, params):        
@@ -329,17 +360,43 @@ class EncoderBlock(nn.Module):
         dropout: Dropout rate. Defaults to 0.1.
         spatial_dim: Number of spatial dimensions for RoPE. Defaults to 3.
         cond_dim: Dimensionality of the conditioning parameters for the MLP. Defaults to 2.
+        conditioning_hidden_dim: Width of the conditioning bottleneck. Defaults to 128.
+        residual_update_scale: Multiplier applied to each residual update. Defaults to 1.
+        normalize_residuals: If true, normalize block outputs after residual updates.
     """
 
-    def __init__(self, dim, num_heads=8, dropout=0.1, spatial_dim=3, cond_dim=2):
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        dropout=0.1,
+        spatial_dim=3,
+        cond_dim=2,
+        conditioning_hidden_dim=128,
+        residual_update_scale=1.0,
+        normalize_residuals=False,
+    ):
         super().__init__()
+        residual_update_scale = float(residual_update_scale)
+        if not math.isfinite(residual_update_scale) or residual_update_scale <= 0.0:
+            raise ValueError("residual_update_scale must be a finite positive number.")
+        self.residual_update_scale = residual_update_scale
+        self.normalize_residuals = bool(normalize_residuals)
         self.geo_attn = CrossAttention(dim=dim, num_heads=num_heads, dropout=dropout, spatial_dim=spatial_dim)
         self.cross_attn = CrossAttention(dim=dim, num_heads=num_heads, dropout=dropout, spatial_dim=spatial_dim)
         self.attn_dropout = nn.Dropout(dropout)
+        self.cross_output_norm = nn.LayerNorm(dim, eps=1e-6) if self.normalize_residuals else nn.Identity()
+        self.output_norm = nn.LayerNorm(dim, eps=1e-6) if self.normalize_residuals else nn.Identity()
         
         # Pointwise MLP
         if cond_dim > 0:
-            self.mlp = SimulationParamModulatedMLP(dim=dim, hidden_dim=dim * 4, cond_dim=cond_dim, dropout=dropout)
+            self.mlp = SimulationParamModulatedMLP(
+                dim=dim,
+                hidden_dim=dim * 4,
+                cond_dim=cond_dim,
+                cond_hidden_dim=conditioning_hidden_dim,
+                dropout=dropout,
+            )
         else:
             self.mlp = PlainMLP(dim=dim, hidden_dim=dim * 4, dropout=dropout)
        
@@ -360,15 +417,20 @@ class EncoderBlock(nn.Module):
                 - Latent geometry after geometry cross-attention and before cross-attention and MLP with shape (batch size, number latent points, dim).
         """
         # First cross-attention with the subsampled geometry
-        latent_geometry_cross = latent_geometry + self.attn_dropout(self.geo_attn(q=latent_geometry, kv=subsampled_geometry, q_pos=latent_geometry_pos, kv_pos=subsampled_geometry_pos))
+        latent_geometry_cross = latent_geometry + self.residual_update_scale * self.attn_dropout(
+            self.geo_attn(q=latent_geometry, kv=subsampled_geometry, q_pos=latent_geometry_pos, kv_pos=subsampled_geometry_pos)
+        )
+        latent_geometry_cross = self.cross_output_norm(latent_geometry_cross)
 
         # Update the initial latent geometry by attending to the cross-attended version of itself
-        latent_geometry_self = latent_geometry + self.attn_dropout(self.cross_attn(q=latent_geometry, kv=latent_geometry_cross, q_pos=latent_geometry_pos, kv_pos=latent_geometry_pos))
+        latent_geometry_self = latent_geometry + self.residual_update_scale * self.attn_dropout(
+            self.cross_attn(q=latent_geometry, kv=latent_geometry_cross, q_pos=latent_geometry_pos, kv_pos=latent_geometry_pos)
+        )
         
         # Pointwise MLP
-        latent_geometry_mlp = latent_geometry_self + self.mlp(latent_geometry_self, params)
+        latent_geometry_mlp = latent_geometry_self + self.residual_update_scale * self.mlp(latent_geometry_self, params)
         
-        return latent_geometry_mlp, latent_geometry_cross
+        return self.output_norm(latent_geometry_mlp), latent_geometry_cross
 
 
 class DecoderBlock(nn.Module):
@@ -381,18 +443,49 @@ class DecoderBlock(nn.Module):
         dropout: Dropout rate. Defaults to 0.1.
         spatial_dim: Number of spatial dimensions for RoPE. Defaults to 3.
         cond_dim: Dimensionality of the conditioning parameters for the MLP. Defaults to 2.
+        conditioning_hidden_dim: Width of the conditioning bottleneck. Defaults to 128.
+        residual_update_scale: Multiplier applied to each residual update. Defaults to 1.
+        normalize_residuals: If true, normalize block outputs after residual updates.
         shared_attn: Shared cross-attention module from the corresponding encoder block. Defaults to None.
         shared_mlp: Shared MLP module from the corresponding encoder block. Defaults to None.
     """
 
-    def __init__(self, dim, num_heads=8, dropout=0.1, spatial_dim=3, cond_dim=2, shared_attn=None, shared_mlp=None):
+    def __init__(
+        self,
+        dim,
+        num_heads=8,
+        dropout=0.1,
+        spatial_dim=3,
+        cond_dim=2,
+        conditioning_hidden_dim=128,
+        residual_update_scale=1.0,
+        normalize_residuals=False,
+        shared_attn=None,
+        shared_mlp=None,
+    ):
         super().__init__()
+        residual_update_scale = float(residual_update_scale)
+        if not math.isfinite(residual_update_scale) or residual_update_scale <= 0.0:
+            raise ValueError("residual_update_scale must be a finite positive number.")
+        self.residual_update_scale = residual_update_scale
+        self.normalize_residuals = bool(normalize_residuals)
         self.attn = CrossAttention(dim=dim, num_heads=num_heads, dropout=dropout, spatial_dim=spatial_dim) if shared_attn is None else shared_attn
         self.attn_dropout = nn.Dropout(dropout)
+        self.output_norm = nn.LayerNorm(dim, eps=1e-6) if self.normalize_residuals else nn.Identity()
         
         # Pointwise MLP
         if cond_dim > 0:
-            self.mlp = SimulationParamModulatedMLP(dim=dim, hidden_dim=dim * 4, cond_dim=cond_dim, dropout=dropout) if shared_mlp is None else shared_mlp
+            self.mlp = (
+                SimulationParamModulatedMLP(
+                    dim=dim,
+                    hidden_dim=dim * 4,
+                    cond_dim=cond_dim,
+                    cond_hidden_dim=conditioning_hidden_dim,
+                    dropout=dropout,
+                )
+                if shared_mlp is None
+                else shared_mlp
+            )
         else:
             self.mlp = PlainMLP(dim=dim, hidden_dim=dim * 4, dropout=dropout) if shared_mlp is None else shared_mlp
        
@@ -410,12 +503,14 @@ class DecoderBlock(nn.Module):
             Updated queries with shape (batch size, number query points, dim).
         """
         # Cross-attention with the latent geometry
-        queries = queries + self.attn_dropout(self.attn(q=queries, kv=latent_geometry, q_pos=queries_pos, kv_pos=latent_geometry_pos))
+        queries = queries + self.residual_update_scale * self.attn_dropout(
+            self.attn(q=queries, kv=latent_geometry, q_pos=queries_pos, kv_pos=latent_geometry_pos)
+        )
         
         # Pointwise MLP
-        queries = queries + self.mlp(queries, params)
+        queries = queries + self.residual_update_scale * self.mlp(queries, params)
         
-        return queries
+        return self.output_norm(queries)
 
 
 def sample_geometry(geometry, num_samples, with_replacement=False):
@@ -444,6 +539,29 @@ def sample_geometry(geometry, num_samples, with_replacement=False):
     sampled_geometry = torch.gather(geometry, 1, idx.unsqueeze(-1).expand(-1, -1, geometry.shape[-1]))
     return sampled_geometry
 
+
+def sample_geometry_indices(geometry, num_samples, with_replacement=False):
+    """Return the point indices used by ``sample_geometry``."""
+    n_points = int(geometry.shape[1])
+    batch_size = int(geometry.shape[0])
+    if num_samples <= 0 or num_samples >= n_points:
+        return torch.arange(n_points, device=geometry.device, dtype=torch.long).view(1, -1).expand(batch_size, -1)
+    if with_replacement:
+        return torch.randint(0, n_points, (batch_size, num_samples), device=geometry.device, dtype=torch.long)
+    return torch.stack(
+        [torch.randperm(n_points, device=geometry.device)[:num_samples] for _ in range(batch_size)],
+        dim=0,
+    )
+
+
+def gather_point_values(values, indices):
+    """Gather [B,N] or [B,N,C] node attributes using [B,K] indices."""
+    if values is None:
+        return None
+    if values.ndim == 2:
+        return torch.gather(values, 1, indices)
+    return torch.gather(values, 1, indices.unsqueeze(-1).expand(-1, -1, values.shape[-1]))
+
    
 class SMART(nn.Module):
     """SMART model for simulating time-independent PDEs over complex 3D geometries.
@@ -461,6 +579,9 @@ class SMART(nn.Module):
         pos_scale_factor: Scaling factor for the positions to use more/less of the dynamic range of the positional embedding. Default is 1000.
         dropout: Dropout rate. Default is 0.0.
         subregion_size: Number of query points to process in each subregion during sequential inference. Default is 262144.
+        conditioning_hidden_dim: Width of each FiLM conditioning bottleneck. Default is 128.
+        residual_update_scale: Multiplier applied to each residual update. Default is 1.
+        normalize_residuals: If true, normalize encoder and decoder block outputs.
     """
 
     def __init__(self, spatial_dim=3,
@@ -475,7 +596,14 @@ class SMART(nn.Module):
                  pos_scale_factor=1000,
                  dropout=0.0,
                  subregion_size=262144,
-                 subsampled_geometry_with_replacement=False):
+                 subsampled_geometry_with_replacement=False,
+                 conditioning_hidden_dim=128,
+                 residual_update_scale=1.0,
+                 normalize_residuals=False,
+                 geometry_feature_channels=0,
+                 query_feature_channels=0,
+                 part_embedding_size=0,
+                 part_embedding_dim=16):
         super(SMART, self).__init__()
         assert surface_channels > 0 and volume_channels > 0, "surface_channels and volume_channels must be positive integers."
         
@@ -485,11 +613,71 @@ class SMART(nn.Module):
         self.subsampled_geometry_points = subsampled_geometry_points
         self.subsampled_geometry_with_replacement = bool(subsampled_geometry_with_replacement)
         self.pos_scale_factor = pos_scale_factor
+        self.conditioning_hidden_dim = int(conditioning_hidden_dim)
+        if self.conditioning_hidden_dim <= 0:
+            raise ValueError("conditioning_hidden_dim must be positive.")
+        self.residual_update_scale = float(residual_update_scale)
+        self.normalize_residuals = bool(normalize_residuals)
+        self.geometry_feature_channels = int(geometry_feature_channels)
+        self.query_feature_channels = int(query_feature_channels)
+        self.part_embedding_size = int(part_embedding_size)
+        self.part_embedding_dim = int(part_embedding_dim)
+        if self.geometry_feature_channels < 0 or self.query_feature_channels < 0:
+            raise ValueError("Feature channel counts must be non-negative.")
+        if self.geometry_feature_channels != self.query_feature_channels:
+            raise ValueError("Geometry and query feature widths must match for shared SMART feature encoding.")
+        if self.part_embedding_size < 0 or self.part_embedding_dim <= 0:
+            raise ValueError("Invalid part embedding configuration.")
+        self.point_feature_encoder = None
+        if self.geometry_feature_channels > 0 or self.part_embedding_size > 0:
+            if self.geometry_feature_channels <= 0 or self.part_embedding_size <= 0:
+                raise ValueError("Both continuous feature channels and part embedding size are required together.")
+            self.point_feature_norm = nn.LayerNorm(self.geometry_feature_channels, eps=1.0e-6)
+            self.point_feature_projection = nn.Sequential(
+                nn.Linear(self.geometry_feature_channels, latent_dim),
+                nn.GELU(),
+                nn.Linear(latent_dim, latent_dim),
+            )
+            self.part_embedding = nn.Embedding(self.part_embedding_size, self.part_embedding_dim, padding_idx=0)
+            self.part_projection = nn.Linear(self.part_embedding_dim, latent_dim, bias=False)
+            self.point_feature_scale = nn.Parameter(torch.tensor(0.1))
+            self.part_feature_scale = nn.Parameter(torch.tensor(0.1))
+            self.point_feature_encoder = nn.Identity()
         self.pos_encoder = ModulatedPositionalEmbedding(latent_dim, spatial_dim)
         
         # Encoder and decoder blocks
-        self.encoder_blocks = nn.ModuleList([EncoderBlock(dim=latent_dim, num_heads=num_heads, dropout=dropout, spatial_dim=spatial_dim, cond_dim=parameter_channels) for i in range(num_encoder_decoder_blocks)])
-        self.decoder_blocks = nn.ModuleList([DecoderBlock(dim=latent_dim, num_heads=num_heads, dropout=dropout, spatial_dim=spatial_dim, cond_dim=parameter_channels, shared_attn=self.encoder_blocks[i].cross_attn, shared_mlp=self.encoder_blocks[i].mlp) for i in range(num_encoder_decoder_blocks)])
+        self.encoder_blocks = nn.ModuleList(
+            [
+                EncoderBlock(
+                    dim=latent_dim,
+                    num_heads=num_heads,
+                    dropout=dropout,
+                    spatial_dim=spatial_dim,
+                    cond_dim=parameter_channels,
+                    conditioning_hidden_dim=self.conditioning_hidden_dim,
+                    residual_update_scale=self.residual_update_scale,
+                    normalize_residuals=self.normalize_residuals,
+                )
+                for _ in range(num_encoder_decoder_blocks)
+            ]
+        )
+        self.decoder_blocks = nn.ModuleList(
+            [
+                DecoderBlock(
+                    dim=latent_dim,
+                    num_heads=num_heads,
+                    dropout=dropout,
+                    spatial_dim=spatial_dim,
+                    cond_dim=parameter_channels,
+                    conditioning_hidden_dim=self.conditioning_hidden_dim,
+                    residual_update_scale=self.residual_update_scale,
+                    normalize_residuals=self.normalize_residuals,
+                    shared_attn=self.encoder_blocks[i].cross_attn,
+                    shared_mlp=self.encoder_blocks[i].mlp,
+                )
+                for i in range(num_encoder_decoder_blocks)
+            ]
+        )
         
         # Final MLP
         self.mlp = nn.Sequential(nn.Linear(latent_dim, 128), nn.GELU(),
@@ -513,24 +701,48 @@ class SMART(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
     
-    def encode(self, geo, params, return_final=False):
+    def _encode_point_features(self, features, part_ids):
+        if self.point_feature_encoder is None:
+            return None
+        if features is None or part_ids is None:
+            raise ValueError("Configured SMART point features require both continuous features and part IDs.")
+        if features.shape[-1] != self.geometry_feature_channels:
+            raise ValueError(
+                f"Expected {self.geometry_feature_channels} continuous point features, got {features.shape[-1]}."
+            )
+        part_ids = part_ids.long().clamp(0, self.part_embedding_size - 1)
+        continuous = self.point_feature_projection(self.point_feature_norm(features.float()))
+        categorical = self.part_projection(self.part_embedding(part_ids))
+        return self.point_feature_scale * continuous + self.part_feature_scale * categorical
+
+    def encode(self, geo, params, geometry_features=None, geometry_part_ids=None, return_final=False):
         # Prepare positions by scaling
         geo = geo * self.pos_scale_factor
         
         # Sample the initial latent geometry
-        latent_geo_pos = sample_geometry(geo, self.num_geo)
+        latent_idx = sample_geometry_indices(geo, self.num_geo)
+        latent_geo_pos = gather_point_values(geo, latent_idx)
         latent_geo_emb = self.pos_encoder(latent_geo_pos)
+        if self.point_feature_encoder is not None:
+            latent_geo_emb = latent_geo_emb + self._encode_point_features(
+                gather_point_values(geometry_features, latent_idx),
+                gather_point_values(geometry_part_ids, latent_idx),
+            )
         
         # Apply encoder blocks
         intermediate_latent_geometries = []
         for block in self.encoder_blocks:
             # Subsample the geometry for geometry cross-attention
-            sub_geo_pos = sample_geometry(
-                geo,
-                self.subsampled_geometry_points,
-                with_replacement=self.subsampled_geometry_with_replacement,
+            sub_idx = sample_geometry_indices(
+                geo, self.subsampled_geometry_points, with_replacement=self.subsampled_geometry_with_replacement
             )
+            sub_geo_pos = gather_point_values(geo, sub_idx)
             sub_geo_emb = self.pos_encoder(sub_geo_pos)
+            if self.point_feature_encoder is not None:
+                sub_geo_emb = sub_geo_emb + self._encode_point_features(
+                    gather_point_values(geometry_features, sub_idx),
+                    gather_point_values(geometry_part_ids, sub_idx),
+                )
             
             # Apply encoder block
             latent_geo_emb, e_ca = block(latent_geo_emb, sub_geo_emb, params, latent_geometry_pos=latent_geo_pos, subsampled_geometry_pos=sub_geo_pos)
@@ -542,10 +754,20 @@ class SMART(nn.Module):
             return intermediate_latent_geometries, latent_geo_pos, latent_geo_emb
         return intermediate_latent_geometries, latent_geo_pos
     
-    def decode_features(self, intermediate_latent_geometries, latent_geo_pos, params, query_pos):
+    def decode_features(
+        self,
+        intermediate_latent_geometries,
+        latent_geo_pos,
+        params,
+        query_pos,
+        query_features=None,
+        query_part_ids=None,
+    ):
         # Prepare positions by scaling
         query_pos = query_pos * self.pos_scale_factor
         query_emb = self.pos_encoder(query_pos)
+        if self.point_feature_encoder is not None:
+            query_emb = query_emb + self._encode_point_features(query_features, query_part_ids)
         
         # Apply decoder blocks
         for e_ca, block in zip(intermediate_latent_geometries, self.decoder_blocks):
@@ -553,12 +775,29 @@ class SMART(nn.Module):
         
         return query_emb
 
-    def decode(self, intermediate_latent_geometries, latent_geo_pos, params, query_pos):
-        query_emb = self.decode_features(intermediate_latent_geometries, latent_geo_pos, params, query_pos)
+    def decode(self, intermediate_latent_geometries, latent_geo_pos, params, query_pos, query_features=None, query_part_ids=None):
+        query_emb = self.decode_features(
+            intermediate_latent_geometries,
+            latent_geo_pos,
+            params,
+            query_pos,
+            query_features=query_features,
+            query_part_ids=query_part_ids,
+        )
         pred = self.mlp(query_emb)
         return pred
 
-    def forward(self, geo, surf_query_pos, vol_query_pos, params):
+    def forward(
+        self,
+        geo,
+        surf_query_pos,
+        vol_query_pos,
+        params,
+        geometry_features=None,
+        query_features=None,
+        geometry_part_ids=None,
+        query_part_ids=None,
+    ):
         """Forward method for SMART model.
         
         Args:
@@ -573,13 +812,22 @@ class SMART(nn.Module):
                 - Volume predictions with shape (batch size, number volume query points, volume_channels).
         """
         # Encode
-        intermediate_latent_geometries, latent_geo_pos = self.encode(geo, params)
+        intermediate_latent_geometries, latent_geo_pos = self.encode(
+            geo, params, geometry_features=geometry_features, geometry_part_ids=geometry_part_ids
+        )
         
         # Prepare query positions by concatenating surface and volume query positions
         query_pos = torch.cat([surf_query_pos, vol_query_pos], dim=1)
         
         # Decode
-        pred = self.decode(intermediate_latent_geometries, latent_geo_pos, params, query_pos)
+        pred = self.decode(
+            intermediate_latent_geometries,
+            latent_geo_pos,
+            params,
+            query_pos,
+            query_features=query_features,
+            query_part_ids=query_part_ids,
+        )
         
         # Split surface and volume predictions
         pred_surf = pred[:, :surf_query_pos.shape[1], 0:self.surface_channels]
@@ -588,7 +836,19 @@ class SMART(nn.Module):
         return pred_surf, pred_vol
     
     @torch.inference_mode()
-    def inference(self, geo, surf_query_pos, vol_query_pos, params):
+    def inference(
+        self,
+        geo,
+        surf_query_pos,
+        vol_query_pos,
+        params,
+        geometry_features=None,
+        query_features=None,
+        geometry_part_ids=None,
+        query_part_ids=None,
+        volume_query_features=None,
+        volume_query_part_ids=None,
+    ):
         """Sequential inference method to handle large number of query points that may not fit into GPU memory.
         
         Args:
@@ -603,14 +863,25 @@ class SMART(nn.Module):
                 - Volume predictions with shape (batch size, number volume query points, volume_channels).
         """
         # Encode
-        intermediate_latent_geometries, latent_geo_pos = self.encode(geo, params)
+        intermediate_latent_geometries, latent_geo_pos = self.encode(
+            geo, params, geometry_features=geometry_features, geometry_part_ids=geometry_part_ids
+        )
         
         # Surface predictions sequentially
         N_surf = surf_query_pos.shape[1]
         y_hat_surf_subregions = []
         for i in range(0, N_surf, self.subregion_size):
             surf_subregion = surf_query_pos[:, i:i+self.subregion_size, :]
-            y_surf_subregion = self.decode(intermediate_latent_geometries, latent_geo_pos, params, surf_subregion)
+            surf_features = None if query_features is None else query_features[:, i:i+self.subregion_size, :]
+            surf_part_ids = None if query_part_ids is None else query_part_ids[:, i:i+self.subregion_size]
+            y_surf_subregion = self.decode(
+                intermediate_latent_geometries,
+                latent_geo_pos,
+                params,
+                surf_subregion,
+                query_features=surf_features,
+                query_part_ids=surf_part_ids,
+            )
             y_hat_surf_subregions.append(y_surf_subregion)
         y_hat_surf = torch.cat(y_hat_surf_subregions, dim=1)
 
@@ -619,7 +890,16 @@ class SMART(nn.Module):
         y_hat_vol_subregions = []
         for i in range(0, N_vol, self.subregion_size):
             vol_subregion = vol_query_pos[:, i:i+self.subregion_size, :]
-            y_vol_subregion = self.decode(intermediate_latent_geometries, latent_geo_pos, params, vol_subregion)
+            vol_features = None if volume_query_features is None else volume_query_features[:, i:i+self.subregion_size, :]
+            vol_part_ids = None if volume_query_part_ids is None else volume_query_part_ids[:, i:i+self.subregion_size]
+            y_vol_subregion = self.decode(
+                intermediate_latent_geometries,
+                latent_geo_pos,
+                params,
+                vol_subregion,
+                query_features=vol_features,
+                query_part_ids=vol_part_ids,
+            )
             y_hat_vol_subregions.append(y_vol_subregion)
         y_hat_vol = torch.cat(y_hat_vol_subregions, dim=1)
         

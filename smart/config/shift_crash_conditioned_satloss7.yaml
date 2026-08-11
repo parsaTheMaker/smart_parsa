@@ -1,0 +1,9 @@
+defaults:
+  - shift_crash_satloss7
+  - _self_
+
+experiment:
+  name: "SHIFT_CRASH_SMART_CONDITIONED_SATLOSS7"
+  model_name: "SMART_SHIFT_CRASH_CONDITIONED_SATLOSS7"
+  conditioning_diagnostics: True
+

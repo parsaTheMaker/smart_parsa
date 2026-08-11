@@ -1,0 +1,30 @@
+defaults:
+  - shift_crash_rebuilt
+  - _self_
+
+experiment:
+  name: "SHIFT_CRASH_SMART_REBUILT_SATLOSS7"
+  model_name: "SMART_SHIFT_CRASH_REBUILT_SATLOSS7"
+  geometry_epoch_seeded_sampling: false
+  num_body_points: 0
+  view_geometry_points: 65536
+  eval_view_geometry_points: 65536
+  num_workers: 4
+  prefetch_factor: 2
+  log_every_n_steps: 5
+
+  shared_shift_family_probabilities: [0.3333333333, 0.3333333333, 0.3333333334]
+  shared_shift_beta_min: 0.0
+  shared_shift_beta_max: 1.0
+  shared_shift_sine_min: 0.0
+  shared_shift_sine_max: 1.0
+  train_shared_shift_sampling_mode: "random_beta_sine"
+  use_prediction_consistency: true
+  prediction_consistency_weight: 1.0
+  prediction_consistency_symmetric_detached: true
+  consistency_warmup_epochs: 0
+  fuse_consistency_views: true
+  task_weighting_method: "fixed_sum"
+  config_task_base_weights: [0.2, 0.2, 0.6]
+  fixed_sum_use_view_losses: true
+  use_learned_task_weighting: false

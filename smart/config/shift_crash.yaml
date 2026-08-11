@@ -1,0 +1,98 @@
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+
+wandb:
+  project: "smart"
+  entity: "parsa-vatani99-technical-university-of-munich"
+
+experiment:
+  name: "SHIFT_CRASH_SMART"
+  model_name: "SMART_SHIFT_CRASH"
+  model_tag: ""
+  random_seed: 42
+  dataset: "SHIFT_CRASH"
+  data_path: "/mnt/ssdraid/parsa/shift_crash_preprocessed"
+  evaluation_split: "validation"
+
+  # Scale point-count hyperparameters from the complete source clouds, not
+  # from DrivAerML's sampled 131K budget. SHIFT uses exactly one quarter of
+  # the complete DrivAerML source-point budget: 32,768 vs 1,048,576 points.
+  num_body_points: 32768
+  num_query_points: 16384
+  eval_query_points: 16384
+  geometry_epoch_seeded_sampling: True
+  coordinate_normalization: "global_bounds"
+
+  architecture:
+    latent_dim: 256
+    latent_geometry_points: 1024
+    subsampled_geometry_points: 4096
+    # SHIFT-Crash has sparse rail evidence.  The isolated model samples its
+    # anchors without replacement and reserves a small fraction for rail
+    # points from the supplied view.
+    subsampled_geometry_with_replacement: False
+    num_encoder_decoder_blocks: 6
+    pos_scale_factor: 100
+    # Cross-attention dropout is enabled only for SHIFT-Crash. This model has
+    # 4,142 independent design cases, so the prior zero-dropout setting
+    # allowed it to memorize case-specific deformation patterns.
+    dropout: 0.10
+  # SHIFT-Crash-only stabilization.  Each block keeps the SMART residual
+  # topology, but scales updates and normalizes its emitted token stream.
+    residual_update_scale: 0.5
+    normalize_residuals: True
+    # The repeated FiLM path remains disabled; the design token is explicit.
+    conditioning_hidden_dim: 32
+
+  # Static pre-impact node inputs from SHIFT-Crash v2. The seven continuous
+  # channels are standardized with train-only statistics; the eighth channel
+  # is the binary front-rail mask and is kept in its native 0/1 scale.
+  geometry_feature_channels: 8
+  query_feature_channels: 8
+  part_embedding_size: 906
+  part_embedding_dim: 16
+
+  # SHIFT-Crash-only global design-token conditioning. A held-out statistical
+  # audit shows the four geometry offsets explain most terminal-response
+  # variation; all six documented pre-impact design variables therefore enter
+  # one token. Repeated per-block FiLM remains disabled. DrivAerML is intact.
+  conditioning_mode: "token_only"
+  conditioning_residual_scale: 0.0
+  conditioning_shift_scale: 0.0
+  conditioning_input_channels: 6
+  conditioning_parameter_indices: [0, 1, 2, 3, 4, 5]
+  initialize_model_weights: True
+
+  optimizer: "adamw"
+  loss_fn: "rel_l2"
+  scheduler: "cosine"
+  batch_size: 8
+  epochs: 250
+  learning_rate: 2.e-4
+  weight_decay: 1.e-3
+  early_stopping_patience: 35
+  early_stopping_min_delta: 1.e-4
+  gradient_norm: null
+  amp: True
+  precision: "float16"
+  amp_scaler_init_scale: 65536
+  amp_scaler_growth_factor: 2.0
+  amp_scaler_backoff_factor: 0.5
+  amp_scaler_growth_interval: 2000
+  log_every_n_steps: 10
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: True
+  cuda_batch_prefetch: True
+  density_voxel_resolution: 96
+  multi_gpu_strategy: "single"
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False

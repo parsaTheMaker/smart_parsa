@@ -1,0 +1,9 @@
+defaults:
+  - shift_crash
+  - _self_
+
+experiment:
+  name: "SHIFT_CRASH_SMART_CONDITIONED"
+  model_name: "SMART_SHIFT_CRASH_CONDITIONED"
+  conditioning_diagnostics: True
+

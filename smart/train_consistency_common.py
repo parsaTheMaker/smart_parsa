@@ -1078,6 +1078,7 @@ def sample_geometry_view(
     gaussian_mask_min_survivors=16384,
     sinusoidal_axis=None,
     sinusoidal_mix_fraction=0.0,
+    return_indices=False,
 ):
     if geo_log_density is None and _sampling_mode_requires_density(mode):
         raise RuntimeError(f"Sampling mode {mode!r} requires geometry log density for view sampling.")
@@ -1125,7 +1126,10 @@ def sample_geometry_view(
     if geo_mesh.device.type != idx.device.type or geo_mesh.device != idx.device:
         idx = idx.to(device=geo_mesh.device, non_blocking=(geo_mesh.device.type == "cuda"))
     sampled_density = None if geo_log_density is None else gather_scalar(geo_log_density, idx)
-    return gather_points(geo_mesh, idx), sampled_density, resolved_modes
+    sampled_geometry = gather_points(geo_mesh, idx)
+    if return_indices:
+        return sampled_geometry, sampled_density, resolved_modes, idx
+    return sampled_geometry, sampled_density, resolved_modes
 
 
 def consistency_warmup_factor(epoch, warmup_epochs):

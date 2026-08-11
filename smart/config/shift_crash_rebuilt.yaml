@@ -1,0 +1,38 @@
+defaults:
+  - shift_crash
+  - _self_
+
+experiment:
+  name: "SHIFT_CRASH_SMART_REBUILT"
+  model_name: "SMART_SHIFT_CRASH_REBUILT"
+  # SHIFT meshes have stable node correspondence and a common physical frame
+  # across cases. Keep that chart intact: per-case centering/scaling removes
+  # the coordinate identity needed to generalize terminal deformation.
+  coordinate_normalization: "global_bounds"
+  # Twofold point budget for the rebuilt experiment.
+  num_body_points: 65536
+  num_query_points: 65536
+  eval_query_points: 65536
+
+  # A 7.6M-parameter six-block model was far larger than needed for 4,660
+  # independent design cases and memorized them. This keeps SMART's attention
+  # operator while reducing its case-level capacity substantially.
+  architecture:
+    latent_dim: 128
+    latent_geometry_points: 1024
+    subsampled_geometry_points: 4096
+    subsampled_geometry_with_replacement: false
+    num_encoder_decoder_blocks: 4
+    num_heads: 8
+    pos_scale_factor: 100
+    dropout: 0.10
+    residual_update_scale: 0.5
+    normalize_residuals: true
+    conditioning_hidden_dim: 32
+    # Query-local interpolation over the supplied geometry view. This is
+    # point-order independent and restores local structural context that the
+    # global SMART latent bottleneck cannot carry by itself.
+    use_local_query_geometry: true
+    local_query_support_points: 8192
+    local_query_neighbors: 8
+    local_query_chunk_size: 8192

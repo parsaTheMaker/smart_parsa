@@ -1,0 +1,19 @@
+defaults:
+  - drivaerml_satloss7
+  - _self_
+
+experiment:
+  name: "DrivAerML_SMART_SATLOSS7_RANGE_100"
+  model_name: "SMART_SATLOSS7_RANGE100"
+  model_tag: ""
+  epochs: 250
+
+  # Same SATLOSS7 protocol as the existing range ablations, with a beta and
+  # sine-mixture endpoint of 1.0 and no checkpoint initialization.
+  shared_shift_beta_min: 0.0
+  shared_shift_beta_max: 1.0
+  shared_shift_sine_min: 0.0
+  shared_shift_sine_max: 1.0
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False

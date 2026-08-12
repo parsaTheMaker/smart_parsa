@@ -274,7 +274,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--satloss7-checkpoint", required=True)
     parser.add_argument("--range200-checkpoint", required=True)
     parser.add_argument("--range300-checkpoint", required=True)
-    parser.add_argument("--range500-checkpoint", required=True)
+    parser.add_argument("--range500-checkpoint", default=None)
+    parser.add_argument(
+        "--exclude-range500",
+        action="store_true",
+        help="Exclude the range-500 model and its plots from this comparison.",
+    )
     parser.add_argument(
         "--output-dir",
         default=str(REPO_ROOT / "results/drivaerml_smart_satloss7_range_ablation_25runs"),
@@ -415,7 +420,7 @@ def rank_top_range_ablation_runs(
 
 
 def checkpoint_map(args: argparse.Namespace) -> OrderedDict[str, str]:
-    return OrderedDict(
+    checkpoints = OrderedDict(
         [
             ("SMART", args.smart_checkpoint),
             ("SMART_SATLOSS7_RANGE025", args.range025_checkpoint),
@@ -424,13 +429,17 @@ def checkpoint_map(args: argparse.Namespace) -> OrderedDict[str, str]:
             ("SMART_SATLOSS7", args.satloss7_checkpoint),
             ("SMART_SATLOSS7_RANGE200", args.range200_checkpoint),
             ("SMART_SATLOSS7_RANGE300", args.range300_checkpoint),
-            ("SMART_SATLOSS7_RANGE500", args.range500_checkpoint),
         ]
     )
+    if not args.exclude_range500:
+        if not args.range500_checkpoint:
+            raise ValueError("--range500-checkpoint is required unless --exclude-range500 is set.")
+        checkpoints["SMART_SATLOSS7_RANGE500"] = args.range500_checkpoint
+    return checkpoints
 
 
 def config_map(args: argparse.Namespace) -> OrderedDict[str, str]:
-    return OrderedDict(
+    configs = OrderedDict(
         [
             ("SMART", args.smart_config),
             ("SMART_SATLOSS7_RANGE025", args.range025_config),
@@ -439,9 +448,11 @@ def config_map(args: argparse.Namespace) -> OrderedDict[str, str]:
             ("SMART_SATLOSS7", args.satloss7_config),
             ("SMART_SATLOSS7_RANGE200", args.range200_config),
             ("SMART_SATLOSS7_RANGE300", args.range300_config),
-            ("SMART_SATLOSS7_RANGE500", args.range500_config),
         ]
     )
+    if not args.exclude_range500:
+        configs["SMART_SATLOSS7_RANGE500"] = args.range500_config
+    return configs
 
 
 def build_ablation_model(config, model_name: str, checkpoint: str, device: torch.device, query_chunk: int):
@@ -1303,10 +1314,55 @@ def plot_combined_geometry_source_bars(
     plt.close(fig)
 
 
+def average_remeshing_rows(
+    rows: Sequence[Mapping[str, object]],
+    source_modes: Sequence[str],
+    percentage: bool,
+) -> List[Dict[str, object]]:
+    """Average angle/isotropic/voxel rows separately for each div factor."""
+    row_map = {
+        (str(row["model_name"]), str(row["shift_name"]), float(row["severity"])): row
+        for row in rows
+    }
+    methods = ("angle", "isotropic", "voxel")
+    factors = sorted(
+        {
+            int(str(source).removeprefix("geometry_").rsplit("div", 1)[1])
+            for source in source_modes
+            if "_div" in str(source)
+        }
+    )
+    value_key = "combined_global_rel_l2_pct_worsening_mean" if percentage else "combined_global_rel_l2_mean"
+    std_key = "combined_global_rel_l2_pct_worsening_std" if percentage else "combined_global_rel_l2_std"
+    averaged: List[Dict[str, object]] = []
+    for model_name in MODEL_ORDER:
+        for factor in factors:
+            source_names = [f"geometry_{method}_div{factor}" for method in methods]
+            source_rows = [row_map.get((model_name, source_name, 1.0)) for source_name in source_names]
+            if any(row is None for row in source_rows):
+                continue
+            typed_rows = [row for row in source_rows if row is not None]
+            result: Dict[str, object] = dict(typed_rows[0])
+            result["shift_name"] = f"geometry_average_div{factor}"
+            result["model_label"] = MODEL_LABELS[model_name]
+            result[value_key] = float(np.mean([float(row[value_key]) for row in typed_rows]))
+            if std_key in typed_rows[0]:
+                # This is only a visual aggregate; RMS preserves the scale of
+                # the source uncertainty without treating source methods as
+                # independent samples.
+                result[std_key] = float(
+                    np.sqrt(np.mean([float(row.get(std_key, 0.0)) ** 2 for row in typed_rows]))
+                )
+            averaged.append(result)
+    return averaged
+
+
 def main() -> None:
-    global _COMPUTE_PLOT_STD
+    global _COMPUTE_PLOT_STD, MODEL_ORDER
     args = parse_args()
     apply_experiment_preset(args)
+    if args.exclude_range500:
+        MODEL_ORDER = tuple(name for name in MODEL_ORDER if name != "SMART_SATLOSS7_RANGE500")
     configure_plot_style(args.font_scale)
     _COMPUTE_PLOT_STD = not bool(args.no_std)
     plot_scales = parse_plot_scales(args.plot_scales)
@@ -1627,6 +1683,43 @@ def main() -> None:
                 y_pad_fraction=args.y_pad_fraction,
             )
             combined_geometry_plot_paths[f"{method}_relative_vs_smart"] = str(output_path)
+
+        average_factors = sorted(
+            {
+                int(source.removeprefix("geometry_").rsplit("div", 1)[1])
+                for source in geometry_source_modes
+                if "_div" in source
+            }
+        )
+        if all(
+            f"geometry_{method}_div{factor}" in geometry_source_modes
+            for method in ("angle", "isotropic", "voxel")
+            for factor in average_factors
+        ):
+            average_absolute = average_remeshing_rows(
+                aggregate,
+                geometry_source_modes,
+                percentage=False,
+            )
+            average_percentage = average_remeshing_rows(
+                percentage_aggregate,
+                geometry_source_modes,
+                percentage=True,
+            )
+            average_source_modes = [f"geometry_average_div{factor}" for factor in average_factors]
+            output_path = output_dir / "range_ablation_combined_global_endpoint_bars_remeshing_average_linear.png"
+            plot_combined_geometry_source_bars(
+                average_absolute,
+                average_percentage,
+                average_source_modes,
+                output_path,
+                "Combined global error (average of angle/isotropic/voxel remeshing, linear scale)",
+                log_scale=False,
+                percentage=False,
+                show_std=_COMPUTE_PLOT_STD,
+                y_pad_fraction=args.y_pad_fraction,
+            )
+            combined_geometry_plot_paths["remeshing_average_linear"] = str(output_path)
 
     table_paths = {
         metric: write_wide_metric_tables(

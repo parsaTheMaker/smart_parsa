@@ -1,0 +1,12 @@
+defaults:
+  - drivaerml_satloss7_range100
+  - _self_
+
+experiment:
+  name: "DrivAerML_SMART_SATLOSS7_RANGE_100_FROM_SMART_KDE4"
+  model_name: "SMART_SATLOSS7_RANGE100_KDE4"
+  epochs: 150
+  density_knn_k: 4
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False

@@ -1,0 +1,17 @@
+defaults:
+  - drivaerml_satloss7_range100
+  - _self_
+
+experiment:
+  name: "DrivAerML_SMART_SATLOSS7_RANGE_100_FROM_SMART_NO_CONSISTENCY"
+  model_name: "SMART_SATLOSS7_RANGE100_NO_CONSISTENCY"
+  epochs: 150
+  use_prediction_consistency: False
+
+  # Keep the original per-view SATLOSS7 coefficients.  The 0.6 consistency
+  # coefficient is intentionally inactive rather than reallocating it.
+  config_task_base_weights: [0.2, 0.2, 0.6]
+  fixed_sum_normalize_weights: False
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False

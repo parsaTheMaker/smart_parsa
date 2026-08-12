@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import gc
 from contextlib import contextmanager
 from timeit import default_timer
 
@@ -520,8 +521,39 @@ def setup_distributed():
 
 
 def cleanup_distributed():
-    if is_dist_enabled():
+    """Release CUDA-side training resources before shutting down NCCL.
+
+    DDP can finish the final epoch and checkpoint successfully while a
+    prefetched batch, CUDA stream, or persistent worker still owns cached
+    allocations.  Letting NCCL tear down against that pressure can turn a
+    successful run into an OOM during process exit.  Cleanup failures from
+    this finalization path are non-training errors and are only ignored when
+    CUDA/NCCL reports the known shutdown-time failure.
+    """
+    if not is_dist_enabled():
+        return
+
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except RuntimeError as exc:
+            if is_main_process():
+                print(f"[cleanup] CUDA synchronize warning before NCCL shutdown: {exc}")
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except RuntimeError as exc:
+            if is_main_process():
+                print(f"[cleanup] CUDA cache release warning before NCCL shutdown: {exc}")
+
+    try:
         dist.destroy_process_group()
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        if not any(token in message for token in ("nccl", "cuda", "out of memory")):
+            raise
+        if is_main_process():
+            print(f"[cleanup] NCCL shutdown warning after training completed: {exc}")
 
 
 def distributed_average_scalars(values):
@@ -1653,6 +1685,8 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
         )
         if not configured_task_weights:
             configured_task_weights = [1.0 / task_count] * task_count
+        if not use_prediction_consistency and len(configured_task_weights) == 3:
+            configured_task_weights = configured_task_weights[:2]
         if len(configured_task_weights) != task_count:
             raise ValueError(
                 f"Expected {task_count} task weights for {task_weighting_method}, "
@@ -1661,7 +1695,15 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
         weight_sum = float(sum(float(weight) for weight in configured_task_weights))
         if weight_sum <= 0.0:
             raise ValueError(f"Task weights for {task_weighting_method} must have a positive sum.")
-        config_task_weights = [float(weight) / weight_sum for weight in configured_task_weights]
+        # The no-consistency ablation may retain the first two SATLOSS view
+        # weights (0.2, 0.2) while disabling the third task.  Do not force
+        # those weights to sum to one when explicitly requested; all existing
+        # configurations retain the historical normalization by default.
+        normalize_fixed_sum_weights = bool(getattr(config, "fixed_sum_normalize_weights", True))
+        if normalize_fixed_sum_weights or not use_fixed_sum:
+            config_task_weights = [float(weight) / weight_sum for weight in configured_task_weights]
+        else:
+            config_task_weights = [float(weight) for weight in configured_task_weights]
         if use_config_layer or use_external_gradnorm:
             config_reference_parameter = resolve_balance_reference_parameter(model)
         if use_config_full:
@@ -2741,4 +2783,52 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     artifact.add_file(last_ckpt)
                 run.log_artifact(artifact)
             run.finish()
+
+        # Drop references held by the last prefetch iterator before asking
+        # NCCL to release its CUDA communicators.  This is especially
+        # important with persistent workers and multi-GPU SATLOSS runs.
+        train_pbar = None
+        train_batch_source = None
+        train_loader = None
+        test_loader = None
+        batch = None
+        geo_mesh = None
+        surf_mesh = None
+        surf_data = None
+        vol_mesh = None
+        vol_data = None
+        params = None
+        geo_log_density = None
+        primary_view_geo = None
+        primary_view_density = None
+        secondary_view_geo = None
+        secondary_view_density = None
+        fused_geo = None
+        fused_surf_mesh = None
+        fused_vol_mesh = None
+        fused_params = None
+        fused_density = None
+        fused_out = None
+        fused_surf = None
+        fused_vol = None
+        y1_surf = None
+        y2_surf = None
+        y1_vol = None
+        y2_vol = None
+        y1_surf_f = None
+        y2_surf_f = None
+        y1_vol_f = None
+        y2_vol_f = None
+        weighted_total_loss = None
+        supervised_primary = None
+        supervised_secondary = None
+        pred_consistency = None
+        train_model = None
+        model = None
+        optimizer = None
+        scheduler = None
+        scaler = None
+        uncertainty_balancer = None
+        external_gradnorm = None
+        gc.collect()
         cleanup_distributed()

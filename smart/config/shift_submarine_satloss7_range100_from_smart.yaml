@@ -1,0 +1,21 @@
+defaults:
+  - shift_submarine_satloss7
+  - _self_
+
+experiment:
+  name: "SHIFT_SUBMARINE_SMART_SATLOSS7_RANGE100_FROM_SMART"
+  model_name: "SMART_SUBMARINE_SATLOSS7_RANGE100_FROM_SMART"
+  epochs: 150
+
+  # Keep the submarine SATLOSS7 protocol: full retained source cloud,
+  # 65K-point views, epoch-independent source sampling, and beta/sine range
+  # [0, 1]. The vanilla checkpoint is used only for model initialization.
+  geometry_epoch_seeded_sampling: False
+  num_body_points: 0
+  view_geometry_points: 65536
+  primary_view_geometry_points: 65536
+  secondary_view_geometry_points: 65536
+  shared_shift_view_geometry_points: 65536
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False

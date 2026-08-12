@@ -1,0 +1,22 @@
+defaults:
+  - pump_satloss7
+  - _self_
+
+experiment:
+  name: "PUMP_SMART_SATLOSS7_RANGE100_FROM_SMART"
+  model_name: "SMART_PUMP_SATLOSS7_RANGE100_FROM_SMART"
+  epochs: 150
+  batch_size: 1
+
+  # Keep the pump SATLOSS7 protocol: full retained source cloud,
+  # 16K-point views, epoch-independent source sampling, and beta/sine range
+  # [0, 1]. The vanilla checkpoint is used only for model initialization.
+  geometry_epoch_seeded_sampling: False
+  num_body_points: 0
+  view_geometry_points: 16384
+  primary_view_geometry_points: 16384
+  secondary_view_geometry_points: 16384
+  shared_shift_view_geometry_points: 16384
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False

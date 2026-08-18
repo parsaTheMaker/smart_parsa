@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import torch
 
@@ -12,6 +14,20 @@ try:
     from sklearn.neighbors import NearestNeighbors
 except ImportError:  # pragma: no cover - optional CPU fallback backend
     NearestNeighbors = None
+
+
+def _sklearn_knn_jobs() -> int:
+    """Honor an explicit per-process kNN worker limit when one is configured.
+
+    Dataset preprocessing often evaluates many independent clouds in separate
+    processes.  ``n_jobs=-1`` in every process then oversubscribes the host.
+    Keeping the default preserves existing behavior, while preprocessing
+    launchers can set ``SMART_KNN_N_JOBS=1`` and parallelize across cases.
+    """
+    try:
+        return int(os.environ.get("SMART_KNN_N_JOBS", "-1"))
+    except ValueError:
+        return -1
 
 
 def knn_edges_as_neighbor_center(points_b, k_cur):
@@ -272,7 +288,11 @@ def estimate_log_sampling_density_kde(points, knn_k=8):
 
             k_cur = min(k_eff, n - 1)
             pts_np = pts_b.detach().cpu().numpy().astype(np.float64, copy=False)
-            nbrs = NearestNeighbors(n_neighbors=k_cur + 1, algorithm="kd_tree", n_jobs=-1)
+            nbrs = NearestNeighbors(
+                n_neighbors=k_cur + 1,
+                algorithm="kd_tree",
+                n_jobs=_sklearn_knn_jobs(),
+            )
             distances, _ = nbrs.fit(pts_np).kneighbors(return_distance=True)
             d2 = np.square(distances[:, 1:], dtype=np.float64)
             h2 = max(float(d2.mean()), np.finfo(np.float64).tiny)

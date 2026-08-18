@@ -82,6 +82,14 @@ def parse_args() -> argparse.Namespace:
         help="Root containing run_<id>/drivaer_<id>.vtp files.",
     )
     parser.add_argument(
+        "--input-glob",
+        default="run_*/drivaer_*.vtp",
+        help=(
+            "Pattern below --input-dir used to discover input VTPs. The default preserves "
+            "the DrivAerML layout; for toy surfaces use 'case_*/toy_case_*_surface.vtp'."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("/mnt/ssdraid/parsa/drivaerml_surface_vtp_decimated"),
@@ -215,7 +223,7 @@ def require_vtk():
     return vtk, vtk_to_numpy
 
 
-def discover_inputs(input_dir: Path, runs: str | None, limit: int | None) -> list[Path]:
+def discover_inputs(input_dir: Path, runs: str | None, limit: int | None, input_glob: str) -> list[Path]:
     if runs:
         run_ids = []
         for item in runs.split(","):
@@ -225,14 +233,14 @@ def discover_inputs(input_dir: Path, runs: str | None, limit: int | None) -> lis
         paths = [input_dir / f"run_{run_id}" / f"drivaer_{run_id}.vtp" for run_id in sorted(set(run_ids))]
     else:
         paths = []
-        for path in sorted(input_dir.glob("run_*/drivaer_*.vtp")):
-            if RUN_FILE_RE.fullmatch(path.name):
+        for path in sorted(input_dir.glob(str(input_glob))):
+            if str(input_glob) != "run_*/drivaer_*.vtp" or RUN_FILE_RE.fullmatch(path.name):
                 paths.append(path)
     paths = [path for path in paths if path.is_file()]
     if limit is not None:
         paths = paths[: max(0, int(limit))]
     if not paths:
-        raise FileNotFoundError(f"No DrivAerML VTP inputs found under {input_dir}.")
+        raise FileNotFoundError(f"No VTP inputs matching {input_glob!r} found under {input_dir}.")
     return paths
 
 
@@ -277,6 +285,57 @@ def geometry_only(vtk, polydata):
     output.SetPolys(polydata.GetPolys())
     output.BuildCells()
     return output
+
+
+def remove_invalid_triangles(vtk, vtk_to_numpy, polydata):
+    """Drop zero-area cells and unused invalid vertices from a triangle mesh.
+
+    Some ACVD releases occasionally leave coincident-vertex triangles after
+    clustering highly graded meshes.  These cells have zero measure and carry
+    no surface geometry.  Removing only those cells is safer than accepting an
+    invalid VTP or applying a broad smoothing/cleaning pass.
+    """
+    from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
+
+    polydata = triangulate_if_needed(vtk, polydata)
+    points = np.asarray(vtk_to_numpy(polydata.GetPoints().GetData()), dtype=np.float64)
+    raw_cells = np.asarray(vtk_to_numpy(polydata.GetPolys().GetData()), dtype=np.int64)
+    if raw_cells.size == 0 or raw_cells.size % 4 != 0 or not np.all(raw_cells[::4] == 3):
+        raise RuntimeError("Cannot repair a non-triangle mesh.")
+    faces = raw_cells.reshape(-1, 4)[:, 1:]
+    valid_indices = np.logical_and(faces >= 0, faces < points.shape[0]).all(axis=1)
+    finite_faces = np.zeros(faces.shape[0], dtype=bool)
+    finite_faces[valid_indices] = np.isfinite(points[faces[valid_indices]]).all(axis=(1, 2))
+    triangles = np.zeros((faces.shape[0], 3, 3), dtype=np.float64)
+    triangles[finite_faces] = points[faces[finite_faces]]
+    double_area = np.linalg.norm(
+        np.cross(triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]), axis=1
+    )
+    finite_points = points[np.isfinite(points).all(axis=1)]
+    span = float(np.linalg.norm(finite_points.max(axis=0) - finite_points.min(axis=0))) if finite_points.size else 1.0
+    area_tolerance = max(1.0e-16, (max(span, 1.0e-8) ** 2) * 1.0e-12)
+    keep = finite_faces & (double_area > 2.0 * area_tolerance)
+    if not np.any(keep):
+        raise RuntimeError("Degenerate-triangle repair would remove the complete surface.")
+    kept_faces = faces[keep]
+    used = np.unique(kept_faces.reshape(-1))
+    remap = np.full(points.shape[0], -1, dtype=np.int64)
+    remap[used] = np.arange(used.size, dtype=np.int64)
+    compact_faces = remap[kept_faces]
+    compact_points = points[used].astype(np.float32, copy=False)
+    output = vtk.vtkPolyData()
+    vtk_points = vtk.vtkPoints()
+    vtk_points.SetData(numpy_to_vtk(np.ascontiguousarray(compact_points), deep=True))
+    output.SetPoints(vtk_points)
+    cells = vtk.vtkCellArray()
+    offsets = np.arange(0, 3 * compact_faces.shape[0] + 1, 3, dtype=np.int64)
+    cells.SetData(
+        numpy_to_vtkIdTypeArray(offsets, deep=True),
+        numpy_to_vtkIdTypeArray(np.ascontiguousarray(compact_faces.reshape(-1)), deep=True),
+    )
+    output.SetPolys(cells)
+    output.BuildCells()
+    return output, int((~keep).sum())
 
 
 def surface_area(vtk, polydata) -> float:
@@ -758,6 +817,9 @@ def process_input(vtk, vtk_to_numpy, input_path: Path, args, factors, calibrated
             decimated = run_quadric_decimation(vtk, original, factor)
         decimate_seconds = time.perf_counter() - t0
 
+        repaired_triangles = 0
+        if getattr(args, "repair_degenerate_triangles", False):
+            decimated, repaired_triangles = remove_invalid_triangles(vtk, vtk_to_numpy, decimated)
         validation = {}
         if args.validate_output:
             validation = validate_mesh(vtk, vtk_to_numpy, decimated, args.validate_topology)
@@ -793,6 +855,7 @@ def process_input(vtk, vtk_to_numpy, input_path: Path, args, factors, calibrated
             "decimate_seconds": decimate_seconds,
             "write_seconds": write_seconds,
             "status": "ok",
+            "repaired_degenerate_triangles": repaired_triangles,
             "validation": validation,
         }
         records.append(record)
@@ -910,7 +973,7 @@ def main() -> int:
         20: parse_divisions(args.divisions_20),
         40: parse_divisions(args.divisions_40),
     }
-    inputs = discover_inputs(args.input_dir, args.runs, args.limit)
+    inputs = discover_inputs(args.input_dir, args.runs, args.limit, args.input_glob)
     vtk, _vtk_to_numpy = require_vtk()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 

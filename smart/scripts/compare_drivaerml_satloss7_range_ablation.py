@@ -120,6 +120,35 @@ GEOMETRY_SOURCE_LABELS = {
 _COMPUTE_PLOT_STD = True
 _PLOT_FONT_SCALE = 1.0
 _PLOT_BASE_FONT_SIZE = 15.0
+REFERENCE_MODEL = "SMART"
+REFERENCE_MODEL_LABEL = "SMART baseline"
+ABLATION_PREFIX = "range_ablation"
+ABLATION_TABLE_TITLE = "SMART SATLOSS range ablation"
+
+KDE_MODEL_ORDER = (
+    "SMART",
+    "SMART_SATLOSS7_KDE4",
+    "SMART_SATLOSS7_KDE8",
+    "SMART_SATLOSS7_KDE16",
+    "SMART_SATLOSS7_KDE32",
+    "SMART_SATLOSS7_KDE64",
+)
+KDE_MODEL_LABELS = {
+    "SMART": "SMART baseline",
+    "SMART_SATLOSS7_KDE4": "SATLOSS KDE k=4",
+    "SMART_SATLOSS7_KDE8": "SATLOSS KDE k=8",
+    "SMART_SATLOSS7_KDE16": "SATLOSS KDE k=16 (reference)",
+    "SMART_SATLOSS7_KDE32": "SATLOSS KDE k=32",
+    "SMART_SATLOSS7_KDE64": "SATLOSS KDE k=64",
+}
+KDE_MODEL_COLORS = {
+    "SMART": "#4C78A8",
+    "SMART_SATLOSS7_KDE4": "#F2CF5B",
+    "SMART_SATLOSS7_KDE8": "#F28E2B",
+    "SMART_SATLOSS7_KDE16": "#7A5195",
+    "SMART_SATLOSS7_KDE32": "#59A14F",
+    "SMART_SATLOSS7_KDE64": "#E15759",
+}
 
 
 def configure_plot_style(font_scale: float) -> None:
@@ -187,6 +216,12 @@ def apply_experiment_preset(args: argparse.Namespace) -> None:
         set_default("--active-geometry-sources", "active_geometry_sources", "angle,isotropic,voxel")
         set_default("--geometry-decimation-factors", "geometry_decimation_factors", "5,10")
         set_default("--num-runs", "num_runs", 25)
+    elif preset == "kde_ablation_vtp":
+        set_default("--shift-levels", "shift_levels", "0,0.25,0.5,0.75,1.0")
+        set_default("--active-shifts", "active_shifts", "beta,sine_y,sine_x")
+        set_default("--active-geometry-sources", "active_geometry_sources", "angle,isotropic,voxel")
+        set_default("--geometry-decimation-factors", "geometry_decimation_factors", "5,10")
+        set_default("--num-runs", "num_runs", 25)
     else:  # pragma: no cover - argparse choices make this unreachable.
         raise ValueError(f"Unknown experiment preset: {preset}")
 
@@ -203,7 +238,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", default="/mnt/ssdraid/parsa/drivaerml_preprocessed")
     parser.add_argument(
         "--experiment-preset",
-        choices=("range_ablation_vtp", "range_ablation_shift_only", "range_ablation_vtp_only", "legacy_25runs"),
+        choices=(
+            "range_ablation_vtp",
+            "range_ablation_shift_only",
+            "range_ablation_vtp_only",
+            "legacy_25runs",
+            "kde_ablation_vtp",
+        ),
         default="range_ablation_vtp",
         help="Named protocol preset; use explicit flags after choosing a preset to adapt the scope.",
     )
@@ -267,14 +308,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--range200-config", default="drivaerml_satloss7_range200")
     parser.add_argument("--range300-config", default="drivaerml_satloss7_range300")
     parser.add_argument("--range500-config", default="drivaerml_satloss7_range500")
-    parser.add_argument("--smart-checkpoint", required=True)
-    parser.add_argument("--range025-checkpoint", required=True)
-    parser.add_argument("--range050-checkpoint", required=True)
-    parser.add_argument("--range075-checkpoint", required=True)
-    parser.add_argument("--satloss7-checkpoint", required=True)
-    parser.add_argument("--range200-checkpoint", required=True)
-    parser.add_argument("--range300-checkpoint", required=True)
+    parser.add_argument("--kde4-config", default="drivaerml_satloss7_range100_kde4_from_smart")
+    parser.add_argument("--kde8-config", default="drivaerml_satloss7_range100_kde8_from_smart")
+    parser.add_argument("--kde16-config", default="drivaerml_satloss7_range100")
+    parser.add_argument("--kde32-config", default="drivaerml_satloss7_range100_kde32_from_smart")
+    parser.add_argument("--kde64-config", default="drivaerml_satloss7_range100_kde64_from_smart")
+    parser.add_argument("--smart-checkpoint", default=None)
+    parser.add_argument("--range025-checkpoint", default=None)
+    parser.add_argument("--range050-checkpoint", default=None)
+    parser.add_argument("--range075-checkpoint", default=None)
+    parser.add_argument("--satloss7-checkpoint", default=None)
+    parser.add_argument("--range200-checkpoint", default=None)
+    parser.add_argument("--range300-checkpoint", default=None)
     parser.add_argument("--range500-checkpoint", default=None)
+    parser.add_argument("--kde4-checkpoint", default=None)
+    parser.add_argument("--kde8-checkpoint", default=None)
+    parser.add_argument("--kde16-checkpoint", default=None)
+    parser.add_argument("--kde32-checkpoint", default=None)
+    parser.add_argument("--kde64-checkpoint", default=None)
     parser.add_argument(
         "--exclude-range500",
         action="store_true",
@@ -420,6 +471,23 @@ def rank_top_range_ablation_runs(
 
 
 def checkpoint_map(args: argparse.Namespace) -> OrderedDict[str, str]:
+    if args.experiment_preset == "kde_ablation_vtp":
+        checkpoints = OrderedDict(
+            [
+                ("SMART", args.smart_checkpoint),
+                ("SMART_SATLOSS7_KDE4", args.kde4_checkpoint),
+                ("SMART_SATLOSS7_KDE8", args.kde8_checkpoint),
+                ("SMART_SATLOSS7_KDE16", args.kde16_checkpoint),
+                ("SMART_SATLOSS7_KDE32", args.kde32_checkpoint),
+                ("SMART_SATLOSS7_KDE64", args.kde64_checkpoint),
+            ]
+        )
+        missing = [name for name, path in checkpoints.items() if not path]
+        if missing:
+            raise ValueError(
+                "KDE ablation requires checkpoints for: " + ", ".join(missing)
+            )
+        return checkpoints
     checkpoints = OrderedDict(
         [
             ("SMART", args.smart_checkpoint),
@@ -435,10 +503,24 @@ def checkpoint_map(args: argparse.Namespace) -> OrderedDict[str, str]:
         if not args.range500_checkpoint:
             raise ValueError("--range500-checkpoint is required unless --exclude-range500 is set.")
         checkpoints["SMART_SATLOSS7_RANGE500"] = args.range500_checkpoint
+    missing = [name for name, path in checkpoints.items() if not path]
+    if missing:
+        raise ValueError("Missing required checkpoint arguments for: " + ", ".join(missing))
     return checkpoints
 
 
 def config_map(args: argparse.Namespace) -> OrderedDict[str, str]:
+    if args.experiment_preset == "kde_ablation_vtp":
+        return OrderedDict(
+            [
+                ("SMART", args.smart_config),
+                ("SMART_SATLOSS7_KDE4", args.kde4_config),
+                ("SMART_SATLOSS7_KDE8", args.kde8_config),
+                ("SMART_SATLOSS7_KDE16", args.kde16_config),
+                ("SMART_SATLOSS7_KDE32", args.kde32_config),
+                ("SMART_SATLOSS7_KDE64", args.kde64_config),
+            ]
+        )
     configs = OrderedDict(
         [
             ("SMART", args.smart_config),
@@ -755,7 +837,7 @@ def paired_percentage_rows(rows: Sequence[Mapping[str, object]], metric_keys: Se
         if severity <= 0.0:
             continue
         baseline = lookup.get(
-            ("SMART", int(row["run_id"]), int(row["view_id"]), str(row["shift_name"]), severity)
+            (REFERENCE_MODEL, int(row["run_id"]), int(row["view_id"]), str(row["shift_name"]), severity)
         )
         if baseline is None:
             continue
@@ -764,7 +846,7 @@ def paired_percentage_rows(rows: Sequence[Mapping[str, object]], metric_keys: Se
             "view_id": int(row["view_id"]),
             "model_name": str(row["model_name"]),
             "model_label": MODEL_LABELS[str(row["model_name"])],
-            "percentage_reference_model": "SMART",
+            "percentage_reference_model": REFERENCE_MODEL,
             "shift_name": str(row["shift_name"]),
             "severity": severity,
         }
@@ -807,7 +889,7 @@ def aggregate_percentage_rows(
         for metric in metric_keys:
             values = np.asarray([float(row[f"{metric}_pct_worsening"]) for row in group], dtype=np.float64)
             current = absolute_lookup.get((model_name, shift_name, severity))
-            reference = absolute_lookup.get(("SMART", shift_name, severity))
+            reference = absolute_lookup.get((REFERENCE_MODEL, shift_name, severity))
             if current is not None and reference is not None:
                 current_mean = float(current[f"{metric}_mean"])
                 reference_mean = float(reference[f"{metric}_mean"])
@@ -882,20 +964,20 @@ def write_wide_metric_tables(
         absolute_rows.append(absolute_row)
         percentage_rows.append(percentage_row)
 
-    absolute_csv = output_dir / f"range_ablation_{slug}_absolute_table.csv"
-    percentage_csv = output_dir / f"range_ablation_{slug}_percentage_worsening_table.csv"
+    absolute_csv = output_dir / f"{ABLATION_PREFIX}_{slug}_absolute_table.csv"
+    percentage_csv = output_dir / f"{ABLATION_PREFIX}_{slug}_percentage_worsening_table.csv"
     write_csv(absolute_csv, absolute_rows)
     write_csv(percentage_csv, percentage_rows)
 
     def write_markdown(path: Path, rows: Sequence[Mapping[str, object]], percentage: bool) -> None:
         headers = ["Model"] + [column for _, column, _ in conditions]
         lines = [
-                    f"# SMART SATLOSS range ablation: `{metric}`",
+                    f"# {ABLATION_TABLE_TITLE}: `{metric}`",
             "",
             (
-                "Values are means across paired runs and views. Percentage values are relative to SMART under the same shift and severity."
+                f"Values are means across paired runs and views. Percentage values are relative to {REFERENCE_MODEL_LABEL} under the same shift and severity."
                 if not include_std
-                else "Values are mean +/- standard deviation across paired runs and views. Percentage values are relative to SMART under the same shift and severity."
+                else f"Values are mean +/- standard deviation across paired runs and views. Percentage values are relative to {REFERENCE_MODEL_LABEL} under the same shift and severity."
             ),
             "",
             "| " + " | ".join(headers) + " |",
@@ -921,8 +1003,8 @@ def write_wide_metric_tables(
             lines.append("| " + " | ".join(values) + " |")
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-    absolute_md = output_dir / f"range_ablation_{slug}_absolute_table.md"
-    percentage_md = output_dir / f"range_ablation_{slug}_percentage_worsening_table.md"
+    absolute_md = output_dir / f"{ABLATION_PREFIX}_{slug}_absolute_table.md"
+    percentage_md = output_dir / f"{ABLATION_PREFIX}_{slug}_percentage_worsening_table.md"
     write_markdown(absolute_md, absolute_rows, percentage=False)
     write_markdown(percentage_md, percentage_rows, percentage=True)
     return {
@@ -966,7 +1048,7 @@ def plot_endpoint_bars(
     smart_endpoint_matches = [
         row
         for row in baseline_aggregate
-        if row["model_name"] == "SMART"
+        if row["model_name"] == REFERENCE_MODEL
         and row["shift_name"] == shift
         and abs(float(row["severity"]) - endpoint) < 1.0e-8
     ]
@@ -1022,7 +1104,7 @@ def plot_endpoint_bars(
     )
     if percentage:
         ax.axhline(0.0, color="#303030", linestyle="--", linewidth=1.1)
-        ylabel = "Relative difference from SMART baseline (%)"
+        ylabel = f"Relative difference from {REFERENCE_MODEL_LABEL} (%)"
     else:
         ylabel = f"Relative L2 error ({'log' if log_scale else 'linear'} scale)"
     ax.set_ylabel(ylabel, fontsize=font_size)
@@ -1079,12 +1161,12 @@ def plot_endpoint_bars(
         if not math.isfinite(value):
             continue
         if percentage:
-            if index == 0:
+            if MODEL_ORDER[index] == REFERENCE_MODEL:
                 continue
             label = f"{value:+.1f}%"
             y = value + (percentage_label_offset if value >= 0.0 else -percentage_label_offset)
         else:
-            if index == 0:
+            if MODEL_ORDER[index] == REFERENCE_MODEL:
                 continue
             percentage_matches = [
                 reference_row
@@ -1217,7 +1299,7 @@ def plot_combined_geometry_source_bars(
                 alpha=alpha,
                 error_kw={"elinewidth": 1.0, "capthick": 1.0},
             )[0]
-            if model_name != "SMART":
+            if model_name != REFERENCE_MODEL:
                 if percentage:
                     relative = value
                 else:
@@ -1253,7 +1335,7 @@ def plot_combined_geometry_source_bars(
 
     if percentage:
         ax.axhline(0.0, color="#303030", linestyle="--", linewidth=1.1)
-        ylabel = "Relative difference from SMART baseline (%)"
+        ylabel = f"Relative difference from {REFERENCE_MODEL_LABEL} (%)"
     else:
         ylabel = f"Combined-global relative L2 ({'log' if log_scale else 'linear'} scale)"
         if log_scale:
@@ -1358,9 +1440,33 @@ def average_remeshing_rows(
 
 
 def main() -> None:
-    global _COMPUTE_PLOT_STD, MODEL_ORDER
+    global _COMPUTE_PLOT_STD, MODEL_ORDER, MODEL_LABELS, MODEL_COLORS
+    global REFERENCE_MODEL, REFERENCE_MODEL_LABEL, ABLATION_PREFIX, ABLATION_TABLE_TITLE
     args = parse_args()
     apply_experiment_preset(args)
+    if args.experiment_preset == "kde_ablation_vtp":
+        MODEL_ORDER = KDE_MODEL_ORDER
+        MODEL_LABELS = dict(KDE_MODEL_LABELS)
+        MODEL_COLORS = dict(KDE_MODEL_COLORS)
+        REFERENCE_MODEL = "SMART"
+        REFERENCE_MODEL_LABEL = "SMART baseline"
+        ABLATION_PREFIX = "kde_ablation"
+        ABLATION_TABLE_TITLE = "SATLOSS KDE-neighborhood ablation"
+    else:
+        MODEL_ORDER = (
+            "SMART",
+            "SMART_SATLOSS7_RANGE025",
+            "SMART_SATLOSS7_RANGE050",
+            "SMART_SATLOSS7_RANGE075",
+            "SMART_SATLOSS7",
+            "SMART_SATLOSS7_RANGE200",
+            "SMART_SATLOSS7_RANGE300",
+            "SMART_SATLOSS7_RANGE500",
+        )
+        REFERENCE_MODEL = "SMART"
+        REFERENCE_MODEL_LABEL = "SMART baseline"
+        ABLATION_PREFIX = "range_ablation"
+        ABLATION_TABLE_TITLE = "SMART SATLOSS range ablation"
     if args.exclude_range500:
         MODEL_ORDER = tuple(name for name in MODEL_ORDER if name != "SMART_SATLOSS7_RANGE500")
     configure_plot_style(args.font_scale)
@@ -1430,14 +1536,14 @@ def main() -> None:
         print(f"[dry-run] modes: {', '.join(str(mode['name']) for mode in modes)}")
         return
 
-    smart_config = configs["SMART"]
+    reference_config = configs[REFERENCE_MODEL]
     dataset = AhmedMLDatasetV2(
         saved_folder=str(args.data_root),
         if_test=True,
         geometry_points=input_budget,
         surface_points=int(args.surface_query_points),
         volume_points=int(args.volume_query_points),
-        scale_positions=bool(smart_config.scale_positions),
+        scale_positions=bool(reference_config.scale_positions),
         require_preprocessed=True,
         geometry_density_estimator=str(args.density_estimator),
         geometry_density_knn_k=int(args.density_knn_k),
@@ -1657,7 +1763,7 @@ def main() -> None:
             if not method_modes:
                 continue
             for log_scale, scale_slug in ((True, "log"), (False, "linear")):
-                output_path = output_dir / f"range_ablation_combined_global_endpoint_bars_{method}_{scale_slug}.png"
+                output_path = output_dir / f"{ABLATION_PREFIX}_combined_global_endpoint_bars_{method}_{scale_slug}.png"
                 plot_combined_geometry_source_bars(
                     aggregate,
                     percentage_aggregate,
@@ -1670,13 +1776,14 @@ def main() -> None:
                     y_pad_fraction=args.y_pad_fraction,
                 )
                 combined_geometry_plot_paths[f"{method}_{scale_slug}"] = str(output_path)
-            output_path = output_dir / f"range_ablation_combined_global_relative_vs_smart_{method}.png"
+            relative_reference_slug = "smart" if REFERENCE_MODEL == "SMART" else "reference"
+            output_path = output_dir / f"{ABLATION_PREFIX}_combined_global_relative_vs_{relative_reference_slug}_{method}.png"
             plot_combined_geometry_source_bars(
                 aggregate,
                 percentage_aggregate,
                 method_modes,
                 output_path,
-                f"Combined global relative difference from SMART ({method.title()} remeshing)",
+                f"Combined global relative difference from {REFERENCE_MODEL_LABEL} ({method.title()} remeshing)",
                 log_scale=False,
                 percentage=True,
                 show_std=False,
@@ -1707,7 +1814,7 @@ def main() -> None:
                 percentage=True,
             )
             average_source_modes = [f"geometry_average_div{factor}" for factor in average_factors]
-            output_path = output_dir / "range_ablation_combined_global_endpoint_bars_remeshing_average_linear.png"
+            output_path = output_dir / f"{ABLATION_PREFIX}_combined_global_endpoint_bars_remeshing_average_linear.png"
             plot_combined_geometry_source_bars(
                 average_absolute,
                 average_percentage,
@@ -1770,9 +1877,9 @@ def main() -> None:
         "combined_geometry_plot_paths": combined_geometry_plot_paths,
         "reported_metric": "combined_global_rel_l2",
         "plot_style": "grouped endpoint bars only; no line plots",
-        "percentage_reference": "SMART baseline at the same shift and severity; SMART bars are 0 percent",
+        "percentage_reference": f"{REFERENCE_MODEL_LABEL} at the same shift and severity; reference bars are 0 percent",
         "percentage_aggregation": "percentage of aggregate mean errors; standard deviation is computed from paired per-view percentages",
-        "protocol": "SMART baseline and SATLOSS upper-range ablation; identical paired views and queries across models. VTP modes use their remeshed coordinates directly and are never beta/sine reweighted.",
+        "protocol": f"{ABLATION_TABLE_TITLE}; identical paired views and queries across models. VTP modes use their remeshed coordinates directly and are never beta/sine reweighted.",
     }
     with (output_dir / "comparison_metadata.json").open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)

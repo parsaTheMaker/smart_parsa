@@ -6,6 +6,9 @@ from data.shiftwing_dataset import ShiftWingDataset
 from data.shift_submarine_dataset import ShiftSubmarineDataset
 from data.pump_dataset import PumpDataset
 from data.naca4_dataset import NACA4Dataset
+from data.toy_satloss_dataset import ToySATLossDataset
+from data.toy_perforated_fin_dataset import ToyPerforatedFinDataset
+from data.toy_heat_exchange_dataset import ToyHeatExchangeDataset
 
 
 # Mapping of dataset names to their corresponding classes and properties
@@ -17,7 +20,10 @@ datasets = {"ShapeNetCar": {"dataset": ShapeNetCarDataset, "spatial_dim": 3, "su
             "ShiftWing": {"dataset": ShiftWingDataset, "spatial_dim": 3, "surf_channels": 1, "vol_channels": 3, "params_dim": 2, "fields": {"surface": ["pressure"], "volume": ["velocity_x", "velocity_y", "velocity_z"]}},
             "ShiftSubmarine": {"dataset": ShiftSubmarineDataset, "spatial_dim": 3, "surf_channels": 4, "vol_channels": 4, "params_dim": 0, "fields": {"surface": ["pressure", "wall_shear_x", "wall_shear_y", "wall_shear_z"], "volume": ["pressure", "velocity_x", "velocity_y", "velocity_z"]}},
             "Pump": {"dataset": PumpDataset, "spatial_dim": 3, "surf_channels": 7, "vol_channels": 4, "params_dim": 13, "fields": {"surface": ["pressure", "velocity_x", "velocity_y", "velocity_z", "wall_shear_x", "wall_shear_y", "wall_shear_z"], "volume": ["pressure", "velocity_x", "velocity_y", "velocity_z"]}},
-            "NACA4": {"dataset": NACA4Dataset, "spatial_dim": 2, "surf_channels": 3, "vol_channels": 4, "params_dim": 0, "fields": {"surface": ["pressure", "normal_x", "normal_y"], "volume": ["pressure", "sdf", "velocity_x", "velocity_y"]}}
+            "NACA4": {"dataset": NACA4Dataset, "spatial_dim": 2, "surf_channels": 3, "vol_channels": 4, "params_dim": 0, "fields": {"surface": ["pressure", "normal_x", "normal_y"], "volume": ["pressure", "sdf", "velocity_x", "velocity_y"]}},
+            "ToySATLoss": {"dataset": ToySATLossDataset, "spatial_dim": 3, "surf_channels": 1, "vol_channels": 1, "params_dim": 0, "fields": {"surface": ["manufactured_surface"], "volume": ["manufactured_volume"]}},
+            "ToyPerforatedFin": {"dataset": ToyPerforatedFinDataset, "spatial_dim": 3, "surf_channels": 1, "vol_channels": 1, "params_dim": 0, "fields": {"surface": ["outward_heat_flux"], "volume": ["temperature"]}},
+            "ToyHeatExchange": {"dataset": ToyHeatExchangeDataset, "spatial_dim": 3, "surf_channels": 1, "vol_channels": 1, "params_dim": 0, "fields": {"surface": ["outward_heat_flux"], "volume": ["temperature"]}},
            }
 
 
@@ -133,6 +139,30 @@ def get_dataset(config):
                     config, "geometry_density_cache_dtype", "float16"
                 )
             dataset_kwargs["split_seed"] = int(getattr(config, "random_seed", 42))
+        if dataset in {"ToySATLoss", "ToyPerforatedFin", "ToyHeatExchange"}:
+            model_name = str(getattr(config, "model_name", ""))
+            dataset_kwargs["coordinate_normalization"] = getattr(
+                config, "coordinate_normalization", "global_train_bounds"
+            )
+            dataset_kwargs["geometry_epoch_seeded_sampling"] = bool(
+                getattr(config, "geometry_epoch_seeded_sampling", False)
+            )
+            dataset_kwargs["split_seed"] = int(getattr(config, "random_seed", 42))
+            if _uses_geometry_density(model_name):
+                arch = getattr(config, "architecture", {})
+                dataset_kwargs["return_geometry_density"] = True
+                dataset_kwargs["geometry_density_knn_k"] = int(
+                    getattr(config, "density_knn_k", getattr(arch, "density_knn_k", 16))
+                )
+                dataset_kwargs["geometry_density_neighbor_hops"] = int(
+                    getattr(config, "density_neighbor_hops", getattr(arch, "density_neighbor_hops", 1))
+                )
+                dataset_kwargs["geometry_density_estimator"] = getattr(
+                    config, "density_estimator", getattr(arch, "density_estimator", "kde")
+                )
+                dataset_kwargs["geometry_density_cache_dtype"] = getattr(
+                    config, "geometry_density_cache_dtype", "float16"
+                )
         if dataset == "NACA4":
             dataset_kwargs["manifest_variant"] = getattr(config, "manifest_variant", "full")
         train_data = datasets[dataset]["dataset"](data_path,

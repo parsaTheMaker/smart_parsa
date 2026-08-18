@@ -1,0 +1,57 @@
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+
+wandb:
+  project: "smart_toy_perforated_fin"
+  entity: "parsa-vatani99-technical-university-of-munich"
+
+experiment:
+  name: "TOY_PERFORATED_FIN_SMART_BASE"
+  model_name: "SMART_TOY_FIN"
+  model_tag: ""
+  random_seed: 42
+  dataset: "ToyPerforatedFin"
+  data_path: "/mnt/ssdraid/parsa/toy_perforated_fin_nonlinear_fem_v2"
+  coordinate_normalization: "global_train_bounds"
+  geometry_epoch_seeded_sampling: True
+  # DrivAerML-aligned SMART hierarchy: 131K encoder input -> 16K internal
+  # subsample -> 4K latent anchors, with 64K surface and volume supervision.
+  num_body_points: 131072
+  num_surface_points: 65536
+  num_volume_points: 65536
+  scale_positions: False
+  architecture:
+    latent_dim: 256
+    latent_geometry_points: 4096
+    subsampled_geometry_points: 16384
+    subsampled_geometry_with_replacement: True
+    num_encoder_decoder_blocks: 6
+    pos_scale_factor: 100
+  optimizer: "adamw"
+  loss_fn: "rel_l2"
+  scheduler: "cosine"
+  scheduler_warmup_fraction: 0.2
+  batch_size: 1
+  epochs: 300
+  learning_rate: 2.e-4
+  gradient_norm: null
+  amp: True
+  precision: "float16"
+  log_every_n_steps: 10
+  track_gradient_diagnostics: False
+  wandb_watch_model: False
+  multi_gpu_strategy: "single"
+  resume_ckpt: ""
+  resume_full_state: False
+  init_ckpt: ""
+  num_workers: 8
+  prefetch_factor: 4
+  pin_memory: True
+  cuda_batch_prefetch: True

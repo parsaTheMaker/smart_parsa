@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate the analytic toy benchmark under matched point-density shifts.
+"""Evaluate the nonlinear toy heat-exchange benchmark under matched shifts.
 
 This script evaluates identical unbiased query clouds for SMART Base and
 SMART SATLOSS.  Only the encoder input distribution changes.  It writes tidy
@@ -23,8 +23,7 @@ import torch
 from omegaconf import OmegaConf
 from tqdm import tqdm
 
-from data.toy_satloss_dataset import ToySATLossDataset
-from data.toy_perforated_fin_dataset import ToyPerforatedFinDataset
+from data.toy_heat_exchange_dataset import ToyHeatExchangeDataset
 from models.smart.smart import SMART
 from train_consistency_common import sample_geometry_view
 
@@ -54,12 +53,10 @@ def device_for(index: int, devices: list[str]) -> torch.device:
 
 def build_model(config_path: Path, checkpoint_path: Path, device: torch.device) -> SMART:
     cfg = OmegaConf.load(config_path)
-    # SATLOSS config files inherit the base toy configuration through Hydra.
+    # The SATLOSS config inherits the base configuration through Hydra.
     # Reconstruct that small composition here without starting a Hydra job.
     if "architecture" not in cfg.experiment:
-        base_path = config_path.with_name(
-            "toy_perforated_fin.yaml" if "perforated_fin" in config_path.name else "toy_satloss.yaml"
-        )
+        base_path = config_path.with_name("toy_heat_exchange.yaml")
         cfg = OmegaConf.merge(OmegaConf.load(base_path), cfg)
     exp = cfg.experiment
     arch = exp.architecture
@@ -140,10 +137,8 @@ def sample_remeshed_encoder_points(path: Path, budget: int, seed: int, mode: str
     return np.ascontiguousarray(np.einsum("ni,nij->nj", weights, vertices), dtype=np.float32)
 
 
-def vtp_stem(case_id: int, benchmark: str) -> str:
-    if benchmark == "perforated_fin":
-        return f"perforated_fin_case_{case_id:05d}_surface"
-    return f"toy_case_{case_id:05d}_surface"
+def vtp_stem(case_id: int) -> str:
+    return f"heat_exchange_case_{case_id:05d}_surface"
 
 
 def vtp_source_paths(case_id: int, args: argparse.Namespace) -> dict[str, Path]:
@@ -157,14 +152,14 @@ def vtp_source_paths(case_id: int, args: argparse.Namespace) -> dict[str, Path]:
         if method not in root_map:
             raise ValueError(f"Unknown geometry source {method!r}; expected angle,isotropic,voxel.")
         for factor in parse_csv(args.geometry_decimation_factors, int):
-            name = f"{vtp_stem(case_id, args.benchmark)}_faces_div{factor}.vtp"
+            name = f"{vtp_stem(case_id)}_faces_div{factor}.vtp"
             path = root_map[method].expanduser().resolve() / f"case_{case_id:05d}" / name
             if path.is_file():
                 sources[f"{method}_div{factor}"] = path
     return sources
 
 
-def predict_errors(model: SMART, device: torch.device, geo: torch.Tensor, surf_q: torch.Tensor, surf_y: torch.Tensor, vol_q: torch.Tensor, vol_y: torch.Tensor, dataset: ToySATLossDataset) -> tuple[float, float, float]:
+def predict_errors(model: SMART, device: torch.device, geo: torch.Tensor, surf_q: torch.Tensor, surf_y: torch.Tensor, vol_q: torch.Tensor, vol_y: torch.Tensor, dataset: ToyHeatExchangeDataset) -> tuple[float, float, float]:
     with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=device.type == "cuda", dtype=torch.float16):
         pred_s, pred_v = model.inference(geo.unsqueeze(0).to(device), surf_q.unsqueeze(0).to(device), vol_q.unsqueeze(0).to(device), None)
     pred_s = pred_s[0].float().cpu() * dataset.std_surf_data + dataset.mean_surf_data
@@ -175,7 +170,7 @@ def predict_errors(model: SMART, device: torch.device, geo: torch.Tensor, surf_q
     return surf_error, vol_error, 0.5 * (surf_error + vol_error)
 
 
-def predict_surface_field(model: SMART, device: torch.device, geo: torch.Tensor, surf_q: torch.Tensor, vol_q: torch.Tensor, dataset: ToySATLossDataset) -> np.ndarray:
+def predict_surface_field(model: SMART, device: torch.device, geo: torch.Tensor, surf_q: torch.Tensor, vol_q: torch.Tensor, dataset: ToyHeatExchangeDataset) -> np.ndarray:
     with torch.inference_mode(), torch.autocast(device_type=device.type, enabled=device.type == "cuda", dtype=torch.float16):
         pred_s, _ = model.inference(geo.unsqueeze(0).to(device), surf_q.unsqueeze(0).to(device), vol_q.unsqueeze(0).to(device), None)
     return np.asarray((pred_s[0].float().cpu() * dataset.std_surf_data + dataset.mean_surf_data).numpy(), dtype=np.float32)
@@ -208,7 +203,7 @@ def write_point_vtp(path: Path, points: np.ndarray, arrays: dict[str, np.ndarray
         raise RuntimeError(f"Failed to write analysis VTP: {path}")
 
 
-def export_analysis_vtps(dataset: ToySATLossDataset, selected: list[int], models: dict[str, SMART], model_devices: dict[str, torch.device], args: argparse.Namespace, output_dir: Path) -> None:
+def export_analysis_vtps(dataset: ToyHeatExchangeDataset, selected: list[int], models: dict[str, SMART], model_devices: dict[str, torch.device], args: argparse.Namespace, output_dir: Path) -> None:
     if not args.save_analysis_vtps:
         return
     if args.analysis_case_ids:
@@ -228,7 +223,7 @@ def export_analysis_vtps(dataset: ToySATLossDataset, selected: list[int], models
         case_id = int(dataset.data[case_index])
         case_dir = analysis_root / f"case_{case_id:05d}"
         case_dir.mkdir(parents=True, exist_ok=True)
-        original_path = original_root / f"case_{case_id:05d}" / f"{vtp_stem(case_id, args.benchmark)}.vtp"
+        original_path = original_root / f"case_{case_id:05d}" / f"{vtp_stem(case_id)}.vtp"
         if not original_path.is_file():
             raise FileNotFoundError(f"Missing original triangular VTP for analysis export: {original_path}")
         shutil.copy2(original_path, case_dir / "original_surface_mesh.vtp")
@@ -280,7 +275,7 @@ def plot_curves(rows: list[dict], output_dir: Path, font_scale: float) -> None:
             ax.plot(levels, means, marker="o", linewidth=2.8, markersize=7, color=colors[model], label=model)
         ax.set_xlabel("Shift intensity", fontsize=12 * font_scale)
         ax.set_ylabel("Global relative L2 error", fontsize=12 * font_scale)
-        ax.set_title(f"Toy benchmark: {shift.replace('_', ' ')} sampling shift", fontsize=14 * font_scale, weight="bold")
+        ax.set_title(f"Toy heat-exchange benchmark: {shift.replace('_', ' ')} sampling shift", fontsize=14 * font_scale, weight="bold")
         ax.grid(alpha=0.25)
         ax.legend(fontsize=11 * font_scale)
         ax.tick_params(labelsize=10 * font_scale)
@@ -307,7 +302,7 @@ def plot_endpoint_bars(rows: list[dict], output_dir: Path, font_scale: float) ->
             ax.annotate(f"{improvement:+.1f}%", (bars_sat[index].get_x() + width / 2, sat_value), xytext=(0, 7), textcoords="offset points", ha="center", fontsize=10 * font_scale, weight="bold")
         ax.set_xticks(x, labels, fontsize=11 * font_scale)
         ax.set_ylabel("Global relative L2 error", fontsize=12 * font_scale)
-        ax.set_title("Toy benchmark point-cloud-shift robustness", fontsize=14 * font_scale, weight="bold")
+        ax.set_title("Toy heat-exchange benchmark point-cloud-shift robustness", fontsize=14 * font_scale, weight="bold")
         if logarithmic:
             ax.set_yscale("log")
         ax.legend(fontsize=11 * font_scale)
@@ -399,13 +394,13 @@ def render_endpoint_plots(rows: list[dict], output_dir: Path, levels: list[float
     endpoint = max(levels)
     for shift, label in (("beta", "Beta shift"), ("sine_x", "Sine-x shift"), ("sine_y", "Sine-y shift")):
         groups = [native_endpoint_group(rows, shift, endpoint, f"{label} {endpoint:g}")]
-        plot_paired_endpoint_bars(groups, f"Toy benchmark: {label} endpoint", f"{shift}_combined_global_rel_l2_endpoint_absolute", output_dir, font_scale)
+        plot_paired_endpoint_bars(groups, f"Toy heat-exchange benchmark: {label} endpoint", f"{shift}_combined_global_rel_l2_endpoint_absolute", output_dir, font_scale)
 
     for method in methods:
         method_groups = [(f"div{factor}", [f"{method}_div{factor}"]) for factor in factors]
         plot_paired_endpoint_bars(
             paired_groups(rows, method_groups),
-            f"Toy benchmark: {method.title()} remeshing",
+            f"Toy heat-exchange benchmark: {method.title()} remeshing",
             f"geometry_{method}_combined_global_rel_l2_endpoint_absolute",
             output_dir,
             font_scale,
@@ -413,7 +408,7 @@ def render_endpoint_plots(rows: list[dict], output_dir: Path, levels: list[float
     average_groups = [(f"Average div{factor}", [f"{method}_div{factor}" for method in methods]) for factor in factors]
     plot_paired_endpoint_bars(
         paired_groups(rows, average_groups),
-        "Toy benchmark: average remeshing",
+        "Toy heat-exchange benchmark: average remeshing",
         "remeshing_average_combined_global_rel_l2_endpoint_absolute",
         output_dir,
         font_scale,
@@ -425,7 +420,7 @@ def render_endpoint_plots(rows: list[dict], output_dir: Path, levels: list[float
     ]
     plot_paired_endpoint_bars(
         combined_groups,
-        "Toy benchmark: sampling and remeshing shifts",
+        "Toy heat-exchange benchmark: sampling and remeshing shifts",
         "combined_global_rel_l2_endpoint_absolute",
         output_dir,
         font_scale,
@@ -450,17 +445,16 @@ def plot_density(case: tuple, output_dir: Path, budget: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--benchmark", choices=("poisson", "perforated_fin"), default="poisson")
-    parser.add_argument("--data-root", default="/mnt/ssdraid/parsa/toy_satloss_poisson_benchmark_v2")
+    parser.add_argument("--data-root", default="/mnt/ssdraid/parsa/toy_heat_exchange_fem_v1")
     parser.add_argument("--base-checkpoint", default=None)
     parser.add_argument("--satloss-checkpoint", default=None)
-    parser.add_argument("--base-config", default="/home/parsa/smart_parsa/smart/config/toy_satloss.yaml")
-    parser.add_argument("--satloss-config", default="/home/parsa/smart_parsa/smart/config/toy_satloss7.yaml")
-    parser.add_argument("--output-dir", default="/home/parsa/smart_parsa/results/toy_satloss_sampling_invariance")
+    parser.add_argument("--base-config", default="/home/parsa/smart_parsa/smart/config/toy_heat_exchange.yaml")
+    parser.add_argument("--satloss-config", default="/home/parsa/smart_parsa/smart/config/toy_heat_exchange_satloss7.yaml")
+    parser.add_argument("--output-dir", default="/home/parsa/smart_parsa/results/toy_heat_exchange_sampling_invariance")
     parser.add_argument("--levels", default="0,0.25,0.5,0.75,1")
-    parser.add_argument("--input-points", type=int, default=16384)
-    parser.add_argument("--surface-query-points", type=int, default=16384)
-    parser.add_argument("--volume-query-points", type=int, default=16384)
+    parser.add_argument("--input-points", type=int, default=65536)
+    parser.add_argument("--surface-query-points", type=int, default=32768)
+    parser.add_argument("--volume-query-points", type=int, default=32768)
     parser.add_argument("--max-cases", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--devices", default="cuda:0,cuda:1")
@@ -468,10 +462,10 @@ def main() -> None:
     parser.add_argument("--plot-only-results-csv", type=Path, default=None, help="Regenerate endpoint plots from an existing CSV without inference.")
     parser.add_argument("--active-geometry-sources", default="angle,isotropic,voxel")
     parser.add_argument("--geometry-decimation-factors", default="5,10")
-    parser.add_argument("--angle-decimated-vtp-dir", default="/mnt/ssdraid/parsa/toy_satloss_surface_vtp_angle_decimated")
-    parser.add_argument("--isotropic-decimated-vtp-dir", default="/mnt/ssdraid/parsa/toy_satloss_surface_vtp_isotropic_remeshed")
-    parser.add_argument("--voxel-decimated-vtp-dir", default="/mnt/ssdraid/parsa/toy_satloss_surface_vtp_voxel_quadric_clustered")
-    parser.add_argument("--original-vtp-dir", default="/mnt/ssdraid/parsa/toy_satloss_surface_vtp")
+    parser.add_argument("--angle-decimated-vtp-dir", default="/mnt/ssdraid/parsa/toy_heat_exchange_surface_vtp_angle")
+    parser.add_argument("--isotropic-decimated-vtp-dir", default="/mnt/ssdraid/parsa/toy_heat_exchange_surface_vtp_isotropic")
+    parser.add_argument("--voxel-decimated-vtp-dir", default="/mnt/ssdraid/parsa/toy_heat_exchange_surface_vtp_voxel")
+    parser.add_argument("--original-vtp-dir", default="/mnt/ssdraid/parsa/toy_heat_exchange_surface_vtp")
     parser.add_argument("--remesh-input-sampling", choices=("vertices", "triangle_uniform"), default="vertices")
     parser.add_argument("--save-analysis-vtps", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--analysis-only", action="store_true", help="Export analysis_vtps without recomputing CSV metrics or plots.")
@@ -493,8 +487,7 @@ def main() -> None:
     if not args.base_checkpoint or not args.satloss_checkpoint:
         parser.error("--base-checkpoint and --satloss-checkpoint are required unless --plot-only-results-csv is used.")
     devices = [value.strip() for value in args.devices.split(",") if value.strip()]
-    dataset_class = ToyPerforatedFinDataset if args.benchmark == "perforated_fin" else ToySATLossDataset
-    dataset = dataset_class(args.data_root, if_test=True, geometry_points=0, surface_points=args.surface_query_points, volume_points=args.volume_query_points, return_geometry_density=True)
+    dataset = ToyHeatExchangeDataset(args.data_root, if_test=True, geometry_points=0, surface_points=args.surface_query_points, volume_points=args.volume_query_points, return_geometry_density=True)
     selected = list(range(len(dataset))) if args.max_cases <= 0 else list(range(min(args.max_cases, len(dataset))))
     if requested_methods:
         missing_vtps = []
@@ -555,7 +548,7 @@ def main() -> None:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader(); writer.writerows(rows)
     protocol = {
-        "benchmark": args.benchmark,
+        "benchmark": "toy_heat_exchange",
         "purpose": "Isolate encoder point-density sensitivity with fixed FEM/analytic ground truth and fixed evaluation quadrature.",
         "input_source": "Case-specific nonuniform virtual meshing density.",
         "queries": "Independent reference surface and volume clouds, shared exactly by all models and shifts.",

@@ -1,0 +1,9 @@
+defaults:
+  - toy_heat_exchange_mspt
+  - toy_heat_exchange_satloss7_protocol
+  - _self_
+
+experiment:
+  name: "TOY_HEAT_EXCHANGE_MSPT_SATLOSS"
+  model_name: "MSPT_TOY_HEAT_EXCHANGE_SATLOSS7"
+  batch_size: 2

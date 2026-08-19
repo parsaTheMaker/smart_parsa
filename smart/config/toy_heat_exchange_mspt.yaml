@@ -1,0 +1,25 @@
+defaults:
+  - toy_heat_exchange_common
+  - _self_
+
+experiment:
+  name: "TOY_HEAT_EXCHANGE_MSPT_BASE"
+  model_name: "MSPT_TOY_HEAT_EXCHANGE"
+  batch_size: 2
+  architecture:
+    # Match the DrivAerML MSPT comparison architecture.
+    num_blocks: 4
+    n_hidden: 192
+    num_heads: 4
+    dropout: 0.1
+    activation: "gelu"
+    mlp_ratio: 1
+    V: 128
+    Q: 1
+    attn_pool: "mean"
+    chunking_mode: "balltree"
+    use_rope: False
+    rope_base: 10000.0
+    use_flash_attn: False
+    use_checkpoint: True
+    use_token_type_embeddings: True

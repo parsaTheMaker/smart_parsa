@@ -1,0 +1,11 @@
+defaults:
+  - toy_heat_exchange_point_transformer_v3
+  - toy_heat_exchange_satloss7_protocol
+  - _self_
+
+experiment:
+  name: "TOY_HEAT_EXCHANGE_POINT_TRANSFORMER_V3_SATLOSS"
+  model_name: "POINT_TRANSFORMER_V3_TOY_HEAT_EXCHANGE_SATLOSS7"
+  # Two SATLOSS views are fused for one backward pass; keep the per-device
+  # batch at one to retain the full 65k geometry and 32k query budgets.
+  batch_size: 1

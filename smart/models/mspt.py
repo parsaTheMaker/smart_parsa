@@ -415,6 +415,7 @@ class MSPT(nn.Module):
         use_rope=False,
         rope_base=10000.0,
         use_flash_attn=False,
+        use_token_type_embeddings=False,
     ):
         super().__init__()
         if parameter_channels:
@@ -429,6 +430,7 @@ class MSPT(nn.Module):
         self.V = int(V)
         self.Q = int(Q)
         self.chunking_mode = str(chunking_mode).lower()
+        self.use_token_type_embeddings = bool(use_token_type_embeddings)
         if self.chunking_mode not in {"linear", "balltree"}:
             raise ValueError("MSPT chunking_mode must be 'linear' or 'balltree'.")
         self.subsampled_geometry_points = 0
@@ -462,7 +464,16 @@ class MSPT(nn.Module):
                 for index in range(int(num_blocks))
             ]
         )
+        # The original MSPT operates on one homogeneous point set. Our
+        # geometry-to-field adapter instead joins geometry support, surface
+        # queries, and volume queries. Segment embeddings preserve that role
+        # information through the spatial reordering required by MSPT.
+        self.token_type_embedding = (
+            nn.Embedding(3, int(n_hidden)) if self.use_token_type_embeddings else None
+        )
         self.initialize_weights()
+        if self.token_type_embedding is not None:
+            nn.init.normal_(self.token_type_embedding.weight, std=0.02)
         self.placeholder = nn.Parameter((1.0 / n_hidden) * torch.rand(n_hidden))
 
     def initialize_weights(self):
@@ -525,6 +536,29 @@ class MSPT(nn.Module):
         all_positions = torch.cat([geo, surf_query_pos, vol_query_pos], dim=1)
         chunked_positions, inverse, original_points = self._partition(all_positions)
         features = self.preprocess(chunked_positions)
+        if self.token_type_embedding is not None:
+            batch_size = int(geo.shape[0])
+            role_ids = torch.cat(
+                [
+                    torch.zeros((batch_size, geometry_count), device=geo.device, dtype=torch.long),
+                    torch.ones((batch_size, surface_count), device=geo.device, dtype=torch.long),
+                    torch.full(
+                        (batch_size, int(vol_query_pos.shape[1])),
+                        2,
+                        device=geo.device,
+                        dtype=torch.long,
+                    ),
+                ],
+                dim=1,
+            )
+            # ``inverse`` maps original-token indices to the spatially
+            # reordered MSPT sequence. Pad tokens, when present, stay geometry
+            # type zero and are discarded by ``_restore`` later.
+            if inverse.shape[1] > role_ids.shape[1]:
+                role_ids = F.pad(role_ids, (0, inverse.shape[1] - role_ids.shape[1]))
+            chunked_role_ids = torch.zeros_like(inverse)
+            chunked_role_ids.scatter_(1, inverse, role_ids)
+            features = features + self.token_type_embedding(chunked_role_ids).to(dtype=features.dtype)
         features = features + self.placeholder.view(1, 1, -1)
 
         supernodes = None

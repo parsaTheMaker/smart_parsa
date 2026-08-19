@@ -9,31 +9,26 @@ hydra:
     dir: .
 
 wandb:
-  project: "smart_toy_perforated_fin"
+  project: "smart_toy_heat_exchange"
   entity: "parsa-vatani99-technical-university-of-munich"
 
 experiment:
-  name: "TOY_PERFORATED_FIN_SMART_BASE"
-  model_name: "SMART_TOY_FIN"
+  name: "TOY_HEAT_EXCHANGE"
+  model_name: "TOY_HEAT_EXCHANGE"
   model_tag: ""
   random_seed: 42
-  dataset: "ToyPerforatedFin"
-  data_path: "/mnt/ssdraid/parsa/toy_perforated_fin_nonlinear_fem_v2"
+  dataset: "ToyHeatExchange"
+  data_path: "/mnt/ssdraid/parsa/toy_heat_exchange_fem_v1"
   coordinate_normalization: "global_train_bounds"
+  # Vanilla models receive a new uniform encoder cloud each epoch. SATLOSS7
+  # overrides this to draw its two density-shifted views from the full cloud.
   geometry_epoch_seeded_sampling: True
-  # DrivAerML-aligned SMART hierarchy: 131K encoder input -> 16K internal
-  # subsample -> 4K latent anchors, with 64K surface and volume supervision.
-  num_body_points: 131072
-  num_surface_points: 65536
-  num_volume_points: 65536
+  # DrivAerML-aligned fractions for the 524,288-point native geometry cloud:
+  # 1/8 encoder input and 1/16 for each surface/volume query set.
+  num_body_points: 65536
+  num_surface_points: 32768
+  num_volume_points: 32768
   scale_positions: False
-  architecture:
-    latent_dim: 256
-    latent_geometry_points: 4096
-    subsampled_geometry_points: 16384
-    subsampled_geometry_with_replacement: True
-    num_encoder_decoder_blocks: 6
-    pos_scale_factor: 100
   optimizer: "adamw"
   loss_fn: "rel_l2"
   scheduler: "cosine"

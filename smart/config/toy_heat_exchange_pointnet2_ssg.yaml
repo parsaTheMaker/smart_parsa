@@ -1,0 +1,25 @@
+defaults:
+  - toy_heat_exchange_common
+  - _self_
+
+experiment:
+  name: "TOY_HEAT_EXCHANGE_POINTNET2_SSG_BASE"
+  model_name: "POINTNET2_SSG_TOY_HEAT_EXCHANGE"
+  batch_size: 4
+  architecture:
+    latent_dim: 256
+    # Radii are in the heat-exchange global-[0, 1]^3 coordinates. On 65k
+    # encoder points they give roughly 60 and 250 median support points,
+    # respectively, before the official SSG neighbor caps are applied.
+    sa1_npoint: 2048
+    sa1_radius: 0.03
+    sa1_nsample: 64
+    sa2_npoint: 512
+    sa2_radius: 0.06
+    sa2_nsample: 128
+    query_neighbors: 3
+    centroid_sampling: "random"
+    density_histogram_bins: 8
+    pos_scale_factor: 1.0
+    query_chunk_size: 65536
+    dropout: 0.0

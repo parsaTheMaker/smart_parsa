@@ -1,21 +1,18 @@
-defaults:
-  - toy_satloss
-  - _self_
-
+# Shared SATLOSS7 protocol for every toy heat-exchange operator.  Each leaf
+# configuration supplies the model-specific architecture and model identity.
 experiment:
-  name: "TOY_SATLOSS_SMART_SATLOSS"
-  model_name: "SMART_TOY_SATLOSS7"
-  model_tag: ""
-  # A full retained cloud is the source for independently shifted views.
   geometry_epoch_seeded_sampling: False
+  # Keep the native 524,288-point surface cloud in the dataset, then draw two
+  # independent 65,536-point views. This is the same source-to-view fraction
+  # and two-view mechanism used by DrivAerML SATLOSS7.
   num_body_points: 0
-  view_geometry_points: 16384
-  primary_view_geometry_points: 16384
-  secondary_view_geometry_points: 16384
-  shared_shift_view_geometry_points: 16384
-  eval_view_geometry_points: 16384
-  eval_aligned_view_geometry_points: 16384
-  eval_shifted_view_geometry_points: 16384
+  view_geometry_points: 65536
+  primary_view_geometry_points: 65536
+  secondary_view_geometry_points: 65536
+  shared_shift_view_geometry_points: 65536
+  eval_view_geometry_points: 65536
+  eval_aligned_view_geometry_points: 65536
+  eval_shifted_view_geometry_points: 65536
   density_knn_k: 16
   density_neighbor_hops: 1
   density_estimator: "kde"
@@ -41,3 +38,8 @@ experiment:
   config_task_base_weights: [0.2, 0.2, 0.6]
   fixed_sum_use_view_losses: True
   use_learned_task_weighting: False
+  # SATLOSS7 is a 150-epoch, weight-only continuation from its completed
+  # matched base model; optimizer/scheduler states are intentionally fresh.
+  epochs: 150
+  num_workers: 4
+  prefetch_factor: 2

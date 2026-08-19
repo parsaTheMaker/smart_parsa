@@ -1,0 +1,9 @@
+defaults:
+  - toy_heat_exchange_lno
+  - toy_heat_exchange_satloss7_protocol
+  - _self_
+
+experiment:
+  name: "TOY_HEAT_EXCHANGE_LNO_SATLOSS"
+  model_name: "LNO_TOY_HEAT_EXCHANGE_SATLOSS7"
+  batch_size: 2

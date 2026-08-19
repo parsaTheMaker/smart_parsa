@@ -1,0 +1,11 @@
+defaults:
+  - toy_heat_exchange_transolverpp
+  - toy_heat_exchange_satloss7_protocol
+  - _self_
+
+experiment:
+  name: "TOY_HEAT_EXCHANGE_TRANSOLVERPP_SATLOSS"
+  model_name: "TRANSOLVERPP_TOY_HEAT_EXCHANGE_SATLOSS7"
+  # Fusing two views makes this four token sequences at batch two, which does
+  # not fit on a 24 GB card at the aligned point budgets.
+  batch_size: 1

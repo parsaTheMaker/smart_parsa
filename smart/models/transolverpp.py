@@ -154,6 +154,7 @@ class TransolverPPBase(nn.Module):
         mlp_ratio=2,
         slice_num=32,
         geometry_points=0,
+        use_token_type_embeddings=False,
     ):
         super().__init__()
         if parameter_channels:
@@ -162,10 +163,18 @@ class TransolverPPBase(nn.Module):
         self.volume_channels = int(volume_channels)
         self.spatial_dim = int(spatial_dim)
         self.geometry_points = int(geometry_points)
+        self.use_token_type_embeddings = bool(use_token_type_embeddings)
         self.preprocess = TransolverPlusMLP(
             self.spatial_dim, n_hidden * 2, n_hidden, n_layers=0, residual=False
         )
         self.placeholder = nn.Parameter((1.0 / n_hidden) * torch.rand(n_hidden))
+        # This adapter predicts at query locations while conditioning on a
+        # separate geometry-support cloud. The upstream model receives one
+        # homogeneous mesh, so preserve support/surface-query/volume-query
+        # membership explicitly when adapting it to this operator interface.
+        self.token_type_embedding = (
+            nn.Embedding(3, int(n_hidden)) if self.use_token_type_embeddings else None
+        )
         self.blocks = nn.ModuleList(
             [
                 TransolverPlusBlock(
@@ -181,6 +190,8 @@ class TransolverPPBase(nn.Module):
             ]
         )
         self.apply(self._init_weights)
+        if self.token_type_embedding is not None:
+            nn.init.normal_(self.token_type_embedding.weight, std=0.02)
 
     @staticmethod
     def _init_weights(module):
@@ -220,6 +231,30 @@ class TransolverPPBase(nn.Module):
         with torch.autocast(device_type=geo.device.type, enabled=False):
             tokens = self.preprocess(torch.cat([geometry_pos, query_pos], dim=1).float())
             tokens = tokens + self.placeholder.view(1, 1, -1)
+            if self.token_type_embedding is not None:
+                batch_size = int(geometry_pos.shape[0])
+                role_ids = torch.cat(
+                    [
+                        torch.zeros(
+                            (batch_size, int(geometry_pos.shape[1])),
+                            device=geo.device,
+                            dtype=torch.long,
+                        ),
+                        torch.ones(
+                            (batch_size, int(surf_query_pos.shape[1])),
+                            device=geo.device,
+                            dtype=torch.long,
+                        ),
+                        torch.full(
+                            (batch_size, int(vol_query_pos.shape[1])),
+                            2,
+                            device=geo.device,
+                            dtype=torch.long,
+                        ),
+                    ],
+                    dim=1,
+                )
+                tokens = tokens + self.token_type_embedding(role_ids)
 
         hidden = None
         prediction = None

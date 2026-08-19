@@ -1,0 +1,50 @@
+defaults:
+  - toy_heat_exchange_common
+  - _self_
+
+experiment:
+  name: "TOY_HEAT_EXCHANGE_POINT_TRANSFORMER_V3_BASE"
+  model_name: "POINT_TRANSFORMER_V3_TOY_HEAT_EXCHANGE"
+  # PTv3 retains the full sparse-backbone graph through backward. A per-device
+  # batch of two exceeds 24 GB at the aligned 65k/32k/32k point budgets.
+  batch_size: 1
+  track_gradient_diagnostics: True
+  amp_scaler_init_scale: 1024.0
+  amp_scaler_growth_interval: 1000000
+  amp_scaler_reset_on_resume: True
+  scheduler_reset_on_resume: True
+  architecture:
+    # The density-sensitive PointTransformerV3 used in the DrivAerML paper
+    # comparison, with local support scaled from 16,384 to 8,192 because the
+    # heat-exchange encoder input is half as large.
+    in_channels: 3
+    grid_size: 0.0078125
+    latent_dim: 192
+    num_latents: 64
+    order: [z, hilbert]
+    stride: [2, 2, 2, 2]
+    enc_depths: [1, 1, 2, 4, 1]
+    enc_channels: [24, 48, 96, 192, 256]
+    enc_heads: [2, 4, 4, 8, 16]
+    enc_patch_size: [1024, 1024, 1024, 1024, 1024]
+    dec_depths: [1, 1, 1, 1]
+    dec_channels: [48, 48, 96, 192]
+    dec_heads: [2, 2, 4, 8]
+    dec_patch_size: [1024, 1024, 1024, 1024]
+    mlp_ratio: 2.0
+    drop_path: 0.3
+    shuffle_orders: False
+    enable_flash: True
+    spconv_algo: "native"
+    attn_drop: 0.0
+    proj_drop: 0.0
+    pos_scale_factor: 100.0
+    query_chunk_size: 65536
+    local_query_neighbors: 4
+    local_query_chunk_size: 8192
+    use_local_query_features: True
+    subsampled_geometry_points: 8192
+    geometry_input_scale: 1.0
+    voxel_density_power: 0.75
+    preserve_density: True
+    dropout: 0.0

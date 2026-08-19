@@ -1,0 +1,9 @@
+defaults:
+  - toy_heat_exchange_pointnet2_ssg
+  - toy_heat_exchange_satloss7_protocol
+  - _self_
+
+experiment:
+  name: "TOY_HEAT_EXCHANGE_POINTNET2_SSG_SATLOSS"
+  model_name: "POINTNET2_SSG_TOY_HEAT_EXCHANGE_SATLOSS7"
+  batch_size: 2

@@ -440,14 +440,11 @@ def barycentric_samples(rng: np.random.Generator, vertices: np.ndarray) -> np.nd
     return np.einsum("ni,nij->nj", weights, vertices)
 
 
-def generate_case(case_id: int, split: str, args: dict) -> dict:
+def _generate_case_once(case_id: int, split: str, args: dict, attempt: int) -> dict:
     started = time.perf_counter()
     root = Path(args["output_dir"])
     case_dir = root / f"case_{case_id:05d}"
-    complete = case_dir / "_COMPLETE.json"
-    if complete.exists() and not args["overwrite"]:
-        return {"case_id": case_id, "skipped": True}
-    seed = int(np.random.SeedSequence([args["seed"], case_id, 5913]).generate_state(1)[0])
+    seed = int(np.random.SeedSequence([args["seed"], case_id, 5913, attempt]).generate_state(1)[0])
     params = heat_exchange_parameters(seed)
     points, tetra = make_tetra_mesh(params, args["mesh_h_min"], args["mesh_h_max"], args["gmsh_threads"])
     volumes = tetra_volumes(points, tetra)
@@ -457,8 +454,6 @@ def generate_case(case_id: int, split: str, args: dict) -> dict:
     faces, _owners, areas, _normals = boundary_triangles(points, tetra)
     inner, outer, channel_faces = classify_boundary_faces(points, faces, params, args["mesh_h_max"])
     area_ratio = float(np.percentile(areas, 95.0) / max(np.percentile(areas, 5.0), 1.0e-20))
-    if area_ratio < float(args["min_surface_area_ratio"]):
-        raise RuntimeError(f"Adaptive mesh is too uniform (surface p95/p05={area_ratio:.2f}).")
     # Channel walls are now exact high-temperature Dirichlet boundaries, so
     # their physically injected heat flux is recovered from the conductive
     # gradient.  Exterior flux is evaluated from its imposed Robin law.
@@ -509,12 +504,12 @@ def generate_case(case_id: int, split: str, args: dict) -> dict:
         "volume_sum": float(volume_data.sum()), "volume_sq_sum": float(np.square(volume_data).sum()), "volume_count": int(volume_data.size),
         "position_min": np.minimum(native.min(axis=0), np.minimum(surface.min(axis=0), volume.min(axis=0))).tolist(),
         "position_max": np.maximum(native.max(axis=0), np.maximum(surface.max(axis=0), volume.max(axis=0))).tolist(),
-        "mesh": {"nodes": int(points.shape[0]), "tetrahedra": int(tetra.shape[0]), "surface_triangles": int(faces.shape[0]), "minimum_tetra_volume": float(volumes.min()), "surface_area_p95_over_p05": area_ratio, "inner_faces": int(inner.sum()), "outer_faces": int(outer.sum()), "channel_faces": channel_faces, "channel_temperature_max_error": wall_error},
+        "mesh": {"nodes": int(points.shape[0]), "tetrahedra": int(tetra.shape[0]), "surface_triangles": int(faces.shape[0]), "minimum_tetra_volume": float(volumes.min()), "surface_area_p95_over_p05": area_ratio, "surface_area_ratio_diagnostic_target": float(args["min_surface_area_ratio"]), "meets_surface_area_ratio_target": bool(area_ratio >= float(args["min_surface_area_ratio"])), "inner_faces": int(inner.sum()), "outer_faces": int(outer.sum()), "channel_faces": channel_faces, "channel_temperature_max_error": wall_error},
         "physics": {"equation": "-div((1+a*theta^2) grad(theta))=0", "channel_bc": "theta=1 on every circular and rectangular channel wall", "exterior_bc": "-(1+a*theta^2) grad(theta).n=Bi_ext*theta+R*((theta+tau)^4-tau^4)", "exterior_biot": args["exterior_biot"], "radiation": args["radiation"], "tau": args["ambient_temperature_ratio"], "nonlinear_conductivity": args["nonlinear_conductivity"], "linear_residual": residual, "nonlinear_relative_change": nonlinear_change, "nonlinear_iterations": iterations},
-        "generator": VERSION,
+        "generator": VERSION, "generation_attempt": attempt,
     }
     (case_dir / "case_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
-    complete.write_text(json.dumps({"case_id": case_id, "split": split}) + "\n", encoding="utf-8")
+    (case_dir / "_COMPLETE.json").write_text(json.dumps({"case_id": case_id, "split": split}) + "\n", encoding="utf-8")
     result = {"case_id": case_id, "skipped": False, "elapsed_seconds": time.perf_counter() - started, "nodes": int(points.shape[0]), "tetrahedra": int(tetra.shape[0]), "temperature_min": float(temperature.min()), "temperature_max": float(temperature.max()), "area_ratio": area_ratio}
     # Explicitly release large Python views before this process exits.  It is
     # cheap and helps RSS observability in profilers; process recycling is the
@@ -522,6 +517,29 @@ def generate_case(case_id: int, split: str, args: dict) -> dict:
     del points, tetra, faces, volumes, temperature, gradients
     gc.collect()
     return result
+
+
+def generate_case(case_id: int, split: str, args: dict) -> dict:
+    """Generate one complete case, retrying only recoverable geometry failures.
+
+    Quality diagnostics are recorded rather than used as a global abort.  A
+    genuinely invalid random CAD/mesh instance is regenerated with a distinct,
+    deterministic seed so one outlier cannot discard hours of completed work.
+    """
+    case_dir = Path(args["output_dir"]) / f"case_{case_id:05d}"
+    if (case_dir / "_COMPLETE.json").exists() and not args["overwrite"]:
+        return {"case_id": case_id, "skipped": True}
+    failures: list[str] = []
+    for attempt in range(int(args["case_retries"])):
+        try:
+            return _generate_case_once(case_id, split, args, attempt)
+        except (RuntimeError, ValueError, np.linalg.LinAlgError) as exc:
+            failures.append(f"attempt={attempt}: {exc}")
+            gc.collect()
+    raise RuntimeError(
+        f"Case {case_id} failed after {args['case_retries']} deterministic geometry attempts: "
+        + " | ".join(failures)
+    )
 
 
 def cache_density(case_id: int, root: str, bounds: np.ndarray, knn_k: int) -> None:
@@ -647,16 +665,15 @@ def main() -> None:
     parser.add_argument("--density-workers", type=int, default=1)
     parser.add_argument("--max-cases-per-worker", type=int, default=1)
     parser.add_argument("--gmsh-threads", type=int, default=1)
-    # This is a diagnostic guard, not a physics criterion.  A p95/p05 surface
-    # area ratio of 15 already corresponds to pronounced spatial refinement;
-    # rejecting a valid 19.58x mesh because it missed an arbitrary 20x bound
-    # only makes a long generation job brittle.
+    # Diagnostic only: the recorded p95/p05 ratio measures mesh adaptivity but
+    # does not determine FEM validity or whether a case may be persisted.
     parser.add_argument("--min-surface-area-ratio", type=float, default=15.0)
+    parser.add_argument("--case-retries", type=int, default=3)
     parser.add_argument("--export-cases", default="0,1,2")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
-    if min(args.train_cases, args.validation_cases, args.geometry_points, args.surface_points, args.volume_points, args.mesh_workers, args.density_workers, args.max_cases_per_worker, args.gmsh_threads) <= 0:
+    if min(args.train_cases, args.validation_cases, args.geometry_points, args.surface_points, args.volume_points, args.mesh_workers, args.density_workers, args.max_cases_per_worker, args.case_retries, args.gmsh_threads) <= 0:
         raise ValueError("Case, point, and worker budgets must be positive.")
     if not 0.0 < args.mesh_h_min < args.mesh_h_max:
         raise ValueError("Require 0 < mesh-h-min < mesh-h-max.")

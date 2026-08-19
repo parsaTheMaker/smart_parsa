@@ -21,16 +21,17 @@ experiment:
   data_path: "/mnt/ssdraid/parsa/toy_heat_exchange_fem_v1"
   coordinate_normalization: "global_train_bounds"
   geometry_epoch_seeded_sampling: True
-  # Four times the base encoder budget retains a strongly nonuniform native
-  # mesh cloud while preserving the established DrivAerML SMART hierarchy.
-  num_body_points: 131072
-  num_surface_points: 65536
-  num_volume_points: 65536
+  # Exact DrivAerML SMART fractions applied to this 524,288-point native
+  # geometry cloud: 1/8 encoder input, then 1/8 cross-attention support, then
+  # 1/4 latent anchors.  Each field query budget is 1/16 of the native cloud.
+  num_body_points: 65536
+  num_surface_points: 32768
+  num_volume_points: 32768
   scale_positions: False
   architecture:
     latent_dim: 256
-    latent_geometry_points: 4096
-    subsampled_geometry_points: 16384
+    latent_geometry_points: 2048
+    subsampled_geometry_points: 8192
     subsampled_geometry_with_replacement: True
     num_encoder_decoder_blocks: 6
     pos_scale_factor: 100

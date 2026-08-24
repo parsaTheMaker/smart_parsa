@@ -55,7 +55,13 @@ def parse_args() -> argparse.Namespace:
         help="Prefix of per-case heat-exchange surface VTPs.",
     )
     parser.add_argument("--factors", default="5,10")
-    parser.add_argument("--max-cases", type=int, default=0, help="Validation cases to remesh; 0 means all.")
+    parser.add_argument(
+        "--split",
+        choices=("validation", "train", "all"),
+        default="validation",
+        help="Benchmark split to export and remesh. The default keeps held-out evaluation preparation unchanged.",
+    )
+    parser.add_argument("--max-cases", type=int, default=0, help="Maximum selected cases to remesh; 0 means all.")
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--feature-angle", type=float, default=30.0)
     parser.add_argument("--isotropic-iterations", type=int, default=8)
@@ -232,11 +238,19 @@ def main() -> int:
     factors = parse_csv_ints(args.factors)
     data_root = args.data_root.expanduser().resolve()
     manifest = json.loads((data_root / "preprocessed_manifest.json").read_text(encoding="utf-8"))
-    case_ids = [int(case_id) for case_id in manifest["validation_ids"]]
+    if args.split == "validation":
+        case_ids = [int(case_id) for case_id in manifest["validation_ids"]]
+    elif args.split == "train":
+        case_ids = [int(case_id) for case_id in manifest["train_ids"]]
+    else:
+        case_ids = sorted({
+            *(int(case_id) for case_id in manifest["train_ids"]),
+            *(int(case_id) for case_id in manifest["validation_ids"]),
+        })
     if args.max_cases > 0:
         case_ids = case_ids[: args.max_cases]
     if not case_ids:
-        raise ValueError("No validation cases selected for remeshing.")
+        raise ValueError(f"No {args.split} cases selected for remeshing.")
 
     surface_root = args.surface_vtp_dir.expanduser().resolve()
     for directory in (surface_root, args.angle_output_dir, args.isotropic_output_dir, args.voxel_output_dir, args.results_dir):
@@ -275,6 +289,7 @@ def main() -> int:
         "data_root": str(data_root), "surface_vtp_dir": str(surface_root),
         "factors": factors, "methods": ["angle", "isotropic", "voxel"],
         "source_role": "actual_adaptive_fem_boundary_mesh",
+        "source_split": str(args.split),
         "target_role": "unchanged area-uniform surface and tetra-volume query arrays",
         "wall_seconds": time.perf_counter() - started, "records": records,
     }

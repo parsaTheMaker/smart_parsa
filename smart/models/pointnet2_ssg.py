@@ -175,12 +175,24 @@ class _SharedPointMLP(nn.Module):
 class SetAbstractionSSG(nn.Module):
     """One PointNet++ single-scale set-abstraction layer."""
 
-    def __init__(self, input_channels, output_channels, npoint, radius, nsample, centroid_sampling="fps"):
+    def __init__(
+        self,
+        input_channels,
+        output_channels,
+        npoint,
+        radius,
+        nsample,
+        centroid_sampling="fps",
+        deterministic_eval_centroids=False,
+        eval_centroid_seed=0,
+    ):
         super().__init__()
         self.npoint = int(npoint)
         self.radius = float(radius)
         self.nsample = int(nsample)
         self.centroid_sampling = str(centroid_sampling).lower()
+        self.deterministic_eval_centroids = bool(deterministic_eval_centroids)
+        self.eval_centroid_seed = int(eval_centroid_seed)
         if self.centroid_sampling not in {"fps", "random"}:
             raise ValueError(f"Unsupported PointNet++ centroid sampler: {centroid_sampling!r}")
         output_channels = tuple(output_channels)
@@ -200,7 +212,22 @@ class SetAbstractionSSG(nn.Module):
         # sensitivity benchmark; ``fps`` remains available for canonical
         # PointNet++ behavior.
         if self.centroid_sampling == "random":
-            centers, center_idx = sample_tokens(xyz, self.npoint)
+            if self.deterministic_eval_centroids and not self.training:
+                # Keep random-centroid density sensitivity during training,
+                # but make every evaluation reproducible.  Otherwise a base
+                # and SATLOSS model receive different hidden centroid draws
+                # for the same controlled encoder cloud.
+                indices = []
+                for batch_index in range(xyz.shape[0]):
+                    generator = torch.Generator(device=xyz.device)
+                    generator.manual_seed(self.eval_centroid_seed + batch_index)
+                    indices.append(
+                        torch.randperm(xyz.shape[1], device=xyz.device, generator=generator)[: self.npoint]
+                    )
+                center_idx = torch.stack(indices, dim=0)
+                centers = _gather_batched(xyz, center_idx)
+            else:
+                centers, center_idx = sample_tokens(xyz, self.npoint)
         else:
             centers, center_idx = sample_tokens_fps(xyz.float(), self.npoint, random_start=True)
         center_idx = center_idx.to(dtype=torch.long)
@@ -245,6 +272,7 @@ class PointNet2SSG(nn.Module):
         sa2_nsample=128,
         query_neighbors=3,
         centroid_sampling="random",
+        deterministic_eval_centroids=False,
         density_histogram_bins=8,
         pos_scale_factor=1.0,
         query_chunk_size=65536,
@@ -264,8 +292,14 @@ class PointNet2SSG(nn.Module):
         self.density_histogram_bins = max(2, int(density_histogram_bins))
 
         self.centroid_sampling = str(centroid_sampling).lower()
-        self.sa1 = SetAbstractionSSG(0, (64, 64, 128), sa1_npoint, sa1_radius, sa1_nsample, self.centroid_sampling)
-        self.sa2 = SetAbstractionSSG(128, (128, 128, 256), sa2_npoint, sa2_radius, sa2_nsample, self.centroid_sampling)
+        self.sa1 = SetAbstractionSSG(
+            0, (64, 64, 128), sa1_npoint, sa1_radius, sa1_nsample,
+            self.centroid_sampling, deterministic_eval_centroids, eval_centroid_seed=104729,
+        )
+        self.sa2 = SetAbstractionSSG(
+            128, (128, 128, 256), sa2_npoint, sa2_radius, sa2_nsample,
+            self.centroid_sampling, deterministic_eval_centroids, eval_centroid_seed=130363,
+        )
         self.global_mlp = _SharedPointMLP(259, (256, 512, latent_dim))
         self.global_pool_logits = nn.Sequential(
             nn.Linear(259, max(32, latent_dim // 4)),

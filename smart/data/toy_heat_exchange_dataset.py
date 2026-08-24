@@ -46,6 +46,7 @@ class ToyHeatExchangeDataset(Dataset):
         geometry_density_neighbor_hops=1,
         geometry_density_estimator="kde",
         geometry_density_cache_dtype="float16",
+        case_ids=None,
         **_unused,
     ):
         del scale_positions
@@ -76,14 +77,22 @@ class ToyHeatExchangeDataset(Dataset):
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.training_ids = tuple(int(x) for x in manifest["train_ids"])
         self.test_ids = tuple(int(x) for x in manifest["validation_ids"])
-        self.data = self.test_ids if self.if_test else self.training_ids
+        if case_ids is None:
+            self.data = self.test_ids if self.if_test else self.training_ids
+        else:
+            selected_ids = tuple(int(case_id) for case_id in case_ids)
+            known_ids = set(self.training_ids) | set(self.test_ids)
+            unknown_ids = sorted(set(selected_ids) - known_ids)
+            if unknown_ids:
+                raise ValueError(f"ToyHeatExchange case_ids contains unknown IDs: {unknown_ids[:10]}")
+            self.data = selected_ids
         if not self.data:
             raise ValueError("ToyHeatExchange selected split is empty.")
         self.surface_field_names = list(self.SURFACE_FIELDS)
         self.volume_field_names = list(self.VOLUME_FIELDS)
         self._load_train_statistics()
         print(
-            f"[ToyHeatExchange] split={'validation' if self.if_test else 'train'}, cases={len(self.data)}, "
+            f"[ToyHeatExchange] split={'custom' if case_ids is not None else ('validation' if self.if_test else 'train')}, cases={len(self.data)}, "
             f"geometry_points={'full' if self.geometry_points == 0 else self.geometry_points}, "
             f"surface_queries={self.surface_points}, volume_queries={self.volume_points}, "
             f"density={self.return_geometry_density}"

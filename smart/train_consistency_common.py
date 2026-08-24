@@ -2718,6 +2718,24 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     "checkpoints/" + model_checkpoint_name + "_last.pt",
                 )
 
+                # Optional, model-weight-only checkpoints for the external
+                # fixed-probe gradient-alignment dashboard.  Disabled by
+                # default so ordinary training keeps its historical I/O.
+                probe_snapshot_every = int(getattr(config, "gradient_probe_snapshot_every", 0))
+                if probe_snapshot_every > 0 and (
+                    (ep + 1) % probe_snapshot_every == 0 or ep + 1 == int(config.epochs)
+                ):
+                    torch.save(
+                        {
+                            "epoch": int(ep),
+                            "global_step": int(global_step),
+                            "model_state_dict": model.state_dict(),
+                            "surface_fields": fields["surface"],
+                            "volume_fields": fields["volume"],
+                        },
+                        "checkpoints/" + model_checkpoint_name + f"_gradient_probe_epoch_{ep + 1:04d}.pt",
+                    )
+
             t2 = default_timer()
             if is_main_process():
                 print(

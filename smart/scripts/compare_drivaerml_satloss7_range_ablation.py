@@ -33,6 +33,7 @@ import math
 import sys
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Sequence
 
@@ -252,9 +253,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-ids", default=None, help="Optional comma-separated explicit test run IDs.")
     parser.add_argument(
         "--run-selection",
-        choices=("random", "top_angle_div10_range_ablation"),
+        choices=("random", "top_angle_div10_range_ablation", "top_pairwise_improvement"),
         default="random",
-        help="Select random geometries, or evaluate all angle-div10 candidates and retain the strongest range-ablation geometries.",
+        help="Select random geometries, use the legacy angle-div10 range selection, or rank a candidate pool by pairwise model improvement.",
     )
     parser.add_argument(
         "--top-selection-metric",
@@ -266,7 +267,40 @@ def parse_args() -> argparse.Namespace:
         "--top-selection-candidates",
         type=int,
         default=0,
-        help="Candidate-pool size for top selection; 0 uses every available angle-div10 candidate.",
+        help="Candidate-pool size for top selection; 0 uses every available common candidate.",
+    )
+    parser.add_argument(
+        "--top-selection-improved-model",
+        default=None,
+        help="Model key that should have lower error when --run-selection=top_pairwise_improvement.",
+    )
+    parser.add_argument(
+        "--top-selection-reference-model",
+        default=None,
+        help="Model key used as the pairwise denominator when --run-selection=top_pairwise_improvement.",
+    )
+    parser.add_argument(
+        "--top-selection-conditions",
+        default="sine_y,sine_x,remeshing",
+        help="Comma-separated ranking conditions: beta,sine_y,sine_x,remeshing. Remeshing includes every active VTP source/factor.",
+    )
+    parser.add_argument(
+        "--top-selection-min-condition-improvement-percent",
+        type=float,
+        default=None,
+        help="Optional eligibility floor applied to every ranking condition before averaging improvements.",
+    )
+    parser.add_argument(
+        "--candidate-split",
+        choices=("test", "all"),
+        default="test",
+        help="Candidate universe for random/top selection. `all` may include training-split geometries and is therefore not a held-out evaluation.",
+    )
+    parser.add_argument(
+        "--screen-case-batch-size",
+        type=int,
+        default=1,
+        help="Number of candidate geometries packed into each screening forward pass."
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--shift-levels", default="0,0.25,0.5,0.75,1.0", help="Severity levels, including zero.")
@@ -300,6 +334,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--font-scale", type=float, default=1.2)
     parser.add_argument("--y-pad-fraction", type=float, default=0.10, help="Fractional vertical padding on every plot y-axis.")
     parser.add_argument("--no-std", action="store_true", help="Disable standard-deviation error bars in all plots.")
+    parser.add_argument(
+        "--compact-endpoint-summary",
+        action="store_true",
+        help="Add one linear chart with sine-x, sine-y, and mean div5/div10 remeshing endpoint groups.",
+    )
     parser.add_argument("--smart-config", default="drivaerml")
     parser.add_argument("--range025-config", default="drivaerml_satloss7_range025")
     parser.add_argument("--range050-config", default="drivaerml_satloss7_range050")
@@ -465,6 +504,134 @@ def rank_top_range_ablation_runs(
     if len(ranked) < int(requested_count):
         raise ValueError(
             f"Top-run selection found only {len(ranked)} complete angle_div10 candidates, "
+            f"but {requested_count} were requested."
+        )
+    return ranked[: int(requested_count)]
+
+
+def top_selection_conditions(
+    conditions_text: str,
+    active_shifts: Sequence[str],
+    levels: Sequence[float] | Mapping[str, Sequence[float]],
+    active_geometry_sources: Sequence[str],
+) -> List[tuple[str, float]]:
+    """Resolve endpoint conditions used only for pairwise candidate ranking."""
+    valid = {"beta", "sine_y", "sine_x", "remeshing"}
+    requested = [item.strip().lower().replace("-", "_") for item in str(conditions_text).split(",") if item.strip()]
+    unknown = sorted(set(requested).difference(valid))
+    if unknown:
+        raise ValueError(f"Unknown --top-selection-conditions values: {unknown}. Valid values: {sorted(valid)}")
+    selected: List[tuple[str, float]] = []
+    for shift in SHIFT_ORDER:
+        if shift in requested:
+            if shift not in active_shifts:
+                raise ValueError(f"Ranking condition `{shift}` is not active. Add it to --active-shifts.")
+            selected.append((shift, float(max(levels_for_shift(levels, shift)))))
+    if "remeshing" in requested:
+        if not active_geometry_sources:
+            raise ValueError("Ranking condition `remeshing` requires active VTP geometry sources.")
+        selected.extend((f"geometry_{source}", 1.0) for source in active_geometry_sources)
+    if not selected:
+        raise ValueError("--top-selection-conditions resolved to no evaluated conditions.")
+    return selected
+
+
+def top_selection_condition_label(condition: tuple[str, float]) -> str:
+    name, severity = condition
+    return f"{name}_{severity:.2f}" if name in SHIFT_ORDER else name
+
+
+def selection_modes(
+    modes: Sequence[Mapping[str, object]],
+    conditions: Sequence[tuple[str, float]],
+) -> List[Mapping[str, object]]:
+    """Keep only the exact endpoint modes that contribute to top-run ranking."""
+    requested = {top_selection_condition_label(condition) for condition in conditions}
+    selected = [mode for mode in modes if str(mode["name"]) in requested]
+    selected_names = {str(mode["name"]) for mode in selected}
+    if selected_names != requested:
+        missing = sorted(requested.difference(selected_names))
+        raise ValueError(f"Top-run selection modes are missing from the evaluation: {missing}")
+    return selected
+
+
+def rank_top_pairwise_improvement_runs(
+    rows: Sequence[Mapping[str, object]],
+    candidate_ids: Sequence[int],
+    metric: str,
+    requested_count: int,
+    improved_model: str,
+    reference_model: str,
+    conditions: Sequence[tuple[str, float]],
+    min_condition_improvement_percent: float | None = None,
+) -> List[Dict[str, object]]:
+    """Rank cases where one model most improves over another across fixed OOD modes.
+
+    The score is the arithmetic mean of per-condition relative improvements:
+    ``100 * (reference_error - improved_error) / abs(reference_error)``.
+    Every selected case must have all requested sine/remeshing conditions for
+    both models.  This selection criterion is saved to a sidecar file and is
+    deliberately not added to plot titles.
+    """
+    grouped: Dict[tuple[str, int, str, float], List[Mapping[str, object]]] = defaultdict(list)
+    for row in rows:
+        model_name = str(row["model_name"])
+        shift_name = str(row["shift_name"])
+        severity = round(float(row["severity"]), 8)
+        if model_name in {improved_model, reference_model} and (shift_name, severity) in conditions:
+            grouped[(model_name, int(row["run_id"]), shift_name, severity)].append(row)
+
+    ranked: List[Dict[str, object]] = []
+    for run_id in sorted(int(value) for value in candidate_ids):
+        improvements: Dict[str, float] = {}
+        values: Dict[str, Dict[str, float]] = {}
+        complete = True
+        for condition in conditions:
+            condition_name, condition_severity = condition
+            condition_label = top_selection_condition_label(condition)
+            improved_rows = grouped.get((improved_model, run_id, condition_name, round(condition_severity, 8)), [])
+            reference_rows = grouped.get((reference_model, run_id, condition_name, round(condition_severity, 8)), [])
+            if not improved_rows or not reference_rows:
+                complete = False
+                break
+            improved_value = float(np.mean([float(row[metric]) for row in improved_rows]))
+            reference_value = float(np.mean([float(row[metric]) for row in reference_rows]))
+            if not (math.isfinite(improved_value) and math.isfinite(reference_value)) or abs(reference_value) < 1.0e-12:
+                complete = False
+                break
+            improvements[condition_label] = 100.0 * (reference_value - improved_value) / abs(reference_value)
+            values[condition_label] = {"improved": improved_value, "reference": reference_value}
+        if not complete:
+            continue
+        if (
+            min_condition_improvement_percent is not None
+            and min(improvements.values()) < float(min_condition_improvement_percent)
+        ):
+            continue
+        score = float(np.mean(list(improvements.values())))
+        row: Dict[str, object] = {
+            "run_id": run_id,
+            "selection_metric": metric,
+            "improved_model": improved_model,
+            "reference_model": reference_model,
+            "selection_conditions": [top_selection_condition_label(condition) for condition in conditions],
+            "mean_pairwise_improvement_pct": score,
+            "minimum_condition_improvement_pct": float(min(improvements.values())),
+        }
+        for condition, improvement in improvements.items():
+            row[f"{condition}_improvement_pct"] = improvement
+            row[f"{condition}_{improved_model.lower()}_error"] = values[condition]["improved"]
+            row[f"{condition}_{reference_model.lower()}_error"] = values[condition]["reference"]
+        ranked.append(row)
+    ranked.sort(key=lambda row: (-float(row["mean_pairwise_improvement_pct"]), int(row["run_id"])))
+    if len(ranked) < int(requested_count):
+        qualification = (
+            ""
+            if min_condition_improvement_percent is None
+            else f" satisfying the per-condition floor of {float(min_condition_improvement_percent):.3g}%"
+        )
+        raise ValueError(
+            f"Pairwise top-run selection found only {len(ranked)} complete candidates{qualification}, "
             f"but {requested_count} were requested."
         )
     return ranked[: int(requested_count)]
@@ -659,7 +826,7 @@ def make_query_data(
 def sample_mode_indices(
     mode: Mapping[str, object],
     surf_coords: np.ndarray,
-    log_density: np.ndarray,
+    log_density: np.ndarray | None,
     sine_weights: Mapping[str, np.ndarray],
     budget: int,
     seed: int,
@@ -679,6 +846,8 @@ def sample_mode_indices(
         elif kind == "uniform_wor":
             indices = sample_uniform_without_replacement(surf_coords.shape[0], budget, rng)
         elif kind == "inverse_density_wor":
+            if log_density is None:
+                raise RuntimeError("Inverse-density sampling requested without a density field.")
             indices = sample_inverse_density_without_replacement(
                 log_density,
                 budget,
@@ -699,6 +868,14 @@ def sample_mode_indices(
     return result
 
 
+def geometry_sampling_seed(global_seed: int, mode_id: int, run_id: int, view_id: int) -> int:
+    """Stable SMART encoder-sampling seed for one evaluated geometry view."""
+    return int(
+        (int(global_seed) + 1_000_003 * int(mode_id) + 10_007 * int(run_id) + 101 * int(view_id))
+        % (2**63 - 1)
+    )
+
+
 def evaluate_model_run(
     model_name: str,
     model,
@@ -706,7 +883,7 @@ def evaluate_model_run(
     case: Mapping[str, np.ndarray],
     query: Mapping[str, object],
     modes: Sequence[Mapping[str, object]],
-    log_density: np.ndarray,
+    log_density: np.ndarray | None,
     sine_weights: Mapping[str, np.ndarray],
     input_budget: int,
     args: argparse.Namespace,
@@ -760,6 +937,13 @@ def evaluate_model_run(
                 device=device,
                 base_seed=int(args.seed + 100000 * int(mode["id"]) + 1000 * int(case["run_id"]) + batch_start * 17),
                 repeats=int(args.model_repeats),
+                geometry_sampling_seeds=torch.tensor(
+                    [
+                        geometry_sampling_seed(args.seed, int(mode["id"]), int(case["run_id"]), view_id)
+                        for view_id in range(batch_start, batch_stop)
+                    ],
+                    dtype=torch.long,
+                ),
             )
             for local_view, view_id in enumerate(range(batch_start, batch_stop)):
                 metrics = compute_metrics(
@@ -787,6 +971,13 @@ def evaluate_model_run(
                 )
         mode_rows[str(mode["name"])] = mode_result
 
+    # Pairwise candidate screening evaluates only endpoint modes.  It does not
+    # need the aligned control rows that full plotting uses for severity zero.
+    if "aligned_uniform_wor" not in mode_rows:
+        for mode in modes:
+            rows.extend(mode_rows[str(mode["name"])])
+        return rows
+
     aligned_rows = mode_rows["aligned_uniform_wor"]
     for shift in [*args.active_shifts, *(f"geometry_{source}" for source in args.active_geometry_sources)]:
         for row in aligned_rows:
@@ -794,6 +985,276 @@ def evaluate_model_run(
     for mode in modes:
         if str(mode["name"]) != "aligned_uniform_wor":
             rows.extend(mode_rows[str(mode["name"])])
+    return rows
+
+
+@torch.inference_mode()
+def predict_packed_case_views(
+    model,
+    geo_views_norm: torch.Tensor,
+    surf_query_norm: torch.Tensor,
+    vol_query_norm: torch.Tensor,
+    mean_s: torch.Tensor,
+    std_s: torch.Tensor,
+    mean_v: torch.Tensor,
+    std_v: torch.Tensor,
+    device: torch.device,
+    base_seed: int,
+    repeats: int,
+    geometry_sampling_seeds: torch.Tensor,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Infer independently queried cases packed into one GPU batch."""
+    batch_size = int(geo_views_norm.shape[0])
+    if int(surf_query_norm.shape[0]) != batch_size or int(vol_query_norm.shape[0]) != batch_size:
+        raise ValueError("Packed geometry and query batches must have the same batch size.")
+    if int(geometry_sampling_seeds.numel()) != batch_size:
+        raise ValueError("Packed geometry and sampling-seed batches must have the same batch size.")
+    geo_b = geo_views_norm.to(device, non_blocking=True)
+    surf_q_b = surf_query_norm.to(device, non_blocking=True)
+    vol_q_b = vol_query_norm.to(device, non_blocking=True)
+    geometry_sampling_b = geometry_sampling_seeds.to(device=device, dtype=torch.long, non_blocking=True)
+
+    surf_acc = None
+    vol_acc = None
+    for repeat in range(int(repeats)):
+        seed = int(base_seed + repeat)
+        if device.type == "cuda":
+            with torch.cuda.device(device):
+                torch.cuda.manual_seed(seed)
+        else:
+            torch.manual_seed(seed)
+        with (torch.cuda.device(device) if device.type == "cuda" else nullcontext()):
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=device.type == "cuda"):
+                pred_s_norm, pred_v_norm = model.inference(
+                    geo_b,
+                    surf_q_b,
+                    vol_q_b,
+                    None,
+                    geometry_sampling_seeds=geometry_sampling_b,
+                )
+        pred_s = denorm_fields(pred_s_norm.cpu(), mean_s, std_s)
+        pred_v = denorm_fields(pred_v_norm.cpu(), mean_v, std_v)
+        surf_acc = pred_s if surf_acc is None else (surf_acc + pred_s)
+        vol_acc = pred_v if vol_acc is None else (vol_acc + pred_v)
+    return (surf_acc / float(repeats)).numpy(), (vol_acc / float(repeats)).numpy()
+
+
+def evaluate_model_case_batch(
+    model_name: str,
+    model,
+    device: torch.device,
+    prepared_cases: Sequence[tuple[Dict[str, np.ndarray], Dict[str, object], Dict[str, torch.Tensor], Dict[str, np.ndarray], np.ndarray | None, Dict[str, np.ndarray]]],
+    modes: Sequence[Mapping[str, object]],
+    input_budget: int,
+    args: argparse.Namespace,
+    mean_s: torch.Tensor,
+    std_s: torch.Tensor,
+    mean_v: torch.Tensor,
+    std_v: torch.Tensor,
+) -> List[Dict[str, object]]:
+    """Evaluate endpoint-only modes with several independent cases per forward pass."""
+    if not prepared_cases:
+        return []
+    if any(str(mode["name"]) == "aligned_uniform_wor" for mode in modes):
+        raise ValueError("Packed candidate screening must receive endpoint modes only.")
+
+    rows: List[Dict[str, object]] = []
+    for mode in modes:
+        sampled_views = []
+        for case, query, source_norm, source_points, log_density, sine_weights in prepared_cases:
+            del source_norm
+            sampled_views.append(
+                sample_mode_indices(
+                    mode,
+                    case["surf_coords"],
+                    log_density,
+                    sine_weights,
+                    int(input_budget),
+                    int(args.seed),
+                    int(case["run_id"]),
+                    int(args.views_per_mode),
+                    source_points,
+                )
+            )
+
+        for view_start in range(0, int(args.views_per_mode), int(args.view_batch_size)):
+            view_stop = min(view_start + int(args.view_batch_size), int(args.views_per_mode))
+            packed_geo: List[torch.Tensor] = []
+            packed_surf_query: List[torch.Tensor] = []
+            packed_vol_query: List[torch.Tensor] = []
+            metadata: List[tuple[Mapping[str, np.ndarray], Mapping[str, object], int]] = []
+            for prepared, indices_per_view in zip(prepared_cases, sampled_views):
+                case, query, source_norm, _source_points, _log_density, _sine_weights = prepared
+                for view_id in range(view_start, view_stop):
+                    indices = indices_per_view[view_id]
+                    if str(mode["kind"]) == "geometry_vtp":
+                        geometry = source_norm[str(mode["geometry_source"])][torch.from_numpy(indices)]
+                    else:
+                        geometry = query["full_surf_norm"][torch.from_numpy(indices)]
+                    packed_geo.append(geometry)
+                    packed_surf_query.append(query["surf_query_norm"])
+                    packed_vol_query.append(query["vol_query_norm"])
+                    metadata.append((case, query, view_id))
+
+            packed_run_seed = sum((index + 1) * int(case["run_id"]) for index, (case, _query, _view) in enumerate(metadata))
+            pred_surf, pred_vol = predict_packed_case_views(
+                model,
+                torch.stack(packed_geo, dim=0),
+                torch.stack(packed_surf_query, dim=0),
+                torch.stack(packed_vol_query, dim=0),
+                mean_s,
+                std_s,
+                mean_v,
+                std_v,
+                device,
+                base_seed=int(args.seed + 100000 * int(mode["id"]) + packed_run_seed + view_start * 17),
+                repeats=int(args.model_repeats),
+                geometry_sampling_seeds=torch.tensor(
+                    [
+                        geometry_sampling_seed(args.seed, int(mode["id"]), int(case["run_id"]), view_id)
+                        for case, _query, view_id in metadata
+                    ],
+                    dtype=torch.long,
+                ),
+            )
+            for packed_index, (case, query, view_id) in enumerate(metadata):
+                metrics = compute_metrics(
+                    query["surf_gt"],
+                    pred_surf[packed_index],
+                    query["vol_gt"],
+                    pred_vol[packed_index],
+                )
+                rows.append(
+                    {
+                        "run_id": int(case["run_id"]),
+                        "view_id": int(view_id),
+                        "model_name": model_name,
+                        "sampling_mode": str(mode["name"]),
+                        "shift_name": str(mode.get("condition", mode["shift"] or "aligned")),
+                        "severity": float(mode["severity"]),
+                        "sampling_kind": str(mode["kind"]),
+                        "geometry_source": str(mode.get("geometry_source", "preprocessed_surface")),
+                        "input_points": int(input_budget),
+                        "surface_query_points": int(query["surf_gt"].shape[0]),
+                        "volume_query_points": int(query["vol_gt"].shape[0]),
+                        "checkpoint": str(args.checkpoints[model_name]),
+                        **metrics,
+                    }
+                )
+    return rows
+
+
+def prepare_run_inputs(
+    run_id: int,
+    dataset: AhmedMLDatasetV2,
+    args: argparse.Namespace,
+    min_pos: torch.Tensor,
+    max_pos: torch.Tensor,
+    geometry_vtp_dirs: Mapping[str, Path],
+) -> tuple[Dict[str, np.ndarray], Dict[str, object], Dict[str, torch.Tensor], Dict[str, np.ndarray], np.ndarray | None, Dict[str, np.ndarray]]:
+    """Load one case once so every model receives identical CPU-side inputs."""
+    case = load_case(Path(args.data_root), int(run_id))
+    case["run_id"] = int(run_id)
+    query = make_query_data(case, args, min_pos, max_pos)
+    geometry_source_points: Dict[str, np.ndarray] = {}
+    geometry_source_norm: Dict[str, torch.Tensor] = {}
+    for source_name in args.active_geometry_sources:
+        source_path = geometry_source_vtp_path(source_name, int(run_id), geometry_vtp_dirs)
+        source_points = read_vtp_points(source_path)
+        validate_geometry_source_bbox(source_points, case["surf_coords"], source_name, int(run_id))
+        geometry_source_points[source_name] = source_points
+        geometry_source_norm[source_name] = normalize_pos(torch.from_numpy(source_points), min_pos, max_pos)
+    needs_density = "beta" in args.active_shifts
+    log_density = None
+    if needs_density:
+        log_density = dataset._load_or_compute_full_geometry_density(
+            int(run_id), expected_n=int(case["surf_coords"].shape[0])
+        ).to(dtype=torch.float32).cpu().numpy()
+    sine_weights = {
+        "sine_y": sinusoidal_axis_probabilities(case["surf_coords"], axis=1),
+        "sine_x": sinusoidal_axis_probabilities(case["surf_coords"], axis=0),
+    }
+    return case, query, geometry_source_norm, geometry_source_points, log_density, sine_weights
+
+
+def prepare_run_batch(
+    run_ids: Sequence[int],
+    dataset: AhmedMLDatasetV2,
+    args: argparse.Namespace,
+    min_pos: torch.Tensor,
+    max_pos: torch.Tensor,
+    geometry_vtp_dirs: Mapping[str, Path],
+) -> List[tuple[Dict[str, np.ndarray], Dict[str, object], Dict[str, torch.Tensor], Dict[str, np.ndarray], np.ndarray | None, Dict[str, np.ndarray]]]:
+    return [
+        prepare_run_inputs(int(run_id), dataset, args, min_pos, max_pos, geometry_vtp_dirs)
+        for run_id in run_ids
+    ]
+
+
+def evaluate_run_group(
+    run_ids: Sequence[int],
+    model_names: Sequence[str],
+    models: Mapping[str, torch.nn.Module],
+    device: torch.device,
+    dataset: AhmedMLDatasetV2,
+    args: argparse.Namespace,
+    modes: Sequence[Mapping[str, object]],
+    budgets: Mapping[str, int],
+    mean_s: torch.Tensor,
+    std_s: torch.Tensor,
+    mean_v: torch.Tensor,
+    std_v: torch.Tensor,
+    min_pos: torch.Tensor,
+    max_pos: torch.Tensor,
+    geometry_vtp_dirs: Mapping[str, Path],
+    case_batch_size: int = 1,
+    progress_label: str = "",
+) -> List[Dict[str, object]]:
+    """Own one GPU and overlap CPU input preparation with model inference."""
+    rows: List[Dict[str, object]] = []
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    if progress_label:
+        print(f"[{progress_label}] starting {len(run_ids)} cases", flush=True)
+    if not run_ids:
+        return rows
+    if int(case_batch_size) < 1:
+        raise ValueError("--screen-case-batch-size must be at least one.")
+    run_batches = [
+        list(run_ids[start : start + int(case_batch_size)])
+        for start in range(0, len(run_ids), int(case_batch_size))
+    ]
+    # The next microbatch is read and normalized on CPU while this GPU
+    # evaluates the current one, avoiding recurring host-side gaps.
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="comparison-prefetch") as prefetch:
+        pending = prefetch.submit(
+            prepare_run_batch,
+            run_batches[0], dataset, args, min_pos, max_pos, geometry_vtp_dirs,
+        )
+        completed_cases = 0
+        for batch_index, _run_batch in enumerate(run_batches):
+            prepared_cases = pending.result()
+            if batch_index + 1 < len(run_batches):
+                pending = prefetch.submit(
+                    prepare_run_batch,
+                    run_batches[batch_index + 1], dataset, args, min_pos, max_pos, geometry_vtp_dirs,
+                )
+            for model_name in model_names:
+                rows.extend(
+                    evaluate_model_case_batch(
+                        model_name, models[model_name], device, prepared_cases, modes,
+                        budgets[model_name], args, mean_s, std_s, mean_v, std_v,
+                    )
+                )
+            completed_cases += len(prepared_cases)
+            if progress_label and (
+                completed_cases == len(run_ids)
+                or completed_cases == len(prepared_cases)
+                or completed_cases % max(5, int(case_batch_size)) == 0
+            ):
+                print(f"[{progress_label}] {completed_cases}/{len(run_ids)} cases complete", flush=True)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
     return rows
 
 
@@ -1439,6 +1900,129 @@ def average_remeshing_rows(
     return averaged
 
 
+def plot_compact_endpoint_summary(
+    aggregate: Sequence[Mapping[str, object]],
+    percentage_aggregate: Sequence[Mapping[str, object]],
+    levels: Mapping[str, Sequence[float]],
+    geometry_source_modes: Sequence[str],
+    output: Path,
+    y_pad_fraction: float,
+    show_std: bool = False,
+) -> None:
+    """Render the paper-style four-condition endpoint summary requested for ablations."""
+    if "sine_x" not in levels or "sine_y" not in levels:
+        return
+    average_absolute = average_remeshing_rows(aggregate, geometry_source_modes, percentage=False)
+    average_percentage = average_remeshing_rows(percentage_aggregate, geometry_source_modes, percentage=True)
+    values_by_key = {
+        (str(row["model_name"]), str(row["shift_name"]), round(float(row["severity"]), 8)): row
+        for row in [*aggregate, *average_absolute]
+    }
+    percentages_by_key = {
+        (str(row["model_name"]), str(row["shift_name"]), round(float(row["severity"]), 8)): row
+        for row in [*percentage_aggregate, *average_percentage]
+    }
+    conditions = (
+        ("sine_x", round(float(max(levels["sine_x"])), 8), "Sine x"),
+        ("sine_y", round(float(max(levels["sine_y"])), 8), "Sine y"),
+        ("geometry_average_div5", 1.0, "Mean remeshing div5"),
+        ("geometry_average_div10", 1.0, "Mean remeshing div10"),
+    )
+    if any(
+        (model_name, condition, severity) not in values_by_key
+        for model_name in MODEL_ORDER
+        for condition, severity, _label in conditions
+    ):
+        return
+
+    metric = "combined_global_rel_l2"
+    fig, axis = plt.subplots(figsize=(12.8, 6.1))
+    font_size = ablation_font_size(1.0)
+    x_centers = np.arange(len(conditions), dtype=np.float64)
+    bar_width = 0.205
+    intra_group_gap = 0.022
+    offsets = (np.arange(len(MODEL_ORDER)) - 0.5 * (len(MODEL_ORDER) - 1)) * (bar_width + intra_group_gap)
+    plotted_values: List[float] = []
+    plotted_lower_bounds: List[float] = []
+    plotted_upper_bounds: List[float] = []
+    percentage_labels: List[tuple[object, float, str, str]] = []
+    for condition_index, (condition, severity, _label) in enumerate(conditions):
+        smart_row = values_by_key[(REFERENCE_MODEL, condition, severity)]
+        smart_value = float(smart_row[f"{metric}_mean"])
+        for model_index, model_name in enumerate(MODEL_ORDER):
+            row = values_by_key[(model_name, condition, severity)]
+            value = float(row[f"{metric}_mean"])
+            plotted_values.append(value)
+            std = float(row.get(f"{metric}_std", 0.0)) if show_std else 0.0
+            if not math.isfinite(std) or std < 0.0:
+                std = 0.0
+            plotted_lower_bounds.append(max(0.0, value - std))
+            plotted_upper_bounds.append(value + std)
+            bar = axis.bar(
+                x_centers[condition_index] + offsets[model_index],
+                value,
+                width=bar_width,
+                color=MODEL_COLORS[model_name],
+                edgecolor="#20262d",
+                linewidth=0.65,
+                zorder=3,
+            )[0]
+            if show_std and std > 0.0:
+                axis.errorbar(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    value,
+                    yerr=std,
+                    fmt="none",
+                    ecolor="#20262d",
+                    elinewidth=1.1,
+                    capsize=3.2,
+                    capthick=1.1,
+                    zorder=5,
+                )
+            if model_name == REFERENCE_MODEL:
+                continue
+            percentage_row = percentages_by_key.get((model_name, condition, severity))
+            relative = (
+                float(percentage_row[f"{metric}_pct_worsening_mean"])
+                if percentage_row is not None
+                else 100.0 * (value - smart_value) / max(abs(smart_value), 1.0e-12)
+            )
+            percentage_labels.append((bar, value + std, f"{relative:+.1f}%", MODEL_COLORS[model_name]))
+    low = min(plotted_lower_bounds)
+    high = max(plotted_upper_bounds)
+    span = max(high - low, high, 1.0e-12)
+    label_offset = max(0.018 * span, 1.0e-6)
+    axis.set_ylim(max(0.0, low - float(y_pad_fraction) * span), high + max(float(y_pad_fraction), 0.12) * span + label_offset)
+    for bar, top, text, color in percentage_labels:
+        axis.text(
+            bar.get_x() + bar.get_width() / 2.0,
+            top + label_offset,
+            text,
+            ha="center",
+            va="bottom",
+            fontsize=font_size * 0.85,
+            fontweight="bold",
+            color=color,
+            clip_on=False,
+        )
+    axis.set_xticks(x_centers)
+    axis.set_xticklabels([label for _condition, _severity, label in conditions], fontsize=font_size)
+    axis.set_ylabel("Combined-global relative L2", fontsize=font_size)
+    axis.yaxis.set_label_coords(-0.075, 0.5)
+    axis.tick_params(axis="y", labelsize=font_size)
+    axis.set_title("Combined-global endpoint error", fontsize=font_size, pad=12)
+    axis.grid(axis="y", alpha=0.22, linewidth=0.8, zorder=0)
+    axis.set_axisbelow(True)
+    axis.legend(
+        handles=[Patch(facecolor=MODEL_COLORS[name], edgecolor="#20262d", label=MODEL_LABELS[name]) for name in MODEL_ORDER],
+        loc="upper center", bbox_to_anchor=(0.5, 1.0), ncol=len(MODEL_ORDER),
+        frameon=False, fontsize=font_size * 0.92,
+    )
+    fig.subplots_adjust(left=0.105, right=0.985, bottom=0.15, top=0.87)
+    save_plot(fig, output)
+    plt.close(fig)
+
+
 def main() -> None:
     global _COMPUTE_PLOT_STD, MODEL_ORDER, MODEL_LABELS, MODEL_COLORS
     global REFERENCE_MODEL, REFERENCE_MODEL_LABEL, ABLATION_PREFIX, ABLATION_TABLE_TITLE
@@ -1550,15 +2134,16 @@ def main() -> None:
         geometry_density_neighbor_hops=1,
         geometry_density_cache_dtype="float16",
     )
+    candidate_universe = set(dataset.test_ids if args.candidate_split == "test" else dataset.all_ids)
     geometry_candidate_ids: set[int] | None = None
     if args.active_geometry_sources:
-        geometry_candidate_ids = {int(run_id) for run_id in dataset.test_ids}
+        geometry_candidate_ids = {int(run_id) for run_id in candidate_universe}
         for source_name in args.active_geometry_sources:
             source_ids = {
                 int(path.parent.name.split("_", 1)[1])
                 for path in (
                     geometry_source_vtp_path(source_name, run_id, geometry_vtp_dirs)
-                    for run_id in dataset.test_ids
+                    for run_id in candidate_universe
                 )
                 if path.is_file()
             }
@@ -1568,23 +2153,23 @@ def main() -> None:
                 "No test runs contain every requested VTP source. "
                 f"Sources: {args.active_geometry_sources}; factors: {geometry_factors}"
             )
-        print(f"VTP common completed subset: {len(geometry_candidate_ids)} test runs")
-    if args.run_selection == "top_angle_div10_range_ablation":
+        print(f"VTP common completed subset ({args.candidate_split} universe): {len(geometry_candidate_ids)} runs")
+    if args.run_selection in {"top_angle_div10_range_ablation", "top_pairwise_improvement"}:
         if args.run_ids:
-            raise ValueError("--run-ids cannot be combined with --run-selection top_angle_div10_range_ablation.")
-        if "angle_div10" not in args.active_geometry_sources:
+            raise ValueError("--run-ids cannot be combined with top-run selection.")
+        if args.run_selection == "top_angle_div10_range_ablation" and "angle_div10" not in args.active_geometry_sources:
             raise ValueError(
                 "Top range-ablation selection requires angle_div10 to be an active VTP source. "
                 "Use --active-geometry-sources angle --geometry-decimation-factors 10."
             )
-        available_top_candidates = sorted(int(run_id) for run_id in (geometry_candidate_ids or set(dataset.test_ids)))
+        available_top_candidates = sorted(int(run_id) for run_id in (geometry_candidate_ids or candidate_universe))
         candidate_pool_size_requested = int(args.top_selection_candidates)
         if candidate_pool_size_requested < 0:
             raise ValueError("--top-selection-candidates must be non-negative.")
         if candidate_pool_size_requested > len(available_top_candidates):
             raise ValueError(
                 f"Requested {candidate_pool_size_requested} top-selection candidates, "
-                f"but only {len(available_top_candidates)} angle_div10 candidates are available."
+                f"but only {len(available_top_candidates)} common candidates are available."
             )
         if candidate_pool_size_requested > 0 and candidate_pool_size_requested < len(available_top_candidates):
             candidate_rng = np.random.default_rng(int(args.seed) + 7101)
@@ -1600,16 +2185,137 @@ def main() -> None:
             run_ids = available_top_candidates
         if int(args.num_runs) <= 0:
             raise ValueError("--num-runs must be positive when selecting top geometries.")
-        print(f"Top-run candidate pool for angle_div10: {len(run_ids)} geometries")
+        print(f"Top-run candidate pool ({args.candidate_split} universe): {len(run_ids)} geometries")
     else:
-        run_ids = select_run_ids(dataset, args, candidate_ids=geometry_candidate_ids)
+        run_ids = select_run_ids(dataset, args, candidate_ids=geometry_candidate_ids or candidate_universe)
     print(f"Evaluating run IDs: {run_ids}")
+    if "beta" not in args.active_shifts:
+        print(
+            "Density estimation skipped: beta/inverse-density sampling is inactive for this run.",
+            flush=True,
+        )
     mean_s = dataset.mean_surf_data
     std_s = torch.clamp(dataset.std_surf_data, min=1.0e-12)
     mean_v = dataset.mean_vol_data
     std_v = torch.clamp(dataset.std_vol_data, min=1.0e-12)
     min_pos = dataset.min_pos
     max_pos = dataset.max_pos
+    top_selection_rows: List[Dict[str, object]] = []
+    candidate_pool_size = len(run_ids)
+
+    if args.run_selection == "top_pairwise_improvement":
+        if not args.top_selection_improved_model or not args.top_selection_reference_model:
+            raise ValueError(
+                "--run-selection top_pairwise_improvement requires --top-selection-improved-model "
+                "and --top-selection-reference-model."
+            )
+        screen_model_names = (
+            str(args.top_selection_improved_model),
+            str(args.top_selection_reference_model),
+        )
+        if any(name not in MODEL_ORDER for name in screen_model_names):
+            raise ValueError("Pairwise selection model keys must be active models in this experiment.")
+        selection_conditions = top_selection_conditions(
+            args.top_selection_conditions,
+            args.active_shifts,
+            levels,
+            args.active_geometry_sources,
+        )
+        screen_modes = selection_modes(modes, selection_conditions)
+
+        # The screening phase has no need to run SMART.  Replicating just the
+        # two ranked checkpoints across devices lets each GPU own a disjoint
+        # case shard, instead of leaving one GPU idle for 250 expensive cases.
+        active_screen_devices = devices[: min(len(devices), len(run_ids))]
+        screen_models_by_device: Dict[torch.device, Dict[str, torch.nn.Module]] = {}
+        for device in active_screen_devices:
+            screen_models_by_device[device] = {
+                name: build_ablation_model(
+                    configs[name], name, args.checkpoints[name], device, args.batched_query_subregion_size
+                )
+                for name in screen_model_names
+            }
+        # Contiguous shards reduce filesystem seek churn relative to round-robin
+        # dispatch while retaining an equal persistent workload per GPU.
+        screen_shards = [
+            [int(run_id) for run_id in shard]
+            for shard in np.array_split(np.asarray(run_ids, dtype=np.int64), len(active_screen_devices))
+            if len(shard)
+        ]
+        print(
+            "Pairwise screening placement: "
+            + ", ".join(
+                f"{device}->{'/'.join(screen_model_names)} ({len(shard)} cases)"
+                for device, shard in zip(active_screen_devices, screen_shards)
+            )
+            + f"; ranking modes={', '.join(str(mode['name']) for mode in screen_modes)}",
+            flush=True,
+        )
+        screening_rows: List[Dict[str, object]] = []
+        with ThreadPoolExecutor(max_workers=len(active_screen_devices)) as executor:
+            futures = [
+                executor.submit(
+                    evaluate_run_group,
+                    shard,
+                    screen_model_names,
+                    screen_models_by_device[device],
+                    device,
+                    dataset,
+                    args,
+                    screen_modes,
+                    budgets,
+                    mean_s,
+                    std_s,
+                    mean_v,
+                    std_v,
+                    min_pos,
+                    max_pos,
+                    geometry_vtp_dirs,
+                    int(args.screen_case_batch_size),
+                    f"screen {device}",
+                )
+                for device, shard in zip(active_screen_devices, screen_shards)
+            ]
+            for future in futures:
+                screening_rows.extend(future.result())
+
+        top_selection_rows = rank_top_pairwise_improvement_runs(
+            screening_rows,
+            run_ids,
+            args.top_selection_metric,
+            int(args.num_runs),
+            screen_model_names[0],
+            screen_model_names[1],
+            selection_conditions,
+            args.top_selection_min_condition_improvement_percent,
+        )
+        selected_ids = [int(row["run_id"]) for row in top_selection_rows]
+        selection_path = output_dir / "top_pairwise_improvement_selection.csv"
+        write_csv(selection_path, top_selection_rows)
+        with (output_dir / "top_pairwise_improvement_selection.json").open("w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "selection_metric": args.top_selection_metric,
+                    "candidate_pool_size": candidate_pool_size,
+                    "candidate_split": args.candidate_split,
+                    "selected_count": len(selected_ids),
+                    "selected_run_ids": selected_ids,
+                    "improved_model": screen_model_names[0],
+                    "reference_model": screen_model_names[1],
+                    "selection_conditions": [top_selection_condition_label(condition) for condition in selection_conditions],
+                    "selection_rule": "highest mean relative improvement of improved_model over reference_model across the listed conditions",
+                    "rows": top_selection_rows,
+                },
+                handle,
+                indent=2,
+            )
+        print(f"Selected top {len(selected_ids)} pairwise-improvement geometries: {selected_ids}", flush=True)
+        run_ids = selected_ids
+        del screen_models_by_device, screening_rows
+        if torch.cuda.is_available():
+            for device in active_screen_devices:
+                with torch.cuda.device(device):
+                    torch.cuda.empty_cache()
 
     model_devices = {name: devices[index % len(devices)] for index, name in enumerate(MODEL_ORDER)}
     models = {
@@ -1623,24 +2329,16 @@ def main() -> None:
 
     all_rows: List[Dict[str, object]] = []
     for run_id in tqdm(run_ids, desc="Runs", dynamic_ncols=True):
-        case = load_case(Path(args.data_root), int(run_id))
-        case["run_id"] = int(run_id)
-        query = make_query_data(case, args, min_pos, max_pos)
-        geometry_source_points: Dict[str, np.ndarray] = {}
-        geometry_source_norm: Dict[str, torch.Tensor] = {}
-        for source_name in args.active_geometry_sources:
-            source_path = geometry_source_vtp_path(source_name, int(run_id), geometry_vtp_dirs)
-            source_points = read_vtp_points(source_path)
-            validate_geometry_source_bbox(source_points, case["surf_coords"], source_name, int(run_id))
-            geometry_source_points[source_name] = source_points
-            geometry_source_norm[source_name] = normalize_pos(torch.from_numpy(source_points), min_pos, max_pos)
-        log_density = dataset._load_or_compute_full_geometry_density(
-            int(run_id), expected_n=int(case["surf_coords"].shape[0])
-        ).to(dtype=torch.float32).cpu().numpy()
-        sine_weights = {
-            "sine_y": sinusoidal_axis_probabilities(case["surf_coords"], axis=1),
-            "sine_x": sinusoidal_axis_probabilities(case["surf_coords"], axis=0),
-        }
+        (
+            case,
+            query,
+            geometry_source_norm,
+            geometry_source_points,
+            log_density,
+            sine_weights,
+        ) = prepare_run_inputs(
+            int(run_id), dataset, args, min_pos, max_pos, geometry_vtp_dirs
+        )
 
         def evaluate_group(group_names: Sequence[str]) -> List[Dict[str, object]]:
             group_rows: List[Dict[str, object]] = []
@@ -1683,8 +2381,6 @@ def main() -> None:
             int(row["view_id"]),
         ),
     )
-    top_selection_rows: List[Dict[str, object]] = []
-    candidate_pool_size = len(run_ids)
     if args.run_selection == "top_angle_div10_range_ablation":
         top_selection_rows = rank_top_range_ablation_runs(
             raw_rows,
@@ -1708,6 +2404,54 @@ def main() -> None:
                 indent=2,
             )
         print(f"Selected top {len(selected_ids)} angle_div10 geometries: {selected_ids}")
+        selected_set = set(selected_ids)
+        raw_rows = [row for row in raw_rows if int(row["run_id"]) in selected_set]
+        run_ids = selected_ids
+    elif args.run_selection == "top_pairwise_improvement" and not top_selection_rows:
+        if not args.top_selection_improved_model or not args.top_selection_reference_model:
+            raise ValueError(
+                "--run-selection top_pairwise_improvement requires --top-selection-improved-model "
+                "and --top-selection-reference-model."
+            )
+        if args.top_selection_improved_model not in MODEL_ORDER or args.top_selection_reference_model not in MODEL_ORDER:
+            raise ValueError("Pairwise selection model keys must be active models in this experiment.")
+        selection_conditions = top_selection_conditions(
+            args.top_selection_conditions,
+            args.active_shifts,
+            levels,
+            args.active_geometry_sources,
+        )
+        top_selection_rows = rank_top_pairwise_improvement_runs(
+            raw_rows,
+            run_ids,
+            args.top_selection_metric,
+            int(args.num_runs),
+            args.top_selection_improved_model,
+            args.top_selection_reference_model,
+            selection_conditions,
+            args.top_selection_min_condition_improvement_percent,
+        )
+        selected_ids = [int(row["run_id"]) for row in top_selection_rows]
+        selection_path = output_dir / "top_pairwise_improvement_selection.csv"
+        write_csv(selection_path, top_selection_rows)
+        with (output_dir / "top_pairwise_improvement_selection.json").open("w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "selection_metric": args.top_selection_metric,
+                    "candidate_pool_size": candidate_pool_size,
+                    "candidate_split": args.candidate_split,
+                    "selected_count": len(selected_ids),
+                    "selected_run_ids": selected_ids,
+                    "improved_model": args.top_selection_improved_model,
+                    "reference_model": args.top_selection_reference_model,
+                    "selection_conditions": [top_selection_condition_label(condition) for condition in selection_conditions],
+                    "selection_rule": "highest mean relative improvement of improved_model over reference_model across the listed conditions",
+                    "rows": top_selection_rows,
+                },
+                handle,
+                indent=2,
+            )
+        print(f"Selected top {len(selected_ids)} pairwise-improvement geometries: {selected_ids}")
         selected_set = set(selected_ids)
         raw_rows = [row for row in raw_rows if int(row["run_id"]) in selected_set]
         run_ids = selected_ids
@@ -1828,6 +2572,19 @@ def main() -> None:
             )
             combined_geometry_plot_paths["remeshing_average_linear"] = str(output_path)
 
+    if args.compact_endpoint_summary:
+        summary_path = output_dir / f"{ABLATION_PREFIX}_combined_global_endpoint_summary_linear.png"
+        plot_compact_endpoint_summary(
+            aggregate,
+            percentage_aggregate,
+            levels,
+            geometry_source_modes,
+            summary_path,
+            args.y_pad_fraction,
+        )
+        if summary_path.is_file():
+            combined_geometry_plot_paths["compact_endpoint_summary_linear"] = str(summary_path)
+
     table_paths = {
         metric: write_wide_metric_tables(
             output_dir,
@@ -1854,7 +2611,18 @@ def main() -> None:
         "top_selection_metric": str(args.top_selection_metric),
         "top_selection_candidate_pool_size": candidate_pool_size,
         "top_selection_candidate_pool_requested": int(args.top_selection_candidates),
-        "top_selection_rows": str(output_dir / "top_angle_div10_range_ablation_selection.csv") if top_selection_rows else None,
+        "top_selection_rows": (
+            str(output_dir / "top_angle_div10_range_ablation_selection.csv")
+            if args.run_selection == "top_angle_div10_range_ablation" and top_selection_rows
+            else str(output_dir / "top_pairwise_improvement_selection.csv")
+            if args.run_selection == "top_pairwise_improvement" and top_selection_rows
+            else None
+        ),
+        "top_selection_improved_model": args.top_selection_improved_model,
+        "top_selection_reference_model": args.top_selection_reference_model,
+        "top_selection_conditions": args.top_selection_conditions,
+        "top_selection_min_condition_improvement_percent": args.top_selection_min_condition_improvement_percent,
+        "candidate_split": args.candidate_split,
         "seed": int(args.seed),
         "encoder_input_budget": input_budget,
         "surface_query_points": int(args.surface_query_points),
@@ -1873,6 +2641,7 @@ def main() -> None:
         "compute_plot_std": bool(_COMPUTE_PLOT_STD),
         "font_scale": float(args.font_scale),
         "y_pad_fraction": float(args.y_pad_fraction),
+        "compact_endpoint_summary": bool(args.compact_endpoint_summary),
         "paper_table_paths": table_paths,
         "combined_geometry_plot_paths": combined_geometry_plot_paths,
         "reported_metric": "combined_global_rel_l2",

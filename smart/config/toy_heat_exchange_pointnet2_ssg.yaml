@@ -19,6 +19,9 @@ experiment:
     sa2_nsample: 128
     query_neighbors: 3
     centroid_sampling: "random"
+    # Training remains random and density-sensitive. Evaluation is fixed so
+    # base/SATLOSS comparisons do not contain independent centroid noise.
+    deterministic_eval_centroids: true
     density_histogram_bins: 8
     pos_scale_factor: 1.0
     query_chunk_size: 65536

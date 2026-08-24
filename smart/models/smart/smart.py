@@ -540,12 +540,50 @@ def sample_geometry(geometry, num_samples, with_replacement=False):
     return sampled_geometry
 
 
-def sample_geometry_indices(geometry, num_samples, with_replacement=False):
-    """Return the point indices used by ``sample_geometry``."""
+def sample_geometry_indices(
+    geometry,
+    num_samples,
+    with_replacement=False,
+    sampling_seeds=None,
+    seed_offset=0,
+):
+    """Return the point indices used by ``sample_geometry``.
+
+    ``sampling_seeds`` is optional and provides one deterministic seed per
+    batch item.  It is used by comparison inference so an example receives
+    identical encoder subsamples whether evaluated alone or in a packed batch.
+    The training/default path remains the original vectorized random sampler.
+    """
     n_points = int(geometry.shape[1])
     batch_size = int(geometry.shape[0])
     if num_samples <= 0 or num_samples >= n_points:
         return torch.arange(n_points, device=geometry.device, dtype=torch.long).view(1, -1).expand(batch_size, -1)
+    if sampling_seeds is not None:
+        sampling_seeds = sampling_seeds.reshape(-1)
+        if int(sampling_seeds.numel()) != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} geometry sampling seeds, got {int(sampling_seeds.numel())}."
+            )
+        sampled_indices = []
+        for seed in sampling_seeds:
+            generator = torch.Generator(device=geometry.device)
+            generator.manual_seed(int(seed.item()) + int(seed_offset))
+            if with_replacement:
+                sampled_indices.append(
+                    torch.randint(
+                        0,
+                        n_points,
+                        (num_samples,),
+                        device=geometry.device,
+                        dtype=torch.long,
+                        generator=generator,
+                    )
+                )
+            else:
+                sampled_indices.append(
+                    torch.randperm(n_points, device=geometry.device, generator=generator)[:num_samples]
+                )
+        return torch.stack(sampled_indices, dim=0)
     if with_replacement:
         return torch.randint(0, n_points, (batch_size, num_samples), device=geometry.device, dtype=torch.long)
     return torch.stack(
@@ -715,12 +753,25 @@ class SMART(nn.Module):
         categorical = self.part_projection(self.part_embedding(part_ids))
         return self.point_feature_scale * continuous + self.part_feature_scale * categorical
 
-    def encode(self, geo, params, geometry_features=None, geometry_part_ids=None, return_final=False):
+    def encode(
+        self,
+        geo,
+        params,
+        geometry_features=None,
+        geometry_part_ids=None,
+        return_final=False,
+        geometry_sampling_seeds=None,
+    ):
         # Prepare positions by scaling
         geo = geo * self.pos_scale_factor
         
         # Sample the initial latent geometry
-        latent_idx = sample_geometry_indices(geo, self.num_geo)
+        latent_idx = sample_geometry_indices(
+            geo,
+            self.num_geo,
+            sampling_seeds=geometry_sampling_seeds,
+            seed_offset=0,
+        )
         latent_geo_pos = gather_point_values(geo, latent_idx)
         latent_geo_emb = self.pos_encoder(latent_geo_pos)
         if self.point_feature_encoder is not None:
@@ -731,10 +782,14 @@ class SMART(nn.Module):
         
         # Apply encoder blocks
         intermediate_latent_geometries = []
-        for block in self.encoder_blocks:
+        for block_index, block in enumerate(self.encoder_blocks):
             # Subsample the geometry for geometry cross-attention
             sub_idx = sample_geometry_indices(
-                geo, self.subsampled_geometry_points, with_replacement=self.subsampled_geometry_with_replacement
+                geo,
+                self.subsampled_geometry_points,
+                with_replacement=self.subsampled_geometry_with_replacement,
+                sampling_seeds=geometry_sampling_seeds,
+                seed_offset=1_000_003 * (block_index + 1),
             )
             sub_geo_pos = gather_point_values(geo, sub_idx)
             sub_geo_emb = self.pos_encoder(sub_geo_pos)
@@ -797,6 +852,7 @@ class SMART(nn.Module):
         query_features=None,
         geometry_part_ids=None,
         query_part_ids=None,
+        geometry_sampling_seeds=None,
     ):
         """Forward method for SMART model.
         
@@ -813,7 +869,11 @@ class SMART(nn.Module):
         """
         # Encode
         intermediate_latent_geometries, latent_geo_pos = self.encode(
-            geo, params, geometry_features=geometry_features, geometry_part_ids=geometry_part_ids
+            geo,
+            params,
+            geometry_features=geometry_features,
+            geometry_part_ids=geometry_part_ids,
+            geometry_sampling_seeds=geometry_sampling_seeds,
         )
         
         # Prepare query positions by concatenating surface and volume query positions
@@ -848,6 +908,7 @@ class SMART(nn.Module):
         query_part_ids=None,
         volume_query_features=None,
         volume_query_part_ids=None,
+        geometry_sampling_seeds=None,
     ):
         """Sequential inference method to handle large number of query points that may not fit into GPU memory.
         
@@ -864,7 +925,11 @@ class SMART(nn.Module):
         """
         # Encode
         intermediate_latent_geometries, latent_geo_pos = self.encode(
-            geo, params, geometry_features=geometry_features, geometry_part_ids=geometry_part_ids
+            geo,
+            params,
+            geometry_features=geometry_features,
+            geometry_part_ids=geometry_part_ids,
+            geometry_sampling_seeds=geometry_sampling_seeds,
         )
         
         # Surface predictions sequentially

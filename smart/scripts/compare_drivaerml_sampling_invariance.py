@@ -1782,6 +1782,7 @@ def predict_view_batch(
     device: torch.device,
     base_seed: int,
     repeats: int,
+    geometry_sampling_seeds: torch.Tensor | None = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     batch_size = int(geo_views_norm.shape[0])
     surf_query_b = surf_query_norm.unsqueeze(0).expand(batch_size, -1, -1)
@@ -1791,6 +1792,11 @@ def predict_view_batch(
     surf_q_b = surf_query_b.to(device, non_blocking=True)
     vol_q_b = vol_query_b.to(device, non_blocking=True)
     geo_log_b = None if geo_log_density_views is None else geo_log_density_views.to(device, non_blocking=True)
+    geometry_sampling_b = (
+        None
+        if geometry_sampling_seeds is None
+        else geometry_sampling_seeds.to(device=device, dtype=torch.long, non_blocking=True)
+    )
 
     surf_acc = None
     vol_acc = None
@@ -1806,12 +1812,15 @@ def predict_view_batch(
             torch.manual_seed(seed)
         with (torch.cuda.device(device) if device.type == "cuda" else nullcontext()):
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_autocast):
+                inference_kwargs = {}
+                if geometry_sampling_b is not None:
+                    inference_kwargs["geometry_sampling_seeds"] = geometry_sampling_b
                 if model_uses_density(model_name):
                     pred_s_norm, pred_v_norm = model.inference(
-                        geo_b, surf_q_b, vol_q_b, None, geo_log_density=geo_log_b
+                        geo_b, surf_q_b, vol_q_b, None, geo_log_density=geo_log_b, **inference_kwargs
                     )
                 else:
-                    pred_s_norm, pred_v_norm = model.inference(geo_b, surf_q_b, vol_q_b, None)
+                    pred_s_norm, pred_v_norm = model.inference(geo_b, surf_q_b, vol_q_b, None, **inference_kwargs)
         pred_s = denorm_fields(pred_s_norm.cpu(), mean_s, std_s)
         pred_v = denorm_fields(pred_v_norm.cpu(), mean_v, std_v)
         surf_acc = pred_s if surf_acc is None else (surf_acc + pred_s)

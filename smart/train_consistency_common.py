@@ -47,6 +47,70 @@ def get_world_size():
     return dist.get_world_size() if is_dist_enabled() else 1
 
 
+def distributed_mean_inplace(tensor):
+    """Average a detached tensor across DDP ranks in place."""
+    if is_dist_enabled():
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor.div_(get_world_size())
+    return tensor
+
+
+def distributed_any(value, device):
+    """Return whether any DDP rank reported a boolean condition."""
+    flag = torch.tensor(int(bool(value)), device=device, dtype=torch.int32)
+    if is_dist_enabled():
+        dist.all_reduce(flag, op=dist.ReduceOp.MAX)
+    return bool(flag.item())
+
+
+def synchronize_auxiliary_gradients(module):
+    """DDP does not reduce gradients of modules kept outside the DDP wrapper."""
+    if module is None or not is_dist_enabled():
+        return
+    with torch.no_grad():
+        for parameter in module.parameters():
+            if parameter.grad is not None:
+                distributed_mean_inplace(parameter.grad)
+
+
+def module_gradients_are_finite(module):
+    if module is None:
+        return True
+    return all(
+        parameter.grad is None or bool(torch.isfinite(parameter.grad).all().item())
+        for parameter in module.parameters()
+    )
+
+
+def synchronize_model_gradients(model):
+    """Average ordinary model gradients without DDP reducer hooks.
+
+    GradNorm and layer-local ConFIG inspect per-task gradients with
+    ``autograd.grad``. PyTorch does not support combining that API with DDP's
+    reducer hooks in one iteration. These paths therefore use an explicit,
+    dtype-preserving flattened all-reduce for their ordinary weighted-model
+    backward pass instead.
+    """
+    if not is_dist_enabled():
+        return
+    gradient_groups = {}
+    for parameter in unwrap_model(model).parameters():
+        if parameter.grad is None:
+            continue
+        key = (parameter.grad.device, parameter.grad.dtype)
+        gradient_groups.setdefault(key, []).append(parameter)
+
+    with torch.no_grad():
+        for parameters in gradient_groups.values():
+            flat_gradient = torch.cat([parameter.grad.detach().reshape(-1) for parameter in parameters])
+            distributed_mean_inplace(flat_gradient)
+            offset = 0
+            for parameter in parameters:
+                size = parameter.numel()
+                parameter.grad.copy_(flat_gradient[offset:offset + size].view_as(parameter.grad))
+                offset += size
+
+
 def is_main_process():
     return get_rank() == 0
 
@@ -175,7 +239,15 @@ def config_layer_gradient(task_losses, reference_parameter, return_diagnostics=F
         gradients.append(gradient.float().reshape(-1))
 
     gradient_matrix = torch.stack(gradients, dim=0)
-    finite = bool(torch.isfinite(gradient_matrix).all().item())
+    if distributed_any(
+        not bool(torch.isfinite(gradient_matrix).all().item()),
+        gradient_matrix.device,
+    ):
+        raise FloatingPointError("ConFIG layer received non-finite task gradients.")
+    # autograd.grad bypasses DDP gradient hooks. Aggregate task gradients before
+    # the nonlinear ConFIG update so every rank takes the same optimizer step.
+    distributed_mean_inplace(gradient_matrix)
+    finite = True
     nonzero = bool((gradient_matrix.norm(dim=1) > 1.0e-12).all().item())
     ordinary_direction = gradient_matrix.sum(dim=0)
     ordinary_norm = ordinary_direction.norm()
@@ -230,40 +302,58 @@ def _config_full_update(gradient_matrix):
     space rather than parameter space.
     """
     with torch.no_grad():
-        had_nonfinite = not bool(torch.isfinite(gradient_matrix).all().item())
-        if had_nonfinite:
-            # Keep AMP enabled and skip only invalid gradient coordinates.
-            # This is intentionally a loose fallback: finite task-gradient
-            # directions still contribute, while one overflowed coordinate
-            # cannot terminate a long run.
-            torch.nan_to_num(gradient_matrix, nan=0.0, posinf=0.0, neginf=0.0, out=gradient_matrix)
+        if not bool(torch.isfinite(gradient_matrix).all().item()):
+            raise FloatingPointError("ConFIG full received non-finite task gradients.")
 
         gradient_norms = gradient_matrix.float().norm(dim=1)
-        unit_gradients = gradient_matrix.float()
-        unit_gradients.div_(gradient_norms.unsqueeze(1).clamp_min(1.0e-12))
-        zero_rows = gradient_norms <= 1.0e-12
-        unit_gradients.masked_fill_(zero_rows.unsqueeze(1), 0.0)
+        ordinary_gradient = gradient_matrix.float().sum(dim=0)
+        active_rows = gradient_norms > 1.0e-12
+        used_fallback = not bool(active_rows.all().item())
 
-        gram = unit_gradients @ unit_gradients.transpose(0, 1)
-        equal_weights = torch.ones(gradient_matrix.shape[0], device=gradient_matrix.device, dtype=gradient_matrix.dtype)
-        coefficients = torch.linalg.lstsq(gram, equal_weights).solution
-        best_direction = unit_gradients.transpose(0, 1) @ coefficients
-        best_norm = best_direction.norm()
-        unit_direction = best_direction / best_norm.clamp_min(1.0e-12)
-        unit_direction = torch.nan_to_num(unit_direction, nan=0.0, posinf=0.0, neginf=0.0)
+        if not bool(active_rows.any().item()):
+            # There is no direction to balance when every task is locally
+            # flat. Keep the mathematically correct zero ordinary gradient.
+            config_gradient = ordinary_gradient
+            min_cosine = torch.ones((), device=gradient_matrix.device, dtype=torch.float32)
+        else:
+            active_gradients = gradient_matrix.float()[active_rows]
+            active_norms = gradient_norms[active_rows]
+            unit_gradients = active_gradients / active_norms.unsqueeze(1)
+            gram = unit_gradients @ unit_gradients.transpose(0, 1)
+            equal_weights = torch.ones(
+                unit_gradients.shape[0],
+                device=gradient_matrix.device,
+                dtype=unit_gradients.dtype,
+            )
+            coefficients = torch.linalg.lstsq(gram, equal_weights).solution
+            best_direction = unit_gradients.transpose(0, 1) @ coefficients
+            best_norm = best_direction.norm()
 
-        # ProjectionLength from the reference implementation:
-        # |g_c| = sum_i <g_i, g_c / |g_c|>.
-        projection_lengths = (unit_gradients @ unit_direction) * gradient_norms
-        config_gradient = unit_direction * projection_lengths.sum()
-        min_cosine = (unit_gradients @ unit_direction).min()
+            if not bool(torch.isfinite(best_norm).item()) or float(best_norm.item()) <= 1.0e-6:
+                # Exact opposing gradients have no common descent direction.
+                # ConFIG is undefined in that case, so record and use the
+                # configured weighted objective rather than silently injecting
+                # a zero or non-finite update.
+                config_gradient = ordinary_gradient
+                min_cosine = torch.full((), -1.0, device=gradient_matrix.device, dtype=torch.float32)
+                used_fallback = True
+            else:
+                unit_direction = best_direction / best_norm
+                # ProjectionLength from the reference implementation:
+                # |g_c| = sum_i <g_i, g_c / |g_c|>.
+                projection_lengths = (unit_gradients @ unit_direction) * active_norms
+                config_gradient = unit_direction * projection_lengths.sum()
+                min_cosine = (unit_gradients @ unit_direction).min()
+
+        if not bool(torch.isfinite(config_gradient).all().item()):
+            raise FloatingPointError("ConFIG full produced a non-finite update direction.")
 
         diagnostics = {
             "mean_grad_norm": gradient_norms.mean().detach().float(),
             "direction_norm": config_gradient.norm().detach().float(),
             "min_cosine": min_cosine.detach().float(),
-            "used_fallback": torch.tensor(float(had_nonfinite), device=gradient_matrix.device),
-            "nonfinite_gradients": torch.tensor(float(had_nonfinite), device=gradient_matrix.device),
+            "used_fallback": torch.tensor(float(used_fallback), device=gradient_matrix.device),
+            "nonfinite_gradients": torch.zeros((), device=gradient_matrix.device, dtype=torch.float32),
         }
         return config_gradient, diagnostics
 
@@ -353,6 +443,15 @@ def config_full_backward(
         del gradient_rows
 
     del stacked_losses
+    # autograd.grad does not invoke DDP's reduction hooks. Reducing the task
+    # gradient matrix before ConFIG is both mathematically faithful to a global
+    # batch and guarantees identical parameter gradients on all ranks.
+    if distributed_any(
+        not bool(torch.isfinite(gradient_matrix).all().item()),
+        gradient_matrix.device,
+    ):
+        raise FloatingPointError("ConFIG full received non-finite task gradients.")
+    distributed_mean_inplace(gradient_matrix)
     config_gradient, diagnostics = _config_full_update(gradient_matrix)
     if amp_scale != 1.0:
         # The assigned parameter gradients stay AMP-scaled for the normal
@@ -366,8 +465,55 @@ def config_full_backward(
         parameter_size = parameter.numel()
         parameter.grad = config_gradient[offset:offset + parameter_size].view_as(parameter).to(dtype=parameter.dtype)
         offset += parameter_size
+    del gradient_matrix, config_gradient
 
     return diagnostics
+
+
+class GradNormBalancer(nn.Module):
+    """Minimal, checkpointable implementation of the original GradNorm state.
+
+    Task weights are updated manually from the GradNorm auxiliary objective,
+    while model parameters receive only the weighted task objective. This keeps
+    the method faithful to GradNorm without importing an unpinned third-party
+    implementation into the training process.
+    """
+
+    def __init__(
+        self,
+        num_losses,
+        loss_weights,
+        learning_rate,
+        restoring_force_alpha,
+        initial_losses_decay=1.0,
+        update_after_step=0,
+        update_every=1,
+    ):
+        super().__init__()
+        initial_weights = torch.as_tensor(loss_weights, dtype=torch.float32)
+        if initial_weights.numel() != int(num_losses):
+            raise ValueError("GradNorm loss_weights must match num_losses.")
+        if bool((initial_weights <= 0.0).any().item()):
+            raise ValueError("GradNorm loss_weights must be strictly positive.")
+        if float(learning_rate) <= 0.0:
+            raise ValueError("GradNorm learning_rate must be positive.")
+        if int(update_every) <= 0:
+            raise ValueError("GradNorm update_every must be positive.")
+
+        self.register_buffer("loss_weights", initial_weights.clone())
+        self.register_buffer("init_loss_weights_for_sum", initial_weights.clone())
+        self.register_buffer("initial_losses", torch.ones_like(initial_weights))
+        self.register_buffer("initted", torch.tensor(False, dtype=torch.bool))
+        self.register_buffer("step", torch.zeros((), dtype=torch.long))
+        self.register_buffer("loss_mask", torch.ones_like(initial_weights, dtype=torch.bool))
+        self.register_buffer("loss_weights_grad", torch.zeros_like(initial_weights))
+        self.learning_rate = float(learning_rate)
+        self.alpha = float(restoring_force_alpha)
+        self.initial_losses_decay = float(initial_losses_decay)
+        self.update_after_step = int(update_after_step)
+        self.update_every = int(update_every)
+        self.frozen = False
+        self.has_restoring_force = self.alpha > 0.0
 
 
 def external_gradnorm_backward(
@@ -381,26 +527,35 @@ def external_gradnorm_backward(
 ):
     """Apply GradNorm weight updates and the weighted model backward separately.
 
-    The upstream helper backpropagates its auxiliary GradNorm loss through the
-    model as well as through its temporary loss-weight parameters. That adds a
-    second-order model update to the task objective. We retain its state and
-    update rule, but restrict the GradNorm derivative to the temporary weights;
-    the model receives only the configured weighted task gradient.
+    GradNorm's auxiliary objective updates only the task weights. The model
+    receives the configured weighted task gradient, not an additional
+    second-order gradient from the balancing objective.
     """
     losses = torch.stack(list(losses))
     if external_gradnorm.initted.device != losses.device:
         external_gradnorm.to(losses.device)
 
+    loss_mask = external_gradnorm.loss_mask.to(device=losses.device, dtype=torch.bool)
+    if external_gradnorm.has_restoring_force:
+        if not bool(external_gradnorm.initted.item()):
+            initial_losses = losses.detach().clone()
+            distributed_mean_inplace(initial_losses)
+            external_gradnorm.initial_losses.copy_(initial_losses)
+            external_gradnorm.initted.fill_(True)
+        elif external_gradnorm.initial_losses_decay < 1.0:
+            meaned_losses = losses.detach().clone()
+            distributed_mean_inplace(meaned_losses)
+            external_gradnorm.initial_losses.lerp_(meaned_losses, 1.0 - external_gradnorm.initial_losses_decay)
+
     step = external_gradnorm.step.item()
     external_gradnorm.step.add_(int(external_gradnorm.training))
     weighted_total_loss = weighted_total_loss.float()
-
     should_update = (
         external_gradnorm.training
         and not external_gradnorm.frozen
         and step >= external_gradnorm.update_after_step
         and (step % external_gradnorm.update_every) == 0
-        and bool(external_gradnorm.loss_mask.any().item())
+        and bool(loss_mask.any().item())
     )
     if not should_update:
         model_loss = weighted_total_loss
@@ -409,44 +564,39 @@ def external_gradnorm_backward(
         model_loss.backward()
         return torch.zeros((), device=losses.device, dtype=torch.float32)
 
-    loss_mask = external_gradnorm.loss_mask.to(device=losses.device, dtype=torch.bool)
-    if external_gradnorm.has_restoring_force:
-        if not bool(external_gradnorm.initted.item()):
-            initial_losses = losses.detach().clone()
-            if is_dist_enabled():
-                dist.all_reduce(initial_losses)
-                initial_losses.div_(get_world_size())
-            external_gradnorm.initial_losses.copy_(initial_losses)
-            external_gradnorm.initted.fill_(True)
-        elif external_gradnorm.initial_losses_decay < 1.0:
-            meaned_losses = losses.detach().clone()
-            if is_dist_enabled():
-                dist.all_reduce(meaned_losses)
-                meaned_losses.div_(get_world_size())
-            external_gradnorm.initial_losses.lerp_(meaned_losses, 1.0 - external_gradnorm.initial_losses_decay)
-
     selected_losses = losses[loss_mask]
     selected_weights = nn.Parameter(external_gradnorm.loss_weights[loss_mask].detach().clone())
-    grad_norms = []
-    for weight, loss in zip(selected_weights, selected_losses):
+    base_grad_norms = []
+    for loss in selected_losses:
         gradient = torch.autograd.grad(
-            weight * loss,
+            loss,
             reference_parameter,
-            create_graph=True,
+            create_graph=False,
             retain_graph=True,
             allow_unused=True,
         )[0]
         if gradient is None:
             gradient = torch.zeros_like(reference_parameter)
-        grad_norms.append(gradient.float().norm(p=2))
-    grad_norms = torch.stack(grad_norms)
-    grad_norm_average = grad_norms.mean()
-    if is_dist_enabled():
-        dist.all_reduce(grad_norm_average)
-        grad_norm_average.div_(get_world_size())
+        # GradNorm is defined with the norm of each task gradient on the
+        # actual global batch. Autograd gradients bypass DDP hooks, so average
+        # every reference gradient before measuring its norm. The resulting
+        # norm is a constant multiplier of the temporary task weight.
+        gradient = gradient.detach().float()
+        distributed_mean_inplace(gradient)
+        base_grad_norms.append(gradient.norm(p=2))
+    base_grad_norms = torch.stack(base_grad_norms).detach()
+    if distributed_any(
+        not bool(torch.isfinite(base_grad_norms).all().item()),
+        losses.device,
+    ):
+        raise FloatingPointError("GradNorm received non-finite reference task gradients.")
+    grad_norms = selected_weights * base_grad_norms
+    grad_norm_average = grad_norms.detach().mean()
 
     if external_gradnorm.has_restoring_force:
-        loss_ratio = selected_losses.detach() / external_gradnorm.initial_losses[loss_mask].clamp_min(1.0e-8)
+        global_selected_losses = selected_losses.detach().clone()
+        distributed_mean_inplace(global_selected_losses)
+        loss_ratio = global_selected_losses / external_gradnorm.initial_losses[loss_mask].clamp_min(1.0e-8)
         relative_training_rate = F.normalize(loss_ratio, p=1, dim=0) * selected_losses.numel()
         gradient_target = (grad_norm_average * relative_training_rate.pow(-external_gradnorm.alpha)).detach()
     else:
@@ -461,6 +611,12 @@ def external_gradnorm_backward(
     )[0]
     if weight_gradient is None:
         weight_gradient = torch.zeros_like(selected_weights)
+    else:
+        weight_gradient = weight_gradient.detach()
+    # The balancer is outside DDP. Averaging its manual update keeps task
+    # weights identical across ranks even though each rank sees a distinct
+    # local minibatch.
+    distributed_mean_inplace(weight_gradient)
 
     # The weighted loss keeps a detached view of the current weight buffer.
     # Backpropagate it before updating that buffer in place.
@@ -470,10 +626,15 @@ def external_gradnorm_backward(
     model_loss.backward()
 
     with torch.no_grad():
-        updated_weights = selected_weights.detach() - weight_gradient.detach() * float(external_gradnorm.learning_rate)
+        updated_weights = selected_weights.detach() - weight_gradient * float(external_gradnorm.learning_rate)
         total_weight = external_gradnorm.init_loss_weights_for_sum[loss_mask].sum()
         if min_loss_weights is None:
-            renormalized_weights = F.normalize(updated_weights, p=1, dim=0) * total_weight
+            nonnegative_weights = updated_weights.clamp_min(0.0)
+            nonnegative_sum = nonnegative_weights.sum()
+            if bool((nonnegative_sum > 1.0e-12).item()):
+                renormalized_weights = total_weight * nonnegative_weights / nonnegative_sum
+            else:
+                renormalized_weights = torch.full_like(updated_weights, total_weight / float(updated_weights.numel()))
         else:
             floors = torch.as_tensor(
                 min_loss_weights,
@@ -493,7 +654,9 @@ def external_gradnorm_backward(
         external_gradnorm.loss_weights[loss_mask] = renormalized_weights
         external_gradnorm.loss_weights_grad[loss_mask] = 0.0
 
-    return gradnorm_loss.detach().float()
+    gradnorm_loss = gradnorm_loss.detach().float()
+    distributed_mean_inplace(gradnorm_loss)
+    return gradnorm_loss
 
 
 def setup_distributed():
@@ -1281,6 +1444,57 @@ class LearnedTaskWeighting(nn.Module):
         }
 
 
+class HomoscedasticUncertaintyWeighting(nn.Module):
+    """Kendall-style homoscedastic uncertainty weighting for regression tasks.
+
+    For task loss L_i and learned log variance s_i, the objective is
+    0.5 * (exp(-s_i) * L_i + s_i). The logarithmic term prevents the trivial
+    solution of driving every precision to zero. Base weights only initialize
+    the precision coefficients; they do not constrain the subsequent update.
+    """
+
+    def __init__(self, task_names, base_weights, min_log_variance=-3.0, max_log_variance=3.0):
+        super().__init__()
+        self.task_names = tuple(task_names)
+        base_weights_t = torch.as_tensor(base_weights, dtype=torch.float32)
+        if base_weights_t.numel() != len(self.task_names):
+            raise ValueError("Uncertainty base_weights must match the number of tasks.")
+        if bool((base_weights_t <= 0.0).any().item()):
+            raise ValueError("Uncertainty base_weights must be strictly positive.")
+        if not torch.isclose(base_weights_t.sum(), torch.tensor(1.0, dtype=torch.float32), atol=1.0e-5):
+            raise ValueError("Uncertainty base_weights must sum to 1.")
+        self.min_log_variance = float(min_log_variance)
+        self.max_log_variance = float(max_log_variance)
+        if self.max_log_variance <= self.min_log_variance:
+            raise ValueError("Uncertainty max_log_variance must exceed min_log_variance.")
+
+        # At initialization, 0.5 * exp(-s_i) equals the supplied base weight.
+        initial_log_variances = -torch.log(2.0 * base_weights_t)
+        self.log_variances = nn.Parameter(initial_log_variances)
+
+    def combine(self, losses, epoch_idx=None):
+        del epoch_idx  # The uncertainty objective has no warmup interpolation.
+        if len(losses) != len(self.task_names):
+            raise ValueError(f"Expected {len(self.task_names)} task losses, got {len(losses)}.")
+        stacked_losses = torch.stack([loss.float() for loss in losses])
+        log_variances = self.log_variances.clamp(self.min_log_variance, self.max_log_variance)
+        precisions = torch.exp(-log_variances)
+        coefficients = 0.5 * precisions
+        per_task_terms = 0.5 * (precisions * stacked_losses + log_variances)
+        normalized_coefficients = coefficients / coefficients.sum().clamp_min(1.0e-12)
+        return {
+            "total_loss": per_task_terms.sum(),
+            "weights": normalized_coefficients.detach(),
+            "coefficients": coefficients.detach(),
+            "logits": log_variances.detach(),
+            "per_task_terms": per_task_terms.detach(),
+        }
+
+    @torch.no_grad()
+    def project_(self):
+        self.log_variances.clamp_(self.min_log_variance, self.max_log_variance)
+
+
 def move_optional_tensor(x, device):
     if x is None:
         return None
@@ -1640,15 +1854,34 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
     use_config_full = task_weighting_method in {"config_full", "config-full", "configfull"}
     use_external_gradnorm = task_weighting_method in {"gradnorm_external", "external_gradnorm", "gradnorm"}
     use_fixed_sum = task_weighting_method in {"fixed_sum", "fixed-sum", "fixedsum"}
-    use_learned_task_weighting = bool(
+    use_homoscedastic_uncertainty = task_weighting_method in {
+        "uncertainty",
+        "homoscedastic_uncertainty",
+        "uncertainty_homoscedastic",
+    }
+    use_learned_task_weighting = not use_homoscedastic_uncertainty and bool(
         getattr(config, "use_learned_task_weighting", getattr(config, "use_uncertainty_weighting", False))
     )
-    if sum((use_config_layer, use_config_full, use_external_gradnorm, use_fixed_sum, use_learned_task_weighting)) > 1:
+    if sum((
+        use_config_layer,
+        use_config_full,
+        use_external_gradnorm,
+        use_fixed_sum,
+        use_homoscedastic_uncertainty,
+        use_learned_task_weighting,
+    )) > 1:
         raise ValueError(
             "Only one task weighting backend can be enabled: task_weighting_method=CONFIG, "
             "task_weighting_method=config_full, "
-            "task_weighting_method=gradnorm_external, task_weighting_method=fixed_sum, "
-            "or use_learned_task_weighting."
+            "task_weighting_method=gradnorm_external, task_weighting_method=uncertainty, "
+            "task_weighting_method=fixed_sum, or use_learned_task_weighting."
+        )
+    default_balancing_task_mode = "view_losses" if use_homoscedastic_uncertainty else "legacy_mean_worst"
+    balancing_task_mode = str(getattr(config, "balancing_task_mode", default_balancing_task_mode)).strip().lower()
+    use_view_task_losses = balancing_task_mode in {"view", "views", "view_losses", "satloss7"}
+    if balancing_task_mode not in {"view", "views", "view_losses", "satloss7", "legacy", "legacy_mean_worst", "mean_worst"}:
+        raise ValueError(
+            "balancing_task_mode must be one of view_losses or legacy_mean_worst."
         )
     scaler = make_grad_scaler(config)
     uncertainty_balancer = None
@@ -1658,10 +1891,35 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
     external_gradnorm = None
     external_gradnorm_min_weights = None
     extra_optimizer_param_groups = []
-    if use_learned_task_weighting:
-        learned_task_names = ["supervised_mean", "supervised_worst"]
-        if use_prediction_consistency:
-            learned_task_names.append("prediction_consistency")
+    balancing_task_names = (
+        ["supervised_primary", "supervised_secondary"]
+        if use_view_task_losses
+        else ["supervised_mean", "supervised_worst"]
+    )
+    if use_prediction_consistency:
+        balancing_task_names.append("prediction_consistency")
+    if use_homoscedastic_uncertainty:
+        uncertainty_balancer = HomoscedasticUncertaintyWeighting(
+            task_names=tuple(balancing_task_names),
+            base_weights=list(
+                getattr(
+                    config,
+                    "uncertainty_base_weights",
+                    getattr(config, "task_weight_base_weights", [1.0 / len(balancing_task_names)] * len(balancing_task_names)),
+                )
+            ),
+            min_log_variance=float(getattr(config, "uncertainty_log_variance_min", -3.0)),
+            max_log_variance=float(getattr(config, "uncertainty_log_variance_max", 3.0)),
+        ).to(device)
+        extra_optimizer_param_groups.append(
+            {
+                "params": list(uncertainty_balancer.parameters()),
+                "lr": float(getattr(config, "uncertainty_lr", getattr(config, "task_weight_lr", 5.0e-4))),
+                "weight_decay": 0.0,
+            }
+        )
+    elif use_learned_task_weighting:
+        learned_task_names = list(balancing_task_names)
         uncertainty_balancer = LearnedTaskWeighting(
             task_names=tuple(learned_task_names),
             init_logits=list(getattr(config, "task_weight_init_logits", [0.0] * len(learned_task_names))),
@@ -1721,19 +1979,11 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     raise ValueError("external_gradnorm_min_weights must be non-negative.")
                 if sum(external_gradnorm_min_weights) >= 1.0:
                     raise ValueError("external_gradnorm_min_weights must sum to less than 1.0.")
-            try:
-                from gradnorm_pytorch import GradNormLossWeighter
-            except ImportError as exc:
-                raise RuntimeError(
-                    "task_weighting_method=gradnorm_external requires gradnorm-pytorch. "
-                    "Install it with: python -m pip install gradnorm-pytorch"
-                ) from exc
-            external_gradnorm = GradNormLossWeighter(
+            external_gradnorm = GradNormBalancer(
                 num_losses=task_count,
                 loss_weights=config_task_weights,
                 learning_rate=float(getattr(config, "external_gradnorm_lr", 1.0e-4)),
                 restoring_force_alpha=float(getattr(config, "external_gradnorm_alpha", 0.0)),
-                grad_norm_parameters=config_reference_parameter,
                 initial_losses_decay=float(getattr(config, "external_gradnorm_initial_losses_decay", 1.0)),
                 update_after_step=int(getattr(config, "external_gradnorm_update_after_step", 0)),
                 update_every=int(getattr(config, "external_gradnorm_update_every", 1)),
@@ -1741,7 +1991,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
     if is_main_process():
         active_backend = (
             task_weighting_method
-            if use_config_layer or use_config_full or use_external_gradnorm
+            if use_config_layer or use_config_full or use_external_gradnorm or use_homoscedastic_uncertainty
             else "uncertainty"
             if use_learned_task_weighting
             else "fixed_sum"
@@ -1839,6 +2089,12 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
         )
         if is_main_process():
             print(f"[multi-gpu] Using DataParallel on {visible_gpus} GPUs.")
+    elif dist_info["enabled"] and (use_config_layer or use_config_full or use_external_gradnorm):
+        # ConFIG and GradNorm inspect task gradients with autograd.grad. DDP
+        # reducers support backward(), not this API, so these paths aggregate
+        # their task gradients and ordinary parameter gradients explicitly.
+        if is_main_process():
+            print("[multi-gpu] Adaptive gradient balancing uses explicit all-reduction (no DDP reducer wrapper).")
     elif dist_info["enabled"]:
         ddp_kwargs = {
             "device_ids": [dist_info["local_rank"]] if device.type == "cuda" else None,
@@ -1870,6 +2126,15 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
         "learned_logit_supervised_mean",
         "learned_logit_supervised_worst",
         "learned_logit_prediction_consistency",
+        "adaptive_weight_primary",
+        "adaptive_weight_secondary",
+        "adaptive_weight_prediction_consistency",
+        "adaptive_coefficient_primary",
+        "adaptive_coefficient_secondary",
+        "adaptive_coefficient_prediction_consistency",
+        "adaptive_log_scale_primary",
+        "adaptive_log_scale_secondary",
+        "adaptive_log_scale_prediction_consistency",
         "external_gradnorm_weight_primary",
         "external_gradnorm_weight_secondary",
         "external_gradnorm_weight_prediction_consistency",
@@ -2200,17 +2465,18 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     supervised_worst_soft.float(),
                     pred_consistency.float(),
                 ]
+                adaptive_task_losses = (
+                    [task_losses[0], task_losses[1]]
+                    if use_view_task_losses
+                    else [task_losses[2], task_losses[3]]
+                )
+                if use_prediction_consistency:
+                    adaptive_task_losses.append((pred_consistency_weight * task_losses[4]).float())
                 external_gradnorm_tasks = None
                 config_full_info = None
-                if use_learned_task_weighting:
-                    learned_tasks = [
-                        task_losses[2],
-                        task_losses[3],
-                    ]
-                    if use_prediction_consistency:
-                        learned_tasks.append((pred_consistency_weight * task_losses[4]).float())
+                if use_homoscedastic_uncertainty or use_learned_task_weighting:
                     uncertainty_info = uncertainty_balancer.combine(
-                        learned_tasks,
+                        adaptive_task_losses,
                         epoch_idx=ep,
                     )
                     current_task_weights = uncertainty_info["weights"].float()
@@ -2218,12 +2484,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     config_info = None
                     external_gradnorm_info = None
                 elif use_config_layer:
-                    config_tasks = [
-                        task_losses[2],
-                        task_losses[3],
-                    ]
-                    if use_prediction_consistency:
-                        config_tasks.append((pred_consistency_weight * task_losses[4]).float())
+                    config_tasks = adaptive_task_losses
                     external_gradnorm_tasks = config_tasks
                     current_task_weights = torch.tensor(config_task_weights, device=device, dtype=torch.float32)
                     weighted_total_loss = sum(
@@ -2234,12 +2495,12 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     external_gradnorm_info = None
                 elif use_config_full:
                     config_full_tasks = [
-                        config_task_weights[0] * task_losses[2],
-                        config_task_weights[1] * task_losses[3],
+                        config_task_weights[0] * adaptive_task_losses[0],
+                        config_task_weights[1] * adaptive_task_losses[1],
                     ]
                     if use_prediction_consistency:
                         config_full_tasks.append(
-                            (config_task_weights[2] * pred_consistency_weight * task_losses[4]).float()
+                            (config_task_weights[2] * adaptive_task_losses[2]).float()
                         )
                     current_task_weights = torch.tensor(config_task_weights, device=device, dtype=torch.float32)
                     weighted_total_loss = sum(config_full_tasks).float()
@@ -2248,12 +2509,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     config_full_info = {"task_losses": config_full_tasks}
                     external_gradnorm_info = None
                 elif use_external_gradnorm:
-                    external_gradnorm_tasks = [
-                        task_losses[2],
-                        task_losses[3],
-                    ]
-                    if use_prediction_consistency:
-                        external_gradnorm_tasks.append((pred_consistency_weight * task_losses[4]).float())
+                    external_gradnorm_tasks = adaptive_task_losses
                     current_task_weights = external_gradnorm.loss_weights.detach().float()
                     weighted_total_loss = sum(
                         weight * task_loss
@@ -2290,20 +2546,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                         + (pred_consistency_weight * pred_consistency if use_prediction_consistency else 0.0)
                     ).float()
 
-                config_direction = None
-                config_diagnostics = None
-                config_full_diagnostics = None
-                if config_info is not None:
-                    config_direction, config_diagnostics = config_layer_gradient(
-                        [
-                            weight * task_loss
-                            for weight, task_loss in zip(config_task_weights, config_info["task_losses"])
-                        ],
-                        config_reference_parameter,
-                        return_diagnostics=True,
-                    )
-
-                if not torch.isfinite(weighted_total_loss):
+                if distributed_any(not bool(torch.isfinite(weighted_total_loss).item()), device):
                     restore_model_buffers(model, buffer_snapshot)
                     raise FloatingPointError(
                         f"Non-finite consistency loss detected at epoch={ep} batch={batch_idx}: "
@@ -2314,46 +2557,91 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                         f"pred_consistency={float(pred_consistency.detach().item()):.6g}"
                     )
 
-                external_gradnorm_loss = weighted_total_loss.new_zeros((), dtype=torch.float32)
-                if use_config_full:
-                    config_full_diagnostics = config_full_backward(
-                        config_full_info["task_losses"],
-                        config_full_parameters,
-                        scaler=scaler,
-                        amp_enabled=amp,
-                        vectorized=bool(getattr(config, "config_full_vectorized_gradients", False)),
-                        allow_sequential_fallback=bool(
-                            getattr(config, "config_full_allow_sequential_fallback", True)
-                        ),
-                    )
-                elif use_external_gradnorm:
-                    external_gradnorm_loss = external_gradnorm_backward(
-                        external_gradnorm,
-                        external_gradnorm_tasks,
-                        config_reference_parameter,
-                        weighted_total_loss,
-                        min_loss_weights=external_gradnorm_min_weights,
-                        scaler=scaler,
-                        amp_enabled=amp,
-                    )
-                elif amp:
-                    scaler.scale(weighted_total_loss).backward()
-                else:
-                    weighted_total_loss.backward()
+                config_direction = None
+                config_diagnostics = None
+                config_full_diagnostics = None
+                try:
+                    if config_info is not None:
+                        config_direction, config_diagnostics = config_layer_gradient(
+                            [
+                                weight * task_loss
+                                for weight, task_loss in zip(config_task_weights, config_info["task_losses"])
+                            ],
+                            config_reference_parameter,
+                            return_diagnostics=True,
+                        )
+
+                    external_gradnorm_loss = weighted_total_loss.new_zeros((), dtype=torch.float32)
+                    if use_config_full:
+                        config_full_diagnostics = config_full_backward(
+                            config_full_info["task_losses"],
+                            config_full_parameters,
+                            scaler=scaler,
+                            amp_enabled=amp,
+                            vectorized=bool(getattr(config, "config_full_vectorized_gradients", False)),
+                            allow_sequential_fallback=bool(
+                                getattr(config, "config_full_allow_sequential_fallback", True)
+                            ),
+                        )
+                    elif use_external_gradnorm:
+                        external_gradnorm_loss = external_gradnorm_backward(
+                            external_gradnorm,
+                            external_gradnorm_tasks,
+                            config_reference_parameter,
+                            weighted_total_loss,
+                            min_loss_weights=external_gradnorm_min_weights,
+                            scaler=scaler,
+                            amp_enabled=amp,
+                        )
+                    elif amp:
+                        scaler.scale(weighted_total_loss).backward()
+                    else:
+                        weighted_total_loss.backward()
+                except FloatingPointError as exc:
+                    # For manually differentiated multi-task objectives, AMP
+                    # cannot discover an overflow itself. All ranks detect the
+                    # same condition above, skip this step, and lower scale.
+                    if is_main_process():
+                        print(f"[warn] {exc} at epoch {ep} batch {batch_idx}; skipping optimizer step.")
+                    restore_model_buffers(model, buffer_snapshot)
+                    optimizer.zero_grad(set_to_none=True)
+                    if amp:
+                        scaler.update(new_scale=max(1.0, 0.5 * scaler.get_scale()))
+                    continue
 
                 if amp:
                     scaler.unscale_(optimizer)
+                if use_config_layer or use_external_gradnorm:
+                    synchronize_model_gradients(model)
+                synchronize_auxiliary_gradients(uncertainty_balancer)
+                if distributed_any(not module_gradients_are_finite(uncertainty_balancer), device):
+                    if is_main_process():
+                        print(
+                            f"[warn] Non-finite adaptive-weight gradients at epoch={ep} batch={batch_idx}; "
+                            "skipping optimizer step and reducing AMP scale."
+                        )
+                    restore_model_buffers(model, buffer_snapshot)
+                    optimizer.zero_grad(set_to_none=True)
+                    if amp:
+                        scaler.update(new_scale=max(1.0, 0.5 * scaler.get_scale()))
+                    continue
                 if config_direction is not None:
                     if config_reference_parameter.grad is None:
                         config_reference_parameter.grad = config_direction.clone()
                     else:
                         config_reference_parameter.grad.copy_(config_direction)
-                gradient_stats = gradient_diagnostics(train_model) if track_gradient_diagnostics else None
-                if gradient_stats is not None and not gradient_stats["finite"]:
-                    print(
-                        f"[warn] Non-finite gradients at epoch={ep} batch={batch_idx}; "
-                        "skipping optimizer step and reducing AMP scale."
-                    )
+                # Full ConFIG assigns gradients manually, so GradScaler cannot
+                # discover an invalid direction through DDP's reducer. Always
+                # verify that path; the optional diagnostics flag only controls
+                # the additional W&B norm logging for ordinary backends.
+                require_gradient_finite_check = track_gradient_diagnostics or use_config_full
+                gradient_stats = gradient_diagnostics(train_model) if require_gradient_finite_check else None
+                if gradient_stats is not None and distributed_any(not gradient_stats["finite"], device):
+                    if is_main_process():
+                        print(
+                            f"[warn] Non-finite gradients at epoch={ep} batch={batch_idx}; "
+                            "skipping optimizer step and reducing AMP scale."
+                        )
                     restore_model_buffers(model, buffer_snapshot)
                     optimizer.zero_grad(set_to_none=True)
                     if amp:
@@ -2369,6 +2657,8 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                         scaler.update()
                 else:
                     optimizer.step()
+                if uncertainty_balancer is not None and hasattr(uncertainty_balancer, "project_"):
+                    uncertainty_balancer.project_()
                 if rollback_buffers and not model_buffers_are_finite(model):
                     restore_model_buffers(model, buffer_snapshot)
                     raise FloatingPointError(
@@ -2433,13 +2723,26 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                         secondary_shift_intensity, device=device, dtype=torch.float32
                     ) * batch_size_float
                     if uncertainty_info is not None:
-                        train_losses["learned_weight_supervised_mean"] += current_task_weights[0].detach().float() * batch_size_float
-                        train_losses["learned_weight_supervised_worst"] += current_task_weights[1].detach().float() * batch_size_float
-                        train_losses["learned_logit_supervised_mean"] += uncertainty_info["logits"][0].detach().float() * batch_size_float
-                        train_losses["learned_logit_supervised_worst"] += uncertainty_info["logits"][1].detach().float() * batch_size_float
-                        if use_prediction_consistency:
-                            train_losses["learned_weight_prediction_consistency"] += current_task_weights[2].detach().float() * batch_size_float
-                            train_losses["learned_logit_prediction_consistency"] += uncertainty_info["logits"][2].detach().float() * batch_size_float
+                        if use_view_task_losses:
+                            adaptive_coefficients = uncertainty_info.get("coefficients", current_task_weights)
+                            train_losses["adaptive_weight_primary"] += current_task_weights[0].detach().float() * batch_size_float
+                            train_losses["adaptive_weight_secondary"] += current_task_weights[1].detach().float() * batch_size_float
+                            train_losses["adaptive_coefficient_primary"] += adaptive_coefficients[0].detach().float() * batch_size_float
+                            train_losses["adaptive_coefficient_secondary"] += adaptive_coefficients[1].detach().float() * batch_size_float
+                            train_losses["adaptive_log_scale_primary"] += uncertainty_info["logits"][0].detach().float() * batch_size_float
+                            train_losses["adaptive_log_scale_secondary"] += uncertainty_info["logits"][1].detach().float() * batch_size_float
+                            if use_prediction_consistency:
+                                train_losses["adaptive_weight_prediction_consistency"] += current_task_weights[2].detach().float() * batch_size_float
+                                train_losses["adaptive_coefficient_prediction_consistency"] += adaptive_coefficients[2].detach().float() * batch_size_float
+                                train_losses["adaptive_log_scale_prediction_consistency"] += uncertainty_info["logits"][2].detach().float() * batch_size_float
+                        else:
+                            train_losses["learned_weight_supervised_mean"] += current_task_weights[0].detach().float() * batch_size_float
+                            train_losses["learned_weight_supervised_worst"] += current_task_weights[1].detach().float() * batch_size_float
+                            train_losses["learned_logit_supervised_mean"] += uncertainty_info["logits"][0].detach().float() * batch_size_float
+                            train_losses["learned_logit_supervised_worst"] += uncertainty_info["logits"][1].detach().float() * batch_size_float
+                            if use_prediction_consistency:
+                                train_losses["learned_weight_prediction_consistency"] += current_task_weights[2].detach().float() * batch_size_float
+                                train_losses["learned_logit_prediction_consistency"] += uncertainty_info["logits"][2].detach().float() * batch_size_float
                     if external_gradnorm_info is not None:
                         train_losses["external_gradnorm_weight_primary"] += current_task_weights[0].detach().float() * batch_size_float
                         train_losses["external_gradnorm_weight_secondary"] += current_task_weights[1].detach().float() * batch_size_float
@@ -2536,6 +2839,8 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                         uncertainty_values = [
                             float(current_task_weights[0].item()),
                             float(current_task_weights[1].item()),
+                            float(uncertainty_info.get("coefficients", current_task_weights)[0].item()),
+                            float(uncertainty_info.get("coefficients", current_task_weights)[1].item()),
                             float(uncertainty_info["logits"][0].item()),
                             float(uncertainty_info["logits"][1].item()),
                         ]
@@ -2543,19 +2848,34 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                             uncertainty_values.extend(
                                 [
                                     float(current_task_weights[2].item()),
+                                    float(uncertainty_info.get("coefficients", current_task_weights)[2].item()),
                                     float(uncertainty_info["logits"][2].item()),
                                 ]
                             )
                         uncertainty_log_scalars = distributed_average_scalars(uncertainty_values)
-                        uncertainty_log_dict = {
-                            "train/batch_learned_weight_supervised_mean": uncertainty_log_scalars[0],
-                            "train/batch_learned_weight_supervised_worst": uncertainty_log_scalars[1],
-                            "train/batch_learned_logit_supervised_mean": uncertainty_log_scalars[2],
-                            "train/batch_learned_logit_supervised_worst": uncertainty_log_scalars[3],
-                        }
-                        if use_prediction_consistency:
-                            uncertainty_log_dict["train/batch_learned_weight_prediction_consistency"] = uncertainty_log_scalars[4]
-                            uncertainty_log_dict["train/batch_learned_logit_prediction_consistency"] = uncertainty_log_scalars[5]
+                        if use_view_task_losses:
+                            uncertainty_log_dict = {
+                                "train/batch_adaptive_weight_primary": uncertainty_log_scalars[0],
+                                "train/batch_adaptive_weight_secondary": uncertainty_log_scalars[1],
+                                "train/batch_adaptive_coefficient_primary": uncertainty_log_scalars[2],
+                                "train/batch_adaptive_coefficient_secondary": uncertainty_log_scalars[3],
+                                "train/batch_adaptive_log_scale_primary": uncertainty_log_scalars[4],
+                                "train/batch_adaptive_log_scale_secondary": uncertainty_log_scalars[5],
+                            }
+                            if use_prediction_consistency:
+                                uncertainty_log_dict["train/batch_adaptive_weight_prediction_consistency"] = uncertainty_log_scalars[6]
+                                uncertainty_log_dict["train/batch_adaptive_coefficient_prediction_consistency"] = uncertainty_log_scalars[7]
+                                uncertainty_log_dict["train/batch_adaptive_log_scale_prediction_consistency"] = uncertainty_log_scalars[8]
+                        else:
+                            uncertainty_log_dict = {
+                                "train/batch_learned_weight_supervised_mean": uncertainty_log_scalars[0],
+                                "train/batch_learned_weight_supervised_worst": uncertainty_log_scalars[1],
+                                "train/batch_learned_logit_supervised_mean": uncertainty_log_scalars[4],
+                                "train/batch_learned_logit_supervised_worst": uncertainty_log_scalars[5],
+                            }
+                            if use_prediction_consistency:
+                                uncertainty_log_dict["train/batch_learned_weight_prediction_consistency"] = uncertainty_log_scalars[6]
+                                uncertainty_log_dict["train/batch_learned_logit_prediction_consistency"] = uncertainty_log_scalars[8]
                         if run is not None:
                             wandb.log(uncertainty_log_dict, step=global_step)
                     if external_gradnorm_info is not None and run is not None:

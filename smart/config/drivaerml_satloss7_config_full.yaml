@@ -1,0 +1,22 @@
+defaults:
+  - drivaerml_satloss7
+  - _self_
+
+experiment:
+  name: "DrivAerML_SMART_SATLOSS7_CONFIG_FULL"
+  model_name: "SMART_SATLOSS7_CONFIG_FULL"
+  model_tag: ""
+  epochs: 150
+  track_gradient_diagnostics: True
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False
+
+  # Full-network ConFIG on the three SATLOSS7 terms. Sequential task-gradient
+  # extraction is intentional: it is robust on the current CUDA/PyTorch stack.
+  task_weighting_method: "config_full"
+  use_learned_task_weighting: False
+  balancing_task_mode: "view_losses"
+  config_task_base_weights: [0.2, 0.2, 0.6]
+  config_full_vectorized_gradients: False
+  config_full_allow_sequential_fallback: True

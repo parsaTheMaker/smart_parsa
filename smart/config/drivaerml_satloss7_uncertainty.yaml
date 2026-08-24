@@ -1,0 +1,23 @@
+defaults:
+  - drivaerml_satloss7
+  - _self_
+
+experiment:
+  name: "DrivAerML_SMART_SATLOSS7_UNCERTAINTY"
+  model_name: "SMART_SATLOSS7_UNCERTAINTY"
+  model_tag: ""
+  epochs: 150
+  track_gradient_diagnostics: True
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False
+
+  # Kendall homoscedastic uncertainty weighting of the three SATLOSS7 terms:
+  # view-1 supervision, view-2 supervision, and prediction consistency.
+  task_weighting_method: "uncertainty"
+  use_learned_task_weighting: False
+  balancing_task_mode: "view_losses"
+  uncertainty_base_weights: [0.2, 0.2, 0.6]
+  uncertainty_lr: 5.e-4
+  uncertainty_log_variance_min: -3.0
+  uncertainty_log_variance_max: 3.0

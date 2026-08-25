@@ -121,6 +121,7 @@ GEOMETRY_SOURCE_LABELS = {
 _COMPUTE_PLOT_STD = True
 _PLOT_FONT_SCALE = 1.0
 _PLOT_BASE_FONT_SIZE = 15.0
+_BAR_WIDTH_SCALE = 1.0
 REFERENCE_MODEL = "SMART"
 REFERENCE_MODEL_LABEL = "SMART baseline"
 ABLATION_PREFIX = "range_ablation"
@@ -149,6 +150,58 @@ KDE_MODEL_COLORS = {
     "SMART_SATLOSS7_KDE16": "#7A5195",
     "SMART_SATLOSS7_KDE32": "#59A14F",
     "SMART_SATLOSS7_KDE64": "#E15759",
+}
+
+DEAL_MODEL_ORDER = (
+    "SMART",
+    "DEAL_FIXED",
+    "DEAL_GRADNORM",
+    "DEAL_UNCERTAINTY",
+    "DEAL_CONFIG",
+)
+DEAL_MODEL_LABELS = {
+    "SMART": "SMART baseline",
+    "DEAL_FIXED": "DeAL fixed weights",
+    "DEAL_GRADNORM": "DeAL GradNorm",
+    "DEAL_UNCERTAINTY": "DeAL uncertainty",
+    "DEAL_CONFIG": "DeAL ConFIG",
+}
+DEAL_MODEL_COLORS = {
+    "SMART": "#4C78A8",
+    "DEAL_FIXED": "#7A5195",
+    "DEAL_GRADNORM": "#F28E2B",
+    "DEAL_UNCERTAINTY": "#59A14F",
+    "DEAL_CONFIG": "#E15759",
+}
+DEAL_GEOMETRY_SOURCE_LABELS = {
+    f"angle_div{factor}": f"Feature-aware div{factor}"
+    for factor in (5, 10, 20, 40)
+} | {
+    f"isotropic_div{factor}": f"QEM div{factor}"
+    for factor in (5, 10, 20, 40)
+} | {
+    f"voxel_div{factor}": f"Voxel-grid clustering div{factor}"
+    for factor in (5, 10, 20, 40)
+}
+DEAL_GEOMETRY_METHOD_LABELS = {
+    "angle": "Feature-aware",
+    "isotropic": "QEM",
+    "voxel": "Voxel-grid clustering",
+}
+GEOMETRY_METHOD_LABELS = {
+    "angle": "Angle",
+    "isotropic": "Isotropic",
+    "voxel": "Voxel",
+}
+GEOMETRY_METHOD_FILE_SLUGS = {
+    "angle": "angle",
+    "isotropic": "isotropic",
+    "voxel": "voxel",
+}
+DEAL_GEOMETRY_METHOD_FILE_SLUGS = {
+    "angle": "feature_aware",
+    "isotropic": "qem",
+    "voxel": "voxel_grid",
 }
 
 
@@ -193,7 +246,7 @@ def apply_experiment_preset(args: argparse.Namespace) -> None:
             setattr(args, attribute, value)
 
     preset = str(args.experiment_preset)
-    if preset == "range_ablation_vtp":
+    if preset in {"range_ablation_vtp", "deal_weighting_ablation_vtp"}:
         set_default("--shift-levels", "shift_levels", "0,0.25,0.5,0.75,1.0")
         set_default("--active-shifts", "active_shifts", "beta,sine_y,sine_x")
         set_default("--active-geometry-sources", "active_geometry_sources", "angle,isotropic,voxel")
@@ -245,6 +298,7 @@ def parse_args() -> argparse.Namespace:
             "range_ablation_vtp_only",
             "legacy_25runs",
             "kde_ablation_vtp",
+            "deal_weighting_ablation_vtp",
         ),
         default="range_ablation_vtp",
         help="Named protocol preset; use explicit flags after choosing a preset to adapt the scope.",
@@ -253,9 +307,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-ids", default=None, help="Optional comma-separated explicit test run IDs.")
     parser.add_argument(
         "--run-selection",
-        choices=("random", "top_angle_div10_range_ablation", "top_pairwise_improvement"),
+        choices=("random", "top_angle_div10_range_ablation", "top_pairwise_improvement", "top_deal_mean_improvement"),
         default="random",
-        help="Select random geometries, use the legacy angle-div10 range selection, or rank a candidate pool by pairwise model improvement.",
+        help="Select random geometries, legacy range selection, pairwise improvement, or mean DeAL improvement over SMART.",
     )
     parser.add_argument(
         "--top-selection-metric",
@@ -352,6 +406,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kde16-config", default="drivaerml_satloss7_range100")
     parser.add_argument("--kde32-config", default="drivaerml_satloss7_range100_kde32_from_smart")
     parser.add_argument("--kde64-config", default="drivaerml_satloss7_range100_kde64_from_smart")
+    parser.add_argument("--deal-fixed-config", default="drivaerml_satloss7_range100")
+    parser.add_argument("--deal-gradnorm-config", default="drivaerml_satloss7_gradnorm")
+    parser.add_argument("--deal-uncertainty-config", default="drivaerml_satloss7_uncertainty")
+    parser.add_argument("--deal-config-config", default="drivaerml_satloss7_config_full")
     parser.add_argument("--smart-checkpoint", default=None)
     parser.add_argument("--range025-checkpoint", default=None)
     parser.add_argument("--range050-checkpoint", default=None)
@@ -365,6 +423,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--kde16-checkpoint", default=None)
     parser.add_argument("--kde32-checkpoint", default=None)
     parser.add_argument("--kde64-checkpoint", default=None)
+    parser.add_argument("--deal-fixed-checkpoint", default=None)
+    parser.add_argument("--deal-gradnorm-checkpoint", default=None)
+    parser.add_argument("--deal-uncertainty-checkpoint", default=None)
+    parser.add_argument("--deal-config-checkpoint", default=None)
     parser.add_argument(
         "--exclude-range500",
         action="store_true",
@@ -637,7 +699,105 @@ def rank_top_pairwise_improvement_runs(
     return ranked[: int(requested_count)]
 
 
+def rank_top_deal_mean_improvement_runs(
+    rows: Sequence[Mapping[str, object]],
+    candidate_ids: Sequence[int],
+    metric: str,
+    requested_count: int,
+    conditions: Sequence[tuple[str, float]],
+) -> List[Dict[str, object]]:
+    """Rank cases by mean SMART-relative improvement across every DeAL variant.
+
+    Each candidate receives one relative improvement for every selected
+    condition and each non-baseline DeAL model. The ranking score is their
+    arithmetic mean, so a single favorable loss balancer cannot dominate
+    selection. All values are computed on paired run/view samples.
+    """
+    deal_models = tuple(name for name in MODEL_ORDER if name != REFERENCE_MODEL)
+    grouped: Dict[tuple[str, int, str, float], List[Mapping[str, object]]] = defaultdict(list)
+    active_models = {REFERENCE_MODEL, *deal_models}
+    for row in rows:
+        model_name = str(row["model_name"])
+        shift_name = str(row["shift_name"])
+        severity = round(float(row["severity"]), 8)
+        if model_name in active_models and (shift_name, severity) in conditions:
+            grouped[(model_name, int(row["run_id"]), shift_name, severity)].append(row)
+
+    ranked: List[Dict[str, object]] = []
+    for run_id in sorted(int(value) for value in candidate_ids):
+        all_improvements: List[float] = []
+        model_scores: Dict[str, List[float]] = {model_name: [] for model_name in deal_models}
+        condition_scores: Dict[str, List[float]] = defaultdict(list)
+        complete = True
+        for condition_name, condition_severity in conditions:
+            key_severity = round(float(condition_severity), 8)
+            smart_rows = grouped.get((REFERENCE_MODEL, run_id, condition_name, key_severity), [])
+            if not smart_rows:
+                complete = False
+                break
+            smart_value = float(np.mean([float(row[metric]) for row in smart_rows]))
+            if not math.isfinite(smart_value) or abs(smart_value) < 1.0e-12:
+                complete = False
+                break
+            condition_label = top_selection_condition_label((condition_name, condition_severity))
+            for model_name in deal_models:
+                deal_rows = grouped.get((model_name, run_id, condition_name, key_severity), [])
+                if not deal_rows:
+                    complete = False
+                    break
+                deal_value = float(np.mean([float(row[metric]) for row in deal_rows]))
+                if not math.isfinite(deal_value):
+                    complete = False
+                    break
+                improvement = 100.0 * (smart_value - deal_value) / abs(smart_value)
+                all_improvements.append(improvement)
+                model_scores[model_name].append(improvement)
+                condition_scores[condition_label].append(improvement)
+            if not complete:
+                break
+        if not complete or not all_improvements:
+            continue
+        item: Dict[str, object] = {
+            "run_id": run_id,
+            "selection_metric": metric,
+            "reference_model": REFERENCE_MODEL,
+            "deal_models": list(deal_models),
+            "selection_conditions": [top_selection_condition_label(condition) for condition in conditions],
+            "mean_deal_improvement_pct": float(np.mean(all_improvements)),
+            "minimum_deal_improvement_pct": float(np.min(all_improvements)),
+        }
+        item.update({
+            f"{model_name.lower()}_mean_improvement_pct": float(np.mean(values))
+            for model_name, values in model_scores.items()
+        })
+        item.update({
+            f"{condition}_mean_deal_improvement_pct": float(np.mean(values))
+            for condition, values in condition_scores.items()
+        })
+        ranked.append(item)
+    ranked.sort(key=lambda row: (-float(row["mean_deal_improvement_pct"]), int(row["run_id"])))
+    if len(ranked) < int(requested_count):
+        raise ValueError(
+            f"DeAL top-run selection found only {len(ranked)} complete candidates, but {requested_count} were requested."
+        )
+    return ranked[: int(requested_count)]
+
+
 def checkpoint_map(args: argparse.Namespace) -> OrderedDict[str, str]:
+    if args.experiment_preset == "deal_weighting_ablation_vtp":
+        checkpoints = OrderedDict(
+            [
+                ("SMART", args.smart_checkpoint),
+                ("DEAL_FIXED", args.deal_fixed_checkpoint),
+                ("DEAL_GRADNORM", args.deal_gradnorm_checkpoint),
+                ("DEAL_UNCERTAINTY", args.deal_uncertainty_checkpoint),
+                ("DEAL_CONFIG", args.deal_config_checkpoint),
+            ]
+        )
+        missing = [name for name, path in checkpoints.items() if not path]
+        if missing:
+            raise ValueError("DeAL weighting ablation requires checkpoints for: " + ", ".join(missing))
+        return checkpoints
     if args.experiment_preset == "kde_ablation_vtp":
         checkpoints = OrderedDict(
             [
@@ -677,6 +837,16 @@ def checkpoint_map(args: argparse.Namespace) -> OrderedDict[str, str]:
 
 
 def config_map(args: argparse.Namespace) -> OrderedDict[str, str]:
+    if args.experiment_preset == "deal_weighting_ablation_vtp":
+        return OrderedDict(
+            [
+                ("SMART", args.smart_config),
+                ("DEAL_FIXED", args.deal_fixed_config),
+                ("DEAL_GRADNORM", args.deal_gradnorm_config),
+                ("DEAL_UNCERTAINTY", args.deal_uncertainty_config),
+                ("DEAL_CONFIG", args.deal_config_config),
+            ]
+        )
     if args.experiment_preset == "kde_ablation_vtp":
         return OrderedDict(
             [
@@ -1556,7 +1726,7 @@ def plot_endpoint_bars(
         means_array,
         yerr=error_values,
         capsize=3 if error_values is not None else 0,
-        width=0.525,
+        width=0.525 * _BAR_WIDTH_SCALE,
         color=[MODEL_COLORS[name] for name in MODEL_ORDER],
         edgecolor="#222222",
         linewidth=0.65,
@@ -1651,7 +1821,7 @@ def plot_endpoint_bars(
             label,
             ha="center",
             va="bottom" if value >= 0.0 else "top",
-            fontsize=font_size * 0.82,
+            fontsize=font_size,
             rotation=90 if len(label) > 7 else 0,
             clip_on=False,
         )
@@ -1700,7 +1870,7 @@ def plot_combined_geometry_source_bars(
     x = np.arange(len(present_models), dtype=np.float64)
     total_slots = len(source_modes)
     slot_pitch = 0.88 / float(max(total_slots, 1))
-    width = 0.82 / float(max(total_slots, 1))
+    width = 0.82 * _BAR_WIDTH_SCALE / float(max(total_slots, 1))
     factor_alphas = {5: 0.50, 10: 1.0, 20: 0.65, 40: 0.85}
     method_edgecolors = {
         "angle": "#222222",
@@ -1790,7 +1960,7 @@ def plot_combined_geometry_source_bars(
                     ha="center",
                     va="bottom" if (not percentage or value >= 0.0) else "top",
                     rotation=90,
-                    fontsize=geometry_font_size * 0.82,
+                    fontsize=geometry_font_size,
                     clip_on=False,
                 )
 
@@ -1936,11 +2106,11 @@ def plot_compact_endpoint_summary(
         return
 
     metric = "combined_global_rel_l2"
-    fig, axis = plt.subplots(figsize=(12.8, 6.1))
+    fig, axis = plt.subplots(figsize=(14.2, 6.1))
     font_size = ablation_font_size(1.0)
     x_centers = np.arange(len(conditions), dtype=np.float64)
-    bar_width = 0.205
-    intra_group_gap = 0.022
+    bar_width = 0.175 * _BAR_WIDTH_SCALE
+    intra_group_gap = 0.028
     offsets = (np.arange(len(MODEL_ORDER)) - 0.5 * (len(MODEL_ORDER) - 1)) * (bar_width + intra_group_gap)
     plotted_values: List[float] = []
     plotted_lower_bounds: List[float] = []
@@ -1991,8 +2161,8 @@ def plot_compact_endpoint_summary(
     low = min(plotted_lower_bounds)
     high = max(plotted_upper_bounds)
     span = max(high - low, high, 1.0e-12)
-    label_offset = max(0.018 * span, 1.0e-6)
-    axis.set_ylim(max(0.0, low - float(y_pad_fraction) * span), high + max(float(y_pad_fraction), 0.12) * span + label_offset)
+    label_offset = max(0.014 * span, 1.0e-6)
+    axis.set_ylim(max(0.0, low - float(y_pad_fraction) * span), high + max(float(y_pad_fraction), 0.14) * span + label_offset)
     for bar, top, text, color in percentage_labels:
         axis.text(
             bar.get_x() + bar.get_width() / 2.0,
@@ -2000,7 +2170,8 @@ def plot_compact_endpoint_summary(
             text,
             ha="center",
             va="bottom",
-            fontsize=font_size * 0.85,
+            rotation=90,
+            fontsize=font_size,
             fontweight="bold",
             color=color,
             clip_on=False,
@@ -2025,10 +2196,23 @@ def plot_compact_endpoint_summary(
 
 def main() -> None:
     global _COMPUTE_PLOT_STD, MODEL_ORDER, MODEL_LABELS, MODEL_COLORS
+    global _BAR_WIDTH_SCALE, GEOMETRY_SOURCE_LABELS, GEOMETRY_METHOD_LABELS, GEOMETRY_METHOD_FILE_SLUGS
     global REFERENCE_MODEL, REFERENCE_MODEL_LABEL, ABLATION_PREFIX, ABLATION_TABLE_TITLE
     args = parse_args()
     apply_experiment_preset(args)
-    if args.experiment_preset == "kde_ablation_vtp":
+    if args.experiment_preset == "deal_weighting_ablation_vtp":
+        MODEL_ORDER = DEAL_MODEL_ORDER
+        MODEL_LABELS = dict(DEAL_MODEL_LABELS)
+        MODEL_COLORS = dict(DEAL_MODEL_COLORS)
+        GEOMETRY_SOURCE_LABELS = dict(DEAL_GEOMETRY_SOURCE_LABELS)
+        GEOMETRY_METHOD_LABELS = dict(DEAL_GEOMETRY_METHOD_LABELS)
+        GEOMETRY_METHOD_FILE_SLUGS = dict(DEAL_GEOMETRY_METHOD_FILE_SLUGS)
+        _BAR_WIDTH_SCALE = 0.70
+        REFERENCE_MODEL = "SMART"
+        REFERENCE_MODEL_LABEL = "SMART baseline"
+        ABLATION_PREFIX = "deal_weighting_ablation"
+        ABLATION_TABLE_TITLE = "DeAL loss-balancing ablation"
+    elif args.experiment_preset == "kde_ablation_vtp":
         MODEL_ORDER = KDE_MODEL_ORDER
         MODEL_LABELS = dict(KDE_MODEL_LABELS)
         MODEL_COLORS = dict(KDE_MODEL_COLORS)
@@ -2037,6 +2221,7 @@ def main() -> None:
         ABLATION_PREFIX = "kde_ablation"
         ABLATION_TABLE_TITLE = "SATLOSS KDE-neighborhood ablation"
     else:
+        _BAR_WIDTH_SCALE = 1.0
         MODEL_ORDER = (
             "SMART",
             "SMART_SATLOSS7_RANGE025",
@@ -2154,7 +2339,7 @@ def main() -> None:
                 f"Sources: {args.active_geometry_sources}; factors: {geometry_factors}"
             )
         print(f"VTP common completed subset ({args.candidate_split} universe): {len(geometry_candidate_ids)} runs")
-    if args.run_selection in {"top_angle_div10_range_ablation", "top_pairwise_improvement"}:
+    if args.run_selection in {"top_angle_div10_range_ablation", "top_pairwise_improvement", "top_deal_mean_improvement"}:
         if args.run_ids:
             raise ValueError("--run-ids cannot be combined with top-run selection.")
         if args.run_selection == "top_angle_div10_range_ablation" and "angle_div10" not in args.active_geometry_sources:
@@ -2310,6 +2495,101 @@ def main() -> None:
                 indent=2,
             )
         print(f"Selected top {len(selected_ids)} pairwise-improvement geometries: {selected_ids}", flush=True)
+        run_ids = selected_ids
+        del screen_models_by_device, screening_rows
+        if torch.cuda.is_available():
+            for device in active_screen_devices:
+                with torch.cuda.device(device):
+                    torch.cuda.empty_cache()
+
+    elif args.run_selection == "top_deal_mean_improvement":
+        if args.experiment_preset != "deal_weighting_ablation_vtp":
+            raise ValueError("--run-selection top_deal_mean_improvement requires --experiment-preset deal_weighting_ablation_vtp.")
+        selection_conditions = top_selection_conditions(
+            args.top_selection_conditions,
+            args.active_shifts,
+            levels,
+            args.active_geometry_sources,
+        )
+        screen_modes = selection_modes(modes, selection_conditions)
+        screen_model_names = list(MODEL_ORDER)
+        active_screen_devices = devices[: min(len(devices), len(screen_model_names))]
+        screen_assignments: Dict[torch.device, List[str]] = defaultdict(list)
+        for index, model_name in enumerate(screen_model_names):
+            screen_assignments[active_screen_devices[index % len(active_screen_devices)]].append(model_name)
+        screen_models_by_device: Dict[torch.device, Dict[str, torch.nn.Module]] = {}
+        for device, assigned_models in screen_assignments.items():
+            screen_models_by_device[device] = {
+                name: build_ablation_model(
+                    configs[name], name, args.checkpoints[name], device, args.batched_query_subregion_size
+                )
+                for name in assigned_models
+            }
+        print(
+            "DeAL screening placement: "
+            + ", ".join(
+                f"{device}->{'/'.join(assigned_models)} ({len(run_ids)} cases)"
+                for device, assigned_models in screen_assignments.items()
+            )
+            + f"; ranking modes={', '.join(str(mode['name']) for mode in screen_modes)}",
+            flush=True,
+        )
+        screening_rows: List[Dict[str, object]] = []
+        with ThreadPoolExecutor(max_workers=len(screen_assignments)) as executor:
+            futures = [
+                executor.submit(
+                    evaluate_run_group,
+                    run_ids,
+                    assigned_models,
+                    screen_models_by_device[device],
+                    device,
+                    dataset,
+                    args,
+                    screen_modes,
+                    budgets,
+                    mean_s,
+                    std_s,
+                    mean_v,
+                    std_v,
+                    min_pos,
+                    max_pos,
+                    geometry_vtp_dirs,
+                    int(args.screen_case_batch_size),
+                    f"screen {device}",
+                )
+                for device, assigned_models in screen_assignments.items()
+            ]
+            for future in futures:
+                screening_rows.extend(future.result())
+
+        top_selection_rows = rank_top_deal_mean_improvement_runs(
+            screening_rows,
+            run_ids,
+            args.top_selection_metric,
+            int(args.num_runs),
+            selection_conditions,
+        )
+        selected_ids = [int(row["run_id"]) for row in top_selection_rows]
+        selection_path = output_dir / "top_deal_mean_improvement_selection.csv"
+        write_csv(selection_path, top_selection_rows)
+        with (output_dir / "top_deal_mean_improvement_selection.json").open("w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "selection_metric": args.top_selection_metric,
+                    "candidate_pool_size": candidate_pool_size,
+                    "candidate_split": args.candidate_split,
+                    "selected_count": len(selected_ids),
+                    "selected_run_ids": selected_ids,
+                    "reference_model": REFERENCE_MODEL,
+                    "deal_models": [name for name in MODEL_ORDER if name != REFERENCE_MODEL],
+                    "selection_conditions": [top_selection_condition_label(condition) for condition in selection_conditions],
+                    "selection_rule": "highest mean SMART-relative improvement across every DeAL model and listed condition",
+                    "rows": top_selection_rows,
+                },
+                handle,
+                indent=2,
+            )
+        print(f"Selected top {len(selected_ids)} mean-DeAL-improvement geometries: {selected_ids}", flush=True)
         run_ids = selected_ids
         del screen_models_by_device, screening_rows
         if torch.cuda.is_available():
@@ -2506,34 +2786,35 @@ def main() -> None:
             ]
             if not method_modes:
                 continue
+            method_slug = GEOMETRY_METHOD_FILE_SLUGS.get(method, method)
             for log_scale, scale_slug in ((True, "log"), (False, "linear")):
-                output_path = output_dir / f"{ABLATION_PREFIX}_combined_global_endpoint_bars_{method}_{scale_slug}.png"
+                output_path = output_dir / f"{ABLATION_PREFIX}_combined_global_endpoint_bars_{method_slug}_{scale_slug}.png"
                 plot_combined_geometry_source_bars(
                     aggregate,
                     percentage_aggregate,
                     method_modes,
                     output_path,
-                    f"Combined global error ({method.title()} remeshing, {scale_slug} scale)",
+                    f"Combined global error ({GEOMETRY_METHOD_LABELS.get(method, method.title())} remeshing, {scale_slug} scale)",
                     log_scale=log_scale,
                     percentage=False,
                     show_std=_COMPUTE_PLOT_STD,
                     y_pad_fraction=args.y_pad_fraction,
                 )
-                combined_geometry_plot_paths[f"{method}_{scale_slug}"] = str(output_path)
+                combined_geometry_plot_paths[f"{method_slug}_{scale_slug}"] = str(output_path)
             relative_reference_slug = "smart" if REFERENCE_MODEL == "SMART" else "reference"
-            output_path = output_dir / f"{ABLATION_PREFIX}_combined_global_relative_vs_{relative_reference_slug}_{method}.png"
+            output_path = output_dir / f"{ABLATION_PREFIX}_combined_global_relative_vs_{relative_reference_slug}_{method_slug}.png"
             plot_combined_geometry_source_bars(
                 aggregate,
                 percentage_aggregate,
                 method_modes,
                 output_path,
-                f"Combined global relative difference from {REFERENCE_MODEL_LABEL} ({method.title()} remeshing)",
+                f"Combined global relative difference from {REFERENCE_MODEL_LABEL} ({GEOMETRY_METHOD_LABELS.get(method, method.title())} remeshing)",
                 log_scale=False,
                 percentage=True,
                 show_std=False,
                 y_pad_fraction=args.y_pad_fraction,
             )
-            combined_geometry_plot_paths[f"{method}_relative_vs_smart"] = str(output_path)
+            combined_geometry_plot_paths[f"{method_slug}_relative_vs_smart"] = str(output_path)
 
         average_factors = sorted(
             {
@@ -2564,7 +2845,7 @@ def main() -> None:
                 average_percentage,
                 average_source_modes,
                 output_path,
-                "Combined global error (average of angle/isotropic/voxel remeshing, linear scale)",
+                "Combined global error (average across the three remeshing methods, linear scale)",
                 log_scale=False,
                 percentage=False,
                 show_std=_COMPUTE_PLOT_STD,
@@ -2616,6 +2897,8 @@ def main() -> None:
             if args.run_selection == "top_angle_div10_range_ablation" and top_selection_rows
             else str(output_dir / "top_pairwise_improvement_selection.csv")
             if args.run_selection == "top_pairwise_improvement" and top_selection_rows
+            else str(output_dir / "top_deal_mean_improvement_selection.csv")
+            if args.run_selection == "top_deal_mean_improvement" and top_selection_rows
             else None
         ),
         "top_selection_improved_model": args.top_selection_improved_model,

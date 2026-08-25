@@ -446,10 +446,11 @@ def _gpu_voxel_remesh(torch, points, faces, voxel_size, face_chunk_size):
     counts = torch.bincount(point_cluster, minlength=cluster_count).to(dtype=torch.float32)
     centroids = centroids / counts.clamp_min(1.0).unsqueeze(1)
 
-    max_key = torch.iinfo(torch.int64).max
-    if cluster_count > int(max_key ** (1.0 / 3.0)):
-        raise RuntimeError("CUDA voxel cluster index range is too large for exact face keys.")
-    face_keys = []
+    # A former implementation encoded each sorted triangle as a base-N int64
+    # key.  DrivAerML can retain more than 2.1M clusters, for which N**3
+    # overflows int64.  Keep the three indices instead: torch.unique(dim=0)
+    # is exact and remains entirely on CUDA.
+    face_chunks = []
     num_faces = int(faces.shape[0])
     for start in range(0, num_faces, int(face_chunk_size)):
         mapped = point_cluster[faces[start:start + int(face_chunk_size)]]
@@ -457,19 +458,12 @@ def _gpu_voxel_remesh(torch, points, faces, voxel_size, face_chunk_size):
         valid = (mapped[:, 0] < mapped[:, 1]) & (mapped[:, 1] < mapped[:, 2])
         mapped = mapped[valid]
         if mapped.numel() > 0:
-            key = (mapped[:, 0] * cluster_count + mapped[:, 1]) * cluster_count + mapped[:, 2]
-            face_keys.append(key)
+            face_chunks.append(torch.unique(mapped, dim=0))
         del mapped, valid
-    if not face_keys:
+    if not face_chunks:
         raise RuntimeError("CUDA voxel remeshing produced no non-degenerate faces.")
-    unique_keys = torch.unique(torch.cat(face_keys), sorted=True)
-    del face_keys, point_cluster, counts
-    square = cluster_count * cluster_count
-    face_a = unique_keys // square
-    remainder = unique_keys - face_a * square
-    face_b = remainder // cluster_count
-    face_c = remainder - face_b * cluster_count
-    remapped_faces = torch.stack((face_a, face_b, face_c), dim=1).to(torch.int64)
+    remapped_faces = torch.unique(torch.cat(face_chunks, dim=0), dim=0)
+    del face_chunks, point_cluster, counts
     # Voxel vertex merging can make more than two source triangles share an
     # edge. Remove only the excess incident triangles on CUDA so the output
     # does not contain non-manifold edges before it is handed back to VTK.
@@ -523,7 +517,7 @@ def _gpu_voxel_remesh(torch, points, faces, voxel_size, face_chunk_size):
     )
     output_points = centroids[used_clusters]
     output_faces = compact_faces.reshape(-1, 3)
-    del unique_keys, face_a, face_b, face_c, remainder, remapped_faces, used_clusters, compact_faces, centroids
+    del remapped_faces, used_clusters, compact_faces, centroids
     return output_points, output_faces
 
 

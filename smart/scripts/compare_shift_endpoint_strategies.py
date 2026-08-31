@@ -78,7 +78,7 @@ DATASET_DEFAULTS = {
 MODEL_ORDER = ("base", "satloss", "downsample", "gaussian_ball_masked", "box_masked")
 MODEL_LABELS = {
     "base": "SMART",
-    "satloss": "SATLOSS",
+    "satloss": "DeAL",
     "downsample": "Downsample",
     "gaussian_ball_masked": "Gaussian-ball mask",
     "box_masked": "Box mask",
@@ -127,6 +127,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-chunk-size", type=int, default=65536)
     parser.add_argument("--devices", default="cuda:0")
     parser.add_argument("--geometry-decimation-factors", default="5,10")
+    parser.add_argument(
+        "--geometry-label-preset",
+        choices=("legacy", "v4"),
+        default="legacy",
+        help="Use 'v4' for feature-aware, QEM, and voxel-grid-clustering remesh summaries.",
+    )
     parser.add_argument("--plot-scales", default="linear,log")
     parser.add_argument("--font-scale", type=float, default=1.0)
     parser.add_argument("--no-std", action="store_true")
@@ -296,6 +302,26 @@ def improvement_percent(base: float, current: float) -> float:
 def normalize_study_summary(summary: dict) -> dict:
     """Accept both legacy flat records and the newer case-oriented summary."""
     if "records" in summary:
+        records = summary["records"]
+        # v4 emits one record per (case, method, factor), whereas this script
+        # consumes a per-case map of source names to VTP paths.
+        if records and "outputs" not in records[0] and "case_id" in records[0]:
+            aliases = {"feature": "angle", "quadric": "isotropic", "voxel": "voxel"}
+            by_case: dict[int, dict[str, str]] = {}
+            for item in records:
+                if str(item.get("status", "ok")) != "ok":
+                    continue
+                method = aliases.get(str(item.get("method", "")))
+                factor = item.get("factor")
+                output = item.get("output")
+                if method is not None and factor is not None and output is not None:
+                    by_case.setdefault(int(item["case_id"]), {})[f"{method}_div{int(factor)}"] = str(output)
+            normalized = dict(summary)
+            normalized["records"] = [
+                {"run_id": case_id, "outputs": outputs}
+                for case_id, outputs in sorted(by_case.items())
+            ]
+            return normalized
         return summary
     cases = summary.get("cases")
     if not isinstance(cases, list):
@@ -316,7 +342,7 @@ def normalize_study_summary(summary: dict) -> dict:
 
 
 def select_top_candidates(rows: list[dict], top_k: int) -> tuple[list[int], list[dict]]:
-    """Rank cases by SATLOSS improvement over the best classical strategy.
+    """Rank cases by DeAL improvement over the best classical strategy.
 
     For each case and endpoint, the classical reference is the lowest error
     among downsample, Gaussian-ball masking, and box masking.  The candidate
@@ -372,7 +398,7 @@ def select_top_candidates(rows: list[dict], top_k: int) -> tuple[list[int], list
     selected = ranking[: int(top_k)]
     if len(selected) < int(top_k):
         raise ValueError(
-            f"Only {len(selected)} candidates had positive aggregate SATLOSS improvement "
+            f"Only {len(selected)} candidates had positive aggregate DeAL improvement "
             f"over the best classical strategy; cannot select top {top_k}."
         )
     return [int(item["run_id"]) for item in selected], selected
@@ -685,8 +711,9 @@ def main() -> int:
     method_groups = OrderedDict(
         (prefix, tuple(f"{prefix}_div{factor}" for factor in sorted(factors))) for prefix in remesh_prefixes
     )
+    v4_labels = {"angle": "Feature-aware", "isotropic": "QEM", "voxel": "Voxel-grid clustering"}
     method_labels = {
-        prefix: f"{prefix.capitalize()} ({'+'.join(f'div{factor}' for factor in sorted(factors))})"
+        prefix: f"{(v4_labels[prefix] if args.geometry_label_preset == 'v4' else prefix.capitalize())} ({'+'.join(f'div{factor}' for factor in sorted(factors))})"
         for prefix in remesh_prefixes
     }
 
@@ -804,7 +831,7 @@ def main() -> int:
                 "pool_run_ids": pool_run_ids,
                 "selected_run_ids": selected_run_ids,
                 "top_k": args.top_k,
-                "criterion": "mean over sine_x_1, sine_y_1, remeshing_div5_mean, and remeshing_div10_mean of SATLOSS improvement over the best of downsample, gaussian_ball_masked, and box_masked",
+                "criterion": "mean over sine_x_1, sine_y_1, remeshing_div5_mean, and remeshing_div10_mean of DeAL improvement over the best of downsample, gaussian_ball_masked, and box_masked",
                 "ranking": selection,
             },
             indent=2,
@@ -821,7 +848,7 @@ def main() -> int:
     stats = category_stats(selected_rows)
     source_stats = grouped_stats(selected_rows, tuple(active_sources), "source")
     source_labels = {
-        source: f"{source.split('_')[0].capitalize()} div{source.rsplit('div', 1)[1]}"
+        source: f"{(v4_labels[source.split('_')[0]] if args.geometry_label_preset == 'v4' else source.split('_')[0].capitalize())} div{source.rsplit('div', 1)[1]}"
         for source in active_sources
     }
     method_stats = grouped_stats(selected_rows, tuple(method_groups), "remeshing_method")

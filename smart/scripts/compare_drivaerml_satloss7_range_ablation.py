@@ -87,13 +87,13 @@ MODEL_ORDER = (
 )
 MODEL_LABELS = {
     "SMART": "SMART baseline",
-    "SMART_SATLOSS7_RANGE025": "SATLOSS [0, 0.25]",
-    "SMART_SATLOSS7_RANGE050": "SATLOSS [0, 0.50]",
-    "SMART_SATLOSS7_RANGE075": "SATLOSS [0, 0.75]",
-    "SMART_SATLOSS7": "SATLOSS [0, 1.00]",
-    "SMART_SATLOSS7_RANGE200": "SATLOSS [0, 2.00]",
-    "SMART_SATLOSS7_RANGE300": "SATLOSS [0, 3.00]",
-    "SMART_SATLOSS7_RANGE500": "SATLOSS [0, 5.00]",
+    "SMART_SATLOSS7_RANGE025": "DeAL [0, 0.25]",
+    "SMART_SATLOSS7_RANGE050": "DeAL [0, 0.50]",
+    "SMART_SATLOSS7_RANGE075": "DeAL [0, 0.75]",
+    "SMART_SATLOSS7": "DeAL [0, 1.00]",
+    "SMART_SATLOSS7_RANGE200": "DeAL [0, 2.00]",
+    "SMART_SATLOSS7_RANGE300": "DeAL [0, 3.00]",
+    "SMART_SATLOSS7_RANGE500": "DeAL [0, 5.00]",
 }
 MODEL_COLORS = {
     "SMART": "#4C78A8",
@@ -125,7 +125,7 @@ _BAR_WIDTH_SCALE = 1.0
 REFERENCE_MODEL = "SMART"
 REFERENCE_MODEL_LABEL = "SMART baseline"
 ABLATION_PREFIX = "range_ablation"
-ABLATION_TABLE_TITLE = "SMART SATLOSS range ablation"
+ABLATION_TABLE_TITLE = "SMART DeAL range ablation"
 
 KDE_MODEL_ORDER = (
     "SMART",
@@ -137,11 +137,11 @@ KDE_MODEL_ORDER = (
 )
 KDE_MODEL_LABELS = {
     "SMART": "SMART baseline",
-    "SMART_SATLOSS7_KDE4": "SATLOSS KDE k=4",
-    "SMART_SATLOSS7_KDE8": "SATLOSS KDE k=8",
-    "SMART_SATLOSS7_KDE16": "SATLOSS KDE k=16 (reference)",
-    "SMART_SATLOSS7_KDE32": "SATLOSS KDE k=32",
-    "SMART_SATLOSS7_KDE64": "SATLOSS KDE k=64",
+    "SMART_SATLOSS7_KDE4": "DeAL KDE k=4",
+    "SMART_SATLOSS7_KDE8": "DeAL KDE k=8",
+    "SMART_SATLOSS7_KDE16": "DeAL KDE k=16 (reference)",
+    "SMART_SATLOSS7_KDE32": "DeAL KDE k=32",
+    "SMART_SATLOSS7_KDE64": "DeAL KDE k=64",
 }
 KDE_MODEL_COLORS = {
     "SMART": "#4C78A8",
@@ -384,6 +384,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--angle-decimated-vtp-dir", default="/mnt/ssdraid/parsa/drivaerml_surface_vtp_decimated")
     parser.add_argument("--isotropic-decimated-vtp-dir", default="/mnt/ssdraid/parsa/drivaerml_surface_vtp_isotropic_gpu")
     parser.add_argument("--voxel-decimated-vtp-dir", default="/mnt/ssdraid/parsa/drivaerml_surface_vtp_voxel_quadric_clustered")
+    parser.add_argument(
+        "--geometry-label-preset",
+        choices=("legacy", "v4"),
+        default="legacy",
+        help="Use 'v4' for feature-aware, QEM, and voxel-grid-clustering remesh inputs.",
+    )
     parser.add_argument("--plot-scales", default="log,linear", help="Absolute-error plot scales, comma-separated.")
     parser.add_argument("--font-scale", type=float, default=1.2)
     parser.add_argument("--y-pad-fraction", type=float, default=0.10, help="Fractional vertical padding on every plot y-axis.")
@@ -2219,7 +2225,7 @@ def main() -> None:
         REFERENCE_MODEL = "SMART"
         REFERENCE_MODEL_LABEL = "SMART baseline"
         ABLATION_PREFIX = "kde_ablation"
-        ABLATION_TABLE_TITLE = "SATLOSS KDE-neighborhood ablation"
+        ABLATION_TABLE_TITLE = "DeAL KDE-neighborhood ablation"
     else:
         _BAR_WIDTH_SCALE = 1.0
         MODEL_ORDER = (
@@ -2235,7 +2241,11 @@ def main() -> None:
         REFERENCE_MODEL = "SMART"
         REFERENCE_MODEL_LABEL = "SMART baseline"
         ABLATION_PREFIX = "range_ablation"
-        ABLATION_TABLE_TITLE = "SMART SATLOSS range ablation"
+        ABLATION_TABLE_TITLE = "SMART DeAL range ablation"
+    if args.geometry_label_preset == "v4":
+        GEOMETRY_SOURCE_LABELS = dict(DEAL_GEOMETRY_SOURCE_LABELS)
+        GEOMETRY_METHOD_LABELS = dict(DEAL_GEOMETRY_METHOD_LABELS)
+        GEOMETRY_METHOD_FILE_SLUGS = dict(DEAL_GEOMETRY_METHOD_FILE_SLUGS)
     if args.exclude_range500:
         MODEL_ORDER = tuple(name for name in MODEL_ORDER if name != "SMART_SATLOSS7_RANGE500")
     configure_plot_style(args.font_scale)
@@ -2677,7 +2687,7 @@ def main() -> None:
                     "candidate_pool_size": candidate_pool_size,
                     "selected_count": len(selected_ids),
                     "selected_run_ids": selected_ids,
-                    "selection_rule": "lowest mean SMART-relative combined error across SATLOSS ranges 0.25, 0.50, and 0.75 on angle_div10",
+                    "selection_rule": "lowest mean SMART-relative combined error across DeAL ranges 0.25, 0.50, and 0.75 on angle_div10",
                     "rows": top_selection_rows,
                 },
                 handle,

@@ -1,0 +1,32 @@
+defaults:
+  - pump
+  - _self_
+
+experiment:
+  name: "PUMP_SMART_DOWNSAMPLE"
+  model_name: "SMART_PUMP_DOWNSAMPLE"
+  model_tag: ""
+
+  geometry_epoch_seeded_sampling: False
+  num_body_points: 0
+  view_geometry_points: 16384
+  primary_view_geometry_points: 16384
+  secondary_view_geometry_points: 4096
+  secondary_view_subsampled_geometry_points: 512
+  eval_aligned_view_geometry_points: 16384
+  eval_shifted_view_geometry_points: 4096
+  eval_shifted_subsampled_geometry_points: 512
+  train_shared_shift_sampling_mode: ""
+  train_primary_sampling_mode: "uniform_wor"
+  train_secondary_sampling_mode: "uniform_wor"
+  eval_aligned_sampling_mode: "uniform_wor"
+  eval_shifted_sampling_mode: "uniform_wor"
+
+  prediction_consistency_weight: 1.0
+  prediction_consistency_smooth_l1_beta: 0.05
+  use_latent_consistency: False
+  consistency_warmup_epochs: 30
+  fuse_consistency_views: False
+  task_weighting_method: "fixed_sum"
+  config_task_base_weights: [0.2, 0.2, 0.6]
+  fixed_sum_use_view_losses: True

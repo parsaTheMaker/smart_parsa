@@ -24,8 +24,10 @@ datasets = {"ShapeNetCar": {"dataset": ShapeNetCarDataset, "spatial_dim": 3, "su
 
 
 def _uses_geometry_density(model_name):
-    model_name = str(model_name)
-    return model_name.startswith("SMART_SATLOSS") or "_SATLOSS" in model_name
+    model_name = str(model_name).upper()
+    # DeAL is the current name for the density-aware SATLOSS training path.
+    # Keep the legacy SATLOSS matching so historical experiments remain valid.
+    return "SATLOSS" in model_name or "DEAL" in model_name
 
 
 def get_dataset(config):

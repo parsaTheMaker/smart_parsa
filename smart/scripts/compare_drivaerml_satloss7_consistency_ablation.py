@@ -2,7 +2,7 @@
 """SMART consistency-loss ablation with the established KDE/range plots.
 
 The plotting and aggregation engine is the same one used by the KDE
-ablation. Its two SATLOSS slots are mapped here to the consistency-enabled
+ablation. Its two DeAL slots are mapped here to the consistency-enabled
 and no-consistency range-100 checkpoints, so this experiment gets the same
 endpoint bars, remeshing bars, tables, colors, fonts, and percentage labels.
 """
@@ -67,15 +67,29 @@ def _consistency_config_map(args):
 
 
 def _translate_cli_aliases() -> None:
-    """Expose descriptive options while reusing the range engine parser."""
+    """Expose descriptive options while reusing the range engine parser.
+
+    Older consistency commands accepted representative-VTK and plot-worker
+    options from the general comparison driver.  The range engine has no VTK
+    export phase and renders serially, so consume those legacy no-op options
+    here instead of failing after a long evaluation command has been prepared.
+    """
     aliases = {
         "--w-consistency-config": "--kde4-config",
         "--w-consistency-checkpoint": "--kde4-checkpoint",
         "--wo-consistency-config": "--kde8-config",
         "--wo-consistency-checkpoint": "--kde8-checkpoint",
     }
+    ignored_value_options = {"--vtk-run-id", "--plot-workers"}
     translated = []
-    for token in sys.argv[1:]:
+    tokens = iter(sys.argv[1:])
+    for token in tokens:
+        if token in ignored_value_options:
+            # These two options always take one positional value.
+            next(tokens, None)
+            continue
+        if any(token.startswith(option + "=") for option in ignored_value_options):
+            continue
         replacement = token
         for source, target in aliases.items():
             if token == source:
@@ -107,7 +121,7 @@ def _rename_outputs(output_dir: Path) -> None:
         text = path.read_text(encoding="utf-8")
         text = text.replace("kde_ablation", "consistency_ablation")
         text = text.replace("kde_ablation_vtp", "consistency_ablation_vtp")
-        text = text.replace("SATLOSS KDE-neighborhood ablation", "SMART consistency-loss ablation")
+        text = text.replace("DeAL KDE-neighborhood ablation", "SMART consistency-loss ablation")
         path.write_text(text, encoding="utf-8")
 
 

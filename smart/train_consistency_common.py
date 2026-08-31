@@ -27,6 +27,7 @@ from utils.utils import (
     initialize_gpu,
     initialize_wandb,
     make_grad_scaler,
+    prepare_native_ddp_reducer,
     print_point_budget,
     reset_scheduler_for_extension,
 )
@@ -1734,6 +1735,10 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
         "local_rank": 0,
         "world_size": 1,
     }
+    # AdamW imports TorchDynamo internally in this PyTorch build. Install the
+    # eager fallback before optimizer construction, regardless of GPU mode.
+    if prepare_native_ddp_reducer() and is_main_process():
+        print("[torch] TorchDynamo unavailable; using eager execution.")
     run = initialize_wandb(config, wandb_config) if is_main_process() else None
 
     device = initialize_gpu(config.random_seed, high_precision=False)

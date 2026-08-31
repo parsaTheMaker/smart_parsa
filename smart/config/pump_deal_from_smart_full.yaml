@@ -1,0 +1,31 @@
+defaults:
+  - pump_satloss7
+  - _self_
+
+experiment:
+  name: "PUMP_DEAL_FROM_SMART_FULL"
+  model_name: "SMART_PUMP_DEAL"
+  model_tag: "full-from-smart-150ep"
+  epochs: 150
+  batch_size: 1
+
+  # DeAL trains only on independently sampled inverse-density views. Sine
+  # redistributions and remeshed surfaces remain evaluation-only shifts.
+  geometry_epoch_seeded_sampling: False
+  num_body_points: 0
+  view_geometry_points: 16384
+  primary_view_geometry_points: 16384
+  secondary_view_geometry_points: 16384
+  shared_shift_view_geometry_points: 0
+  train_shared_shift_sampling_mode: ""
+  train_primary_sampling_mode: "inverse_density_wor"
+  train_secondary_sampling_mode: "inverse_density_wor"
+  randomize_primary_inverse_density_beta: True
+  primary_inverse_density_beta_min: 0.0
+  primary_inverse_density_beta_max: 1.0
+  randomize_secondary_inverse_density_beta: True
+  secondary_inverse_density_beta_min: 0.0
+  secondary_inverse_density_beta_max: 1.0
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False

@@ -134,7 +134,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pump-repo-id", default="luminary-shift/Pump-sample")
     parser.add_argument("--pump-revision", default="main")
-    parser.add_argument("--pump-count", type=int, default=100)
+    parser.add_argument(
+        "--pump-count",
+        type=int,
+        default=100,
+        help="Number of sequential Pump samples to fetch when sources are absent; use 0 to remesh every local source mesh.",
+    )
     parser.add_argument(
         "--delete-pump-source-after-success",
         action="store_true",
@@ -528,7 +533,15 @@ def source_paths(args: argparse.Namespace, root: Path) -> list[Path]:
     if args.dataset == "pump":
         requested_ids = {int(item.strip()) for item in args.case_ids.split(",") if item.strip()}
         if not requested_ids:
-            requested_ids = set(range(1, int(args.pump_count) + 1))
+            if int(args.pump_count) > 0:
+                requested_ids = set(range(1, int(args.pump_count) + 1))
+            else:
+                paths = sorted(root.glob(DATASET_DEFAULTS[args.dataset]["pattern"]))
+                if args.max_cases > 0:
+                    paths = paths[: int(args.max_cases)]
+                if not paths:
+                    raise FileNotFoundError(f"No source VTPs found under {root}.")
+                return paths
         if args.max_cases > 0:
             requested_ids = set(sorted(requested_ids)[: int(args.max_cases)])
         missing = [index for index in sorted(requested_ids) if not (root / f"sample_{index:06d}" / "merged_surfaces.vtp").is_file()]

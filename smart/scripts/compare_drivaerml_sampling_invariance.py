@@ -135,38 +135,38 @@ MODEL_LABELS = {
     "SMART_DOWNSAMPLE": "SMART-DOWNSAMPLE",
     "SMART_GAUSSIAN_BALL_MASKED": "SMART-GAUSSIAN-BALL-MASKED",
     "SMART_BOX_MASKED": "SMART-BOX-MASKED",
-    "SMART_SATLOSS3": "SMART-SATLOSS3",
-    "SMART_SATLOSS4": "SMART-SATLOSS4",
-    "SMART_SATLOSS5": "SMART-SATLOSS5",
-    "SMART_SATLOSS5_NOPM": "SMART-SATLOSS5-NOPM",
-    "SMART_SATLOSS6": "SMART-SATLOSS6",
-    "SMART_SATLOSS6_FIXEDSUM": "SMART-SATLOSS6-FIXEDSUM",
-    "SMART_SATLOSS6_GRADNORM": "SMART-SATLOSS6-GRADNORM",
-    "SMART_SATLOSS6_CONFIG_FULL": "SMART-SATLOSS6-ConFIG-FULL",
-    "SMART_SATLOSS6_CONFIG_LAYER": "SMART-SATLOSS6-ConFIG-LAYER",
-    "SMART_SATLOSS7": "SMART-SATLOSS",
-    "SMART_SATLOSS8": "SMART-SATLOSS8",
+    "SMART_SATLOSS3": "SMART-DeAL3",
+    "SMART_SATLOSS4": "SMART-DeAL4",
+    "SMART_SATLOSS5": "SMART-DeAL5",
+    "SMART_SATLOSS5_NOPM": "SMART-DeAL5-NOPM",
+    "SMART_SATLOSS6": "SMART-DeAL6",
+    "SMART_SATLOSS6_FIXEDSUM": "SMART-DeAL6-FIXEDSUM",
+    "SMART_SATLOSS6_GRADNORM": "SMART-DeAL6-GRADNORM",
+    "SMART_SATLOSS6_CONFIG_FULL": "SMART-DeAL6-ConFIG-FULL",
+    "SMART_SATLOSS6_CONFIG_LAYER": "SMART-DeAL6-ConFIG-LAYER",
+    "SMART_SATLOSS7": "SMART-DeAL",
+    "SMART_SATLOSS8": "SMART-DeAL8",
     "TRANSOLVERPP": "TransolverPP",
-    "TRANSOLVERPP_SATLOSS3": "TransolverPP-SATLOSS3",
-    "TRANSOLVERPP_SATLOSS6": "TransolverPP-SATLOSS6",
-    "TRANSOLVERPP_SATLOSS7": "TransolverPP-SATLOSS",
-    "TRANSOLVERPP_SATLOSS8": "TransolverPP-SATLOSS8",
+    "TRANSOLVERPP_SATLOSS3": "TransolverPP-DeAL3",
+    "TRANSOLVERPP_SATLOSS6": "TransolverPP-DeAL6",
+    "TRANSOLVERPP_SATLOSS7": "TransolverPP-DeAL",
+    "TRANSOLVERPP_SATLOSS8": "TransolverPP-DeAL8",
     "POINTNET2_SSG": "PointNet++-SSG",
-    "POINTNET2_SSG_SATLOSS6": "PointNet++-SSG-SATLOSS6",
-    "POINTNET2_SSG_SATLOSS7": "PointNet++-SSG-SATLOSS",
-    "POINTNET2_SSG_SATLOSS8": "PointNet++-SSG-SATLOSS8",
+    "POINTNET2_SSG_SATLOSS6": "PointNet++-SSG-DeAL6",
+    "POINTNET2_SSG_SATLOSS7": "PointNet++-SSG-DeAL",
+    "POINTNET2_SSG_SATLOSS8": "PointNet++-SSG-DeAL8",
     "LNO": "LNO",
-    "LNO_SATLOSS6": "LNO-SATLOSS6",
-    "LNO_SATLOSS7": "LNO-SATLOSS",
-    "LNO_SATLOSS8": "LNO-SATLOSS8",
+    "LNO_SATLOSS6": "LNO-DeAL6",
+    "LNO_SATLOSS7": "LNO-DeAL",
+    "LNO_SATLOSS8": "LNO-DeAL8",
     "MSPT": "MSPT",
-    "MSPT_SATLOSS6": "MSPT-SATLOSS6",
-    "MSPT_SATLOSS7": "MSPT-SATLOSS",
-    "MSPT_SATLOSS8": "MSPT-SATLOSS8",
+    "MSPT_SATLOSS6": "MSPT-DeAL6",
+    "MSPT_SATLOSS7": "MSPT-DeAL",
+    "MSPT_SATLOSS8": "MSPT-DeAL8",
     "POINT_TRANSFORMER_V3": "PointTransformerV3",
-    "POINT_TRANSFORMER_V3_SATLOSS6": "PointTransformerV3-SATLOSS6",
-    "POINT_TRANSFORMER_V3_SATLOSS7": "PointTransformerV3-SATLOSS",
-    "POINT_TRANSFORMER_V3_SATLOSS8": "PointTransformerV3-SATLOSS8",
+    "POINT_TRANSFORMER_V3_SATLOSS6": "PointTransformerV3-DeAL6",
+    "POINT_TRANSFORMER_V3_SATLOSS7": "PointTransformerV3-DeAL",
+    "POINT_TRANSFORMER_V3_SATLOSS8": "PointTransformerV3-DeAL8",
 }
 MODEL_COLORS = {
     "SMART": "#6C6F7D",
@@ -325,13 +325,13 @@ FAMILY_GROUPS = OrderedDict(
     ]
 )
 FAMILY_TITLES = {
-    "smart_family": "SMART vs SMART-DOWNSAMPLE vs SMART-GAUSSIAN-BALL-MASKED vs SMART-BOX-MASKED vs SMART-SATLOSS3 vs SMART-SATLOSS4 vs SMART-SATLOSS5 vs SMART-SATLOSS5-NOPM vs SMART-SATLOSS6 vs SATLOSS6 weighting variants",
+    "smart_family": "SMART vs SMART-DOWNSAMPLE vs SMART-GAUSSIAN-BALL-MASKED vs SMART-BOX-MASKED vs SMART-DeAL3 vs SMART-DeAL4 vs SMART-DeAL5 vs SMART-DeAL5-NOPM vs SMART-DeAL6 vs DeAL6 weighting variants",
     "smart_satloss6_weighting_family": "SMART-SATLOSS6-FIXEDSUM vs SMART-SATLOSS6-GRADNORM vs SMART-SATLOSS6-ConFIG-FULL vs SMART-SATLOSS6-ConFIG-LAYER",
-    "transolverpp_family": "TransolverPP and SATLOSS variants",
-    "pointnet2_ssg_family": "PointNet++ SSG and SATLOSS variants",
-    "lno_family": "LNO and SATLOSS variants",
-    "mspt_family": "MSPT and SATLOSS variants",
-    "point_transformer_v3_family": "PointTransformerV3 and SATLOSS variants",
+    "transolverpp_family": "TransolverPP and DeAL variants",
+    "pointnet2_ssg_family": "PointNet++ SSG and DeAL variants",
+    "lno_family": "LNO and DeAL variants",
+    "mspt_family": "MSPT and DeAL variants",
+    "point_transformer_v3_family": "PointTransformerV3 and DeAL variants",
 }
 VTK_PRESSURE_MODELS = [
     "SMART",
@@ -570,6 +570,12 @@ def parse_args() -> argparse.Namespace:
             "angle_div5/isotropic_div10/etc. The aligned preprocessed cloud is the baseline."
         ),
     )
+    p.add_argument(
+        "--geometry-label-preset",
+        choices=("legacy", "v4"),
+        default="legacy",
+        help="Use 'v4' for feature-aware, QEM, and voxel-grid-clustering remesh inputs.",
+    )
     p.add_argument("--plot-workers", type=int, default=max(1, min(6, (os.cpu_count() or 1) // 2)), help="Worker count for CPU-side plot generation.")
     p.add_argument(
         "--no-std",
@@ -579,7 +585,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--satloss-only-percent-labels",
         action="store_true",
-        help="Show vanilla-relative percentage labels only on SATLOSS bars.",
+        help="Show vanilla-relative percentage labels only on DeAL bars.",
     )
     p.add_argument(
         "--strategy-only",
@@ -1013,6 +1019,16 @@ GEOMETRY_METHOD_LABELS = {
     "isotropic": "Isotropic remeshing",
     "voxel": "Voxel/quadric clustering",
 }
+V4_GEOMETRY_SOURCE_LABELS = {
+    **{f"angle_div{factor}": f"Feature-aware div{factor}" for factor in GEOMETRY_FACTOR_ORDER},
+    **{f"isotropic_div{factor}": f"QEM div{factor}" for factor in GEOMETRY_FACTOR_ORDER},
+    **{f"voxel_div{factor}": f"Voxel-grid clustering div{factor}" for factor in GEOMETRY_FACTOR_ORDER},
+}
+V4_GEOMETRY_METHOD_LABELS = {
+    "angle": "Feature-aware decimation",
+    "isotropic": "QEM decimation",
+    "voxel": "Voxel-grid clustering",
+}
 GEOMETRY_BBOX_TOLERANCE = 2.5e-3
 
 
@@ -1350,6 +1366,71 @@ def write_polydata_vtk(path: Path, points_xyz: np.ndarray, point_data: Dict[str,
                 f.write(b"LOOKUP_TABLE default\n")
                 f.write(a.astype(">f4", copy=False).tobytes())
                 f.write(b"\n")
+
+
+def write_mask_surface_vtp(
+    path: Path,
+    *,
+    kind: str,
+    center_xyz: np.ndarray,
+    sigma_radius: float,
+    box_min_xyz: np.ndarray | None = None,
+    box_max_xyz: np.ndarray | None = None,
+) -> None:
+    """Write a closed VTP surface locating one deterministic training mask."""
+    import vtk
+    from vtk.util.numpy_support import numpy_to_vtk
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    center = np.asarray(center_xyz, dtype=np.float32).reshape(3)
+    sigma = float(sigma_radius)
+    if not np.isfinite(sigma) or sigma <= 0.0:
+        raise ValueError("sigma_radius must be finite and positive")
+
+    if kind == "gaussian_sigma_sphere":
+        source = vtk.vtkSphereSource()
+        source.SetCenter(*center.tolist())
+        # The Gaussian removal profile is centered here; show its one-standard-
+        # deviation radius as the closed mask-reference surface.
+        source.SetRadius(sigma)
+        source.SetThetaResolution(64)
+        source.SetPhiResolution(32)
+    elif kind == "box_surface":
+        if box_min_xyz is None or box_max_xyz is None:
+            raise ValueError("box surfaces require box_min_xyz and box_max_xyz")
+        box_min = np.asarray(box_min_xyz, dtype=np.float32).reshape(3)
+        box_max = np.asarray(box_max_xyz, dtype=np.float32).reshape(3)
+        source = vtk.vtkCubeSource()
+        # vtkCubeSource expects paired axis bounds: xmin, xmax, ymin, ymax, zmin, zmax.
+        source.SetBounds(
+            float(box_min[0]), float(box_max[0]),
+            float(box_min[1]), float(box_max[1]),
+            float(box_min[2]), float(box_max[2]),
+        )
+    else:
+        raise ValueError(f"Unknown mask surface kind: {kind}")
+
+    source.Update()
+    polydata = vtk.vtkPolyData()
+    polydata.ShallowCopy(source.GetOutput())
+    n = int(polydata.GetNumberOfPoints())
+    point_data = {
+        "mask_center_xyz": np.repeat(center.reshape(1, 3), n, axis=0),
+        "mask_sigma_radius": np.full((n,), sigma, dtype=np.float32),
+        "mask_boundary_radius": np.full((n,), sigma, dtype=np.float32),
+    }
+    for name, values in point_data.items():
+        vtk_array = numpy_to_vtk(np.ascontiguousarray(values, dtype=np.float32), deep=True)
+        vtk_array.SetName(name)
+        vtk_array.SetNumberOfComponents(values.shape[1] if values.ndim == 2 else 1)
+        polydata.GetPointData().AddArray(vtk_array)
+
+    writer = vtk.vtkXMLPolyDataWriter()
+    writer.SetFileName(str(path))
+    writer.SetInputData(polydata)
+    writer.SetDataModeToBinary()
+    if writer.Write() != 1:
+        raise RuntimeError(f"Failed to write VTP: {path}")
 
 
 def _prepare_density_histogram_values(log_density_values: np.ndarray) -> Tuple[np.ndarray, float, float, float, float]:
@@ -1946,7 +2027,7 @@ def select_run_ids(
         chosen = [int(x.strip()) for x in run_ids_arg.split(",") if x.strip()]
         missing = [x for x in chosen if x not in test_ids]
         if missing:
-            raise ValueError(f"Requested run ids not in test split: {missing}")
+            raise ValueError(f"Requested run ids are unavailable or lack a required geometry source: {missing}")
         return chosen
     rng = np.random.default_rng(int(seed) + 7001)
     n = min(int(num_runs), len(test_ids))
@@ -2497,7 +2578,7 @@ def plot_absolute_average_error_bars(
     ``combined_physics_rel_l2`` is the mean of the four physics quantities
     (surface pressure, surface WSS magnitude, volume pressure, and volume
     velocity magnitude). ``combined_global_rel_l2`` is the mean of the
-    surface-global and volume-global errors. SATLOSS variants keep their
+    surface-global and volume-global errors. DeAL variants keep their
     vanilla family color and use a hatch to mirror their dash-dot curves.
     """
     row_map = {
@@ -2549,7 +2630,7 @@ def plot_absolute_average_error_bars(
     ax.legend(
         handles=[
             Patch(facecolor="#BDBDBD", edgecolor="black", label="Vanilla / solid"),
-            Patch(facecolor="#BDBDBD", edgecolor="black", hatch="///", label="SATLOSS / dash-dot"),
+            Patch(facecolor="#BDBDBD", edgecolor="black", hatch="///", label="DeAL / dash-dot"),
         ],
         loc="upper left",
         fontsize=_font_size(9),
@@ -2703,7 +2784,7 @@ def plot_geometry_source_bars(
     ax.legend(
         handles=[
             Patch(facecolor="none", edgecolor="black", label="Vanilla (no hatch)"),
-            Patch(facecolor="none", edgecolor="black", hatch="///", label="SATLOSS (hatch)"),
+            Patch(facecolor="none", edgecolor="black", hatch="///", label="DeAL (hatch)"),
         ],
         loc="upper left",
         bbox_to_anchor=(1.01, 0.68),
@@ -2827,9 +2908,9 @@ def write_satloss_endpoint_table(
     write_csv(csv_path, rows, fieldnames)
     header = ["Model"] + [satloss_endpoint_label(key, mode_name) for key, mode_name in endpoint_specs]
     lines = [
-        "# SATLOSS improvement versus vanilla",
+        "# DeAL improvement versus vanilla",
         "",
-        "Positive values mean SATLOSS has lower combined-global relative L2 error than vanilla.",
+        "Positive values mean DeAL has lower combined-global relative L2 error than vanilla.",
         "",
         "| " + " | ".join(header) + " |",
         "| " + " | ".join("---" for _ in header) + " |",
@@ -2851,7 +2932,7 @@ def plot_satloss_endpoint_improvement_bars(
     out_path: Path,
     title: str,
 ) -> None:
-    """Plot SATLOSS improvement percentages for only the requested endpoints."""
+    """Plot DeAL improvement percentages for only the requested endpoints."""
     if not rows or not endpoint_specs:
         return
     present_rows = [
@@ -2899,7 +2980,7 @@ def plot_satloss_endpoint_improvement_bars(
         rotation=18,
         ha="right",
     )
-    ax.set_ylabel("SATLOSS improvement versus vanilla (%)")
+    ax.set_ylabel("DeAL improvement versus vanilla (%)")
     ax.set_title(title)
     ax.grid(axis="y", alpha=0.2)
     ax.legend(fontsize=_font_size(9), ncol=2, loc="best")
@@ -3033,13 +3114,13 @@ def write_strategy_endpoint_tables(
         absolute_md,
         absolute_rows,
         "SMART training-strategy endpoint errors",
-        "Lower combined-global relative L2 is better. SATLOSS is the proposed two-view training strategy.",
+        "Lower combined-global relative L2 is better. DeAL is the proposed two-view training strategy.",
     )
     render_table(
         relative_md,
         relative_rows,
-        "SMART training strategies relative to SATLOSS",
-        "Positive values mean the strategy is worse than SMART-SATLOSS at that endpoint; negative values mean it is better.",
+        "SMART training strategies relative to DeAL",
+        "Positive values mean the strategy is worse than SMART-DeAL at that endpoint; negative values mean it is better.",
     )
     return absolute_csv, relative_csv, absolute_md, relative_md
 
@@ -3210,7 +3291,7 @@ def plot_strategy_endpoint_relative_bars(
         ha="right",
         fontsize=strategy_font_size,
     )
-    ax.set_ylabel("Relative error difference versus SATLOSS (%)", fontsize=strategy_font_size)
+    ax.set_ylabel("Relative error difference versus DeAL (%)", fontsize=strategy_font_size)
     ax.yaxis.set_label_coords(-0.095, 0.50)
     ax.tick_params(axis="y", labelsize=strategy_font_size)
     ax.set_title(title.replace("SMART training strategies: ", ""), fontsize=strategy_font_size)
@@ -3550,12 +3631,12 @@ def plot_endpoint_error_bars(
         )
     endpoint_handles.extend(
         [
-            Patch(facecolor="#4C78A8", edgecolor="black", alpha=1.0, hatch="///", label="SATLOSS variant"),
+            Patch(facecolor="#4C78A8", edgecolor="black", alpha=1.0, hatch="///", label="DeAL variant"),
             Patch(
                 facecolor="none",
                 edgecolor="none",
                 label=(
-                    "SATLOSS labels: % vs vanilla"
+                    "DeAL labels: % vs vanilla"
                     if _SATLOSS_ONLY_PERCENT_LABELS
                     else "Labels: % vs vanilla baseline"
                 ),
@@ -4074,7 +4155,11 @@ def plot_percentage_degradation_bars(
 
 def main():
     global _INDEPENDENT_SATLOSS6_LINE_MODE, _COMPUTE_PLOT_STD, _SATLOSS_ONLY_PERCENT_LABELS, _PLOT_FONT_SCALE
+    global GEOMETRY_SOURCE_LABELS, GEOMETRY_METHOD_LABELS
     args = parse_args()
+    if args.geometry_label_preset == "v4":
+        GEOMETRY_SOURCE_LABELS = dict(V4_GEOMETRY_SOURCE_LABELS)
+        GEOMETRY_METHOD_LABELS = dict(V4_GEOMETRY_METHOD_LABELS)
     _COMPUTE_PLOT_STD = not bool(args.no_std)
     _SATLOSS_ONLY_PERCENT_LABELS = bool(args.satloss_only_percent_labels)
     _PLOT_FONT_SCALE = float(args.font_scale)
@@ -4403,30 +4488,37 @@ def main():
         "isotropic": Path(args.isotropic_decimated_vtp_dir).expanduser().resolve(),
         "voxel": Path(args.voxel_decimated_vtp_dir).expanduser().resolve(),
     }
+    # Explicit IDs are commonly used to evaluate remeshed training and test
+    # cases together. Keep the default random protocol test-only, but never
+    # reject an explicitly requested, fully preprocessed run merely because
+    # it belongs to the training split.
+    requested_run_ids = [int(item.strip()) for item in str(args.run_ids).split(",") if item.strip()] if args.run_ids else []
+    candidate_universe = set(dataset.all_ids if requested_run_ids else dataset.test_ids)
     geometry_candidate_ids: set[int] | None = None
     if active_geometry_sources:
-        geometry_candidate_ids = {int(run_id) for run_id in dataset.test_ids}
+        geometry_candidate_ids = {int(run_id) for run_id in candidate_universe}
         for source_name in active_geometry_sources:
             source_ids = {
                 int(path.parent.name.split("_", 1)[1])
                 for path in (
                     geometry_source_vtp_path(source_name, run_id, geometry_vtp_dirs)
-                    for run_id in dataset.test_ids
+                    for run_id in candidate_universe
                 )
                 if path.is_file()
             }
             geometry_candidate_ids.intersection_update(source_ids)
         if not geometry_candidate_ids:
             raise FileNotFoundError(
-                "No test-split runs contain every requested geometry source: "
+                "No eligible runs contain every requested geometry source: "
                 f"{active_geometry_sources}. Check the three geometry VTP directory arguments."
             )
         print(
-            f"VTP geometry tests available on {len(geometry_candidate_ids)} test runs; "
+            f"VTP geometry tests available on {len(geometry_candidate_ids)} "
+            f"{'all-data' if requested_run_ids else 'test-split'} runs; "
             f"selecting from the common completed subset."
         )
     run_ids = select_run_ids(
-        dataset.test_ids,
+        candidate_universe,
         args.num_runs,
         args.run_ids,
         args.seed,
@@ -5748,9 +5840,9 @@ def main():
         satloss_endpoint_specs,
         "combined_global_rel_l2",
     )
-    satloss_table_csv = out_root / "all_models_combined_global_satloss_endpoint_improvement.csv"
-    satloss_table_md = out_root / "all_models_combined_global_satloss_endpoint_improvement.md"
-    satloss_table_png = out_root / "all_models_combined_global_satloss_endpoint_improvement.png"
+    satloss_table_csv = out_root / "all_models_combined_global_deal_endpoint_improvement.csv"
+    satloss_table_md = out_root / "all_models_combined_global_deal_endpoint_improvement.md"
+    satloss_table_png = out_root / "all_models_combined_global_deal_endpoint_improvement.png"
     write_satloss_endpoint_table(
         satloss_endpoint_rows,
         satloss_endpoint_specs,
@@ -5761,7 +5853,7 @@ def main():
         satloss_endpoint_rows,
         satloss_endpoint_specs,
         satloss_table_png,
-        "SATLOSS improvement versus vanilla at endpoint shifts",
+        "DeAL improvement versus vanilla at endpoint shifts",
     )
     strategy_models = [
         model_name
@@ -5865,13 +5957,13 @@ def main():
                 percentage_plot=True,
             )
             strategy_plot_paths[f"{test_slug}_relative_vs_smart"] = str(vanilla_pct_path)
-            satloss_pct_path = out_root / f"smart_strategies_combined_global_relative_vs_satloss_{test_slug}.png"
+            satloss_pct_path = out_root / f"smart_strategies_combined_global_relative_vs_deal_{test_slug}.png"
             plot_strategy_test_bars(
                 strategy_absolute_rows,
                 strategy_relative_rows,
                 test_specs,
                 satloss_pct_path,
-                f"Relative error versus SATLOSS ({test_label})",
+                f"Relative error versus DeAL ({test_label})",
                 log_scale=False,
                 percentage_plot=True,
             )
@@ -6477,6 +6569,8 @@ def main():
         geometry_sampling_plot_paths.append(str(geometry_plot_path))
 
     representative_view2_sampling_vtk_paths: List[str] = []
+    representative_mask_surface_vtp_paths: List[str] = []
+    representative_mask_surface_vtp_dir = out_root / "mask_surfaces_vtps"
     if "SMART_DOWNSAMPLE" in model_specs:
         downsample_cfg = model_specs["SMART_DOWNSAMPLE"]["config"]
         downsample_budget = int(getattr(downsample_cfg, "secondary_view_geometry_points", getattr(downsample_cfg, "view_geometry_points", sampling_budget)))
@@ -6524,6 +6618,17 @@ def main():
                 },
             )
             representative_view2_sampling_vtk_paths.append(str(masked_vtk_path))
+            gaussian_surface_vtp_path = representative_mask_surface_vtp_dir / (
+                f"drivaerml_test_run_{vtk_run_id}_smart_gaussian_ball_masked_view2_example_{masked_example_idx:02d}"
+                "_mask_1sigma_surface.vtp"
+            )
+            write_mask_surface_vtp(
+                gaussian_surface_vtp_path,
+                kind="gaussian_sigma_sphere",
+                center_xyz=masked_info["center_point"],
+                sigma_radius=float(masked_info["sigma_radius"]),
+            )
+            representative_mask_surface_vtp_paths.append(str(gaussian_surface_vtp_path))
             masked_survivor_points = sampling_input_surf_coords[masked_kept_idx]
             masked_survivor_vtk_path = out_root / (
                 f"drivaerml_test_run_{vtk_run_id}_smart_gaussian_ball_masked_view2_example_{masked_example_idx:02d}"
@@ -6576,6 +6681,19 @@ def main():
                 },
             )
             representative_view2_sampling_vtk_paths.append(str(box_vtk_path))
+            box_surface_vtp_path = representative_mask_surface_vtp_dir / (
+                f"drivaerml_test_run_{vtk_run_id}_smart_box_masked_view2_example_{box_example_idx:02d}"
+                "_mask_box_surface.vtp"
+            )
+            write_mask_surface_vtp(
+                box_surface_vtp_path,
+                kind="box_surface",
+                center_xyz=box_info["center_point"],
+                sigma_radius=float(box_info["sigma_radius"]),
+                box_min_xyz=box_info["box_min"],
+                box_max_xyz=box_info["box_max"],
+            )
+            representative_mask_surface_vtp_paths.append(str(box_surface_vtp_path))
             box_survivor_points = sampling_input_surf_coords[box_kept_idx]
             box_survivor_vtk_path = out_root / (
                 f"drivaerml_test_run_{vtk_run_id}_smart_box_masked_view2_example_{box_example_idx:02d}"
@@ -6720,6 +6838,7 @@ def main():
             "smart_strategy_endpoint_plots": strategy_plot_paths,
             "smart_strategy_models": strategy_models,
             "representative_view2_sampling_vtks": representative_view2_sampling_vtk_paths,
+            "representative_mask_surface_vtps": representative_mask_surface_vtp_paths,
             "audi_vtk_skipped_models": audi_vtk_skipped_models,
             "encoder_budget_mismatches": encoder_budget_mismatch_models,
             "query_budget_mismatches": query_budget_mismatch_models,

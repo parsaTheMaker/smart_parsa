@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import OrderedDict
 from multiprocessing import Value
 from pathlib import Path
@@ -110,7 +111,10 @@ class PumpDataset(Dataset):
 
     @staticmethod
     def _atomic_save(path, array):
-        temporary = path.with_suffix(path.suffix + ".partial")
+        # DDP constructs one dataset per rank. A rank-specific staging path
+        # prevents concurrent statistics initialization from replacing another
+        # rank's temporary file before its atomic rename.
+        temporary = path.with_name(f"{path.name}.{os.getpid()}.partial")
         with temporary.open("wb") as handle:
             np.save(handle, np.asarray(array), allow_pickle=False)
         temporary.replace(path)
@@ -126,7 +130,7 @@ class PumpDataset(Dataset):
             values = self._compute_stats()
             for path, value in zip(paths, values):
                 self._atomic_save(path, value)
-            temporary = provenance.with_suffix(".partial")
+            temporary = provenance.with_name(f"{provenance.name}.{os.getpid()}.partial")
             temporary.write_text(json.dumps({"train_ids": list(self.training_ids), "version": self.CACHE_VERSION}, indent=2) + "\n", encoding="utf-8")
             temporary.replace(provenance)
         surface, volume, parameter, position = (np.load(path) for path in paths)

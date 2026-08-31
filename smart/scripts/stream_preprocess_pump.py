@@ -23,12 +23,31 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import ctypes
 import gc
 import json
+import multiprocessing as mp
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
+
+
+def _load_conda_libstdcpp() -> None:
+    """Load Conda's C++ runtime before PyVista/VTK optional extensions."""
+    lib_dir = Path(sys.prefix) / "lib"
+    for candidate in (lib_dir / "libstdc++.so.6.0.34", lib_dir / "libstdc++.so.6"):
+        if not candidate.is_file():
+            continue
+        try:
+            ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            pass
+        break
+
+
+_load_conda_libstdcpp()
 
 import numpy as np
 import pyvista as pv
@@ -36,7 +55,8 @@ import torch
 
 os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
-SMART_ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
+SMART_ROOT = SCRIPT_DIR.parent
 if str(SMART_ROOT) not in sys.path:
     sys.path.insert(0, str(SMART_ROOT))
 
@@ -90,13 +110,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--results-dir", default=DEFAULT_RESULTS_DIR)
     parser.add_argument("--staging-dir", default=DEFAULT_STAGING_DIR)
-    parser.add_argument("--num-samples", type=int, default=100)
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        default=100,
+        help="Number of cases to process; use 0 to process every available case from --source-root.",
+    )
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--workers", type=int, default=2)
     parser.add_argument("--surface-points", type=int, default=1_000_000)
     parser.add_argument("--volume-points", type=int, default=1_000_000)
     parser.add_argument("--density-knn-k", type=int, default=16)
     parser.add_argument("--density-device", choices=("auto", "cpu", "cuda"), default="auto")
+    parser.add_argument(
+        "--density-devices",
+        default="",
+        help="Comma-separated CUDA devices assigned round-robin to workers, e.g. cuda:0,cuda:1.",
+    )
     parser.add_argument("--density-cache-dtype", choices=("float16", "float32"), default="float16")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
@@ -106,6 +136,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--inspection-sample-index", type=int, default=1)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--source-root", default="", help="Local sample root for smoke tests; skips Hub downloads.")
+    parser.add_argument(
+        "--remesh-after-preprocess",
+        action="store_true",
+        help="Run validated geometry-only remeshing after all selected cases preprocess successfully. Requires --source-root.",
+    )
+    parser.add_argument("--remesh-output-dir", default="")
+    parser.add_argument("--remesh-results-dir", default="")
+    parser.add_argument("--remesh-workers", type=int, default=8)
+    parser.add_argument("--remesh-methods", default="voxel,quadric,feature")
+    parser.add_argument("--remesh-factors", default="5,10")
     return parser.parse_args()
 
 
@@ -221,6 +261,7 @@ def _process_case(task: tuple[str, str, str, dict, bool]) -> dict:
     temporary.mkdir(parents=True, exist_ok=True)
     worker_stage.mkdir(parents=True, exist_ok=True)
     try:
+        print(f"[{sample_name}] loading surface and volume fields", flush=True)
         if local_mode:
             inputs = _load_local_inputs(sample_name, args["source_root"])
         else:
@@ -237,6 +278,10 @@ def _process_case(task: tuple[str, str, str, dict, bool]) -> dict:
             raise ValueError(f"{sample_name}: surface point/field mismatch {surface_points_full.shape} vs {surface_data_full.shape}")
         if volume_points_full.shape != (volume_data_full.shape[0], 3):
             raise ValueError(f"{sample_name}: volume point/field mismatch {volume_points_full.shape} vs {volume_data_full.shape}")
+        print(
+            f"[{sample_name}] sampling surface={surface_points_full.shape[0]:,}, volume={volume_points_full.shape[0]:,}",
+            flush=True,
+        )
         surface_idx = _sample_indices(surface_points_full.shape[0], int(args["surface_points"]), int(args["seed"]) + 11 * run_id)
         volume_idx = _sample_indices(volume_points_full.shape[0], int(args["volume_points"]), int(args["seed"]) + 17 * run_id)
         surface_points = np.ascontiguousarray(surface_points_full[surface_idx])
@@ -244,6 +289,7 @@ def _process_case(task: tuple[str, str, str, dict, bool]) -> dict:
         volume_points = np.ascontiguousarray(volume_points_full[volume_idx])
         volume_data = np.ascontiguousarray(volume_data_full[volume_idx])
         parameters = _numeric_parameter_vector(_load_json(inputs["params.json"]))
+        print(f"[{sample_name}] KDE-{int(args['density_knn_k'])} on {surface_points.shape[0]:,} surface points", flush=True)
         density, density_info = _density_cache(
             surface_points,
             int(args["seed"]) + run_id,
@@ -343,7 +389,7 @@ def _aggregate_stats(output_root: Path, rows: list[dict], args: argparse.Namespa
     train_ids = sorted(int(value) for value in shuffled[:split])
     test_ids = train_ids if len(shuffled) == 1 else sorted(int(value) for value in shuffled[split:])
     manifest = {
-        "dataset": "SHIFTPumpSample",
+        "dataset": "SHIFT-Pump" if str(args.repo_id).rstrip("/").endswith("/Pump") else "SHIFT-Pump-sample",
         "source": str(args.repo_id),
         "sample_count": len(ids),
         "fields": {"surface": list(SURFACE_FIELDS), "volume": list(VOLUME_FIELDS)},
@@ -387,17 +433,59 @@ def _export_inspection(sample_name: str, results_root: Path, staging_root: Path,
         shutil.rmtree(temporary, ignore_errors=True)
 
 
+def _run_remeshing(
+    args: argparse.Namespace,
+    source_root: Path,
+    results_root: Path,
+    sample_names: list[str],
+) -> None:
+    """Run the validated geometry-only remesher after preprocessing succeeds.
+
+    The original full-resolution VTP files remain on the large source volume;
+    the smaller geometry-only remeshes are written beside the processed corpus.
+    """
+    if not args.source_root:
+        raise ValueError("--remesh-after-preprocess requires --source-root so original VTP meshes are available.")
+    if args.remesh_workers <= 0:
+        raise ValueError("--remesh-workers must be positive.")
+    remesh_output = Path(args.remesh_output_dir).expanduser().resolve() if args.remesh_output_dir else (
+        Path(args.output_dir).expanduser().resolve().with_name("shift_pump_full_surface_vtp_remesh_v4")
+    )
+    remesh_results = Path(args.remesh_results_dir).expanduser().resolve() if args.remesh_results_dir else (
+        results_root / "remeshing"
+    )
+    command = [
+        sys.executable,
+        str(SCRIPT_DIR / "remesh_surface_meshes_v2.py"),
+        "--dataset", "pump",
+        "--source-dir", str(source_root),
+        "--output-dir", str(remesh_output),
+        "--results-dir", str(remesh_results),
+        "--pump-count", "0",
+        "--case-ids", ",".join(str(_sample_number(name)) for name in sample_names),
+        "--methods", str(args.remesh_methods),
+        "--factors", str(args.remesh_factors),
+        "--workers", str(args.remesh_workers),
+    ]
+    print(f"Starting post-preprocessing remeshing: {' '.join(command)}", flush=True)
+    subprocess.run(command, check=True)
+
+
 def main() -> None:
     args = parse_args()
-    if args.num_samples <= 0 or args.workers <= 0 or args.surface_points <= 0 or args.volume_points <= 0:
-        raise ValueError("num-samples, workers, surface-points, and volume-points must be positive.")
+    if args.num_samples < 0 or args.workers <= 0 or args.surface_points <= 0 or args.volume_points <= 0:
+        raise ValueError("num-samples must be nonnegative; workers, surface-points, and volume-points must be positive.")
+    if args.num_samples == 0 and not args.source_root:
+        raise ValueError("--num-samples 0 requires --source-root to avoid an incomplete paginated Hub listing.")
     if not args.source_root:
         sample_names = list_samples(args.num_samples, args.start_index, args.repo_id, args.revision)
     else:
         root = Path(args.source_root).expanduser().resolve()
         sample_names = sorted((path.name for path in root.glob("sample_*") if path.is_dir()), key=_sample_number)
-        sample_names = [name for name in sample_names if _sample_number(name) >= args.start_index][:args.num_samples]
-        if len(sample_names) < args.num_samples:
+        sample_names = [name for name in sample_names if _sample_number(name) >= args.start_index]
+        if args.num_samples > 0:
+            sample_names = sample_names[:args.num_samples]
+        if args.num_samples > 0 and len(sample_names) < args.num_samples:
             raise RuntimeError(f"Local source has only {len(sample_names)} selected cases.")
     output_root = Path(args.output_dir).expanduser().resolve()
     results_root = Path(args.results_dir).expanduser().resolve()
@@ -405,8 +493,14 @@ def main() -> None:
     output_root.mkdir(parents=True, exist_ok=True)
     results_root.mkdir(parents=True, exist_ok=True)
     staging_root.mkdir(parents=True, exist_ok=True)
+    density_devices = [item.strip() for item in str(args.density_devices).split(",") if item.strip()]
     density_device = args.density_device
-    if density_device == "auto":
+    if density_devices:
+        if any(not device.startswith("cuda") for device in density_devices):
+            raise ValueError("--density-devices accepts CUDA device names only, e.g. cuda:0,cuda:1.")
+        if not torch.cuda.is_available():
+            raise RuntimeError("--density-devices was requested but CUDA is unavailable.")
+    elif density_device == "auto":
         density_device = "cpu" if args.workers > 1 else ("cuda" if torch.cuda.is_available() else "cpu")
     if density_device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA density requested but CUDA is unavailable.")
@@ -425,10 +519,22 @@ def main() -> None:
         "overwrite": args.overwrite,
         "source_root": str(Path(args.source_root).expanduser().resolve()) if args.source_root else "",
     }
-    tasks = [(name, str(output_root), str(staging_root), options, bool(args.source_root)) for name in sample_names]
-    print(f"Selected {len(tasks)} Pump cases, workers={args.workers}, density_device={density_device}", flush=True)
+    tasks = []
+    for index, name in enumerate(sample_names):
+        task_options = dict(options)
+        if density_devices:
+            task_options["density_device"] = density_devices[index % len(density_devices)]
+        tasks.append((name, str(output_root), str(staging_root), task_options, bool(args.source_root)))
+    density_summary = ",".join(density_devices) if density_devices else density_device
+    print(f"Selected {len(tasks)} Pump cases, workers={args.workers}, density_device={density_summary}", flush=True)
     try:
-        with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as executor:
+        # CUDA contexts cannot be initialized safely in forked children. CPU
+        # preprocessing retains fork's lower startup overhead; CUDA KDE uses
+        # spawn so every worker owns a valid CUDA context.
+        executor_kwargs = {"max_workers": args.workers}
+        if density_devices or density_device == "cuda":
+            executor_kwargs["mp_context"] = mp.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(**executor_kwargs) as executor:
             futures = [executor.submit(_process_case, task) for task in tasks]
             for index, future in enumerate(concurrent.futures.as_completed(futures), start=1):
                 row = future.result()
@@ -449,6 +555,8 @@ def main() -> None:
         if selected is None:
             raise ValueError(f"Inspection sample {args.inspection_sample_index} was not selected.")
         _export_inspection(selected, results_root, staging_root, options)
+    if args.remesh_after_preprocess:
+        _run_remeshing(args, root if args.source_root else Path(), results_root, sample_names)
     if staging_root.exists() and not any(staging_root.iterdir()):
         staging_root.rmdir()
     print(f"Preprocessing complete: {len(rows)} cases -> {output_root}", flush=True)

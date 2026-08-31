@@ -4,6 +4,7 @@ import torch.nn as nn
 import numpy as np
 import random
 import inspect
+import importlib
 from loss.losses import RelL2Loss
 from lion_pytorch import Lion
 from omegaconf import OmegaConf, open_dict
@@ -11,6 +12,8 @@ import os
 import json
 import re
 import hashlib
+import sys
+from types import SimpleNamespace
 
 
 def make_grad_scaler(config):
@@ -22,6 +25,33 @@ def make_grad_scaler(config):
         backoff_factor=float(getattr(config, "amp_scaler_backoff_factor", 0.5)),
         growth_interval=int(getattr(config, "amp_scaler_growth_interval", 2000)),
     )
+
+
+def prepare_native_ddp_reducer() -> bool:
+    """Use eager DDP when an optional TorchDynamo import is broken.
+
+    PyTorch consults ``torch._dynamo`` when constructing DDP even for models
+    that are not compiled. This preserves the standard C++ DDP reducer when
+    that optional package cannot be imported in the active environment.
+    """
+    try:
+        importlib.import_module("torch._dynamo")
+        return False
+    except ImportError:
+        def disable(fn=None, recursive=True):
+            del recursive
+            return fn if fn is not None else (lambda wrapped: wrapped)
+
+        fallback = SimpleNamespace(
+            config=SimpleNamespace(_get_optimize_ddp_mode=lambda: "ddp_optimizer"),
+            disable=disable,
+            graph_break=lambda: None,
+        )
+        # Optimizers lazily execute ``import torch._dynamo`` on their first
+        # call. Register the fallback in both places importlib consults.
+        sys.modules["torch._dynamo"] = fallback
+        torch._dynamo = fallback  # type: ignore[attr-defined]
+        return True
 
 
 def reset_scheduler_for_extension(scheduler, optimizer, total_steps):

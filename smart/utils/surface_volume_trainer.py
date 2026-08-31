@@ -24,6 +24,7 @@ from utils.utils import (
     initialize_gpu,
     initialize_wandb,
     make_grad_scaler,
+    prepare_native_ddp_reducer,
     print_point_budget,
     reset_scheduler_for_extension,
 )
@@ -351,6 +352,11 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
         "world_size": 1,
     }
     is_main = not dist_info["enabled"] or dist_info["rank"] == 0
+    # This PyTorch installation may fail to import optional TorchDynamo even
+    # when running eagerly. AdamW imports it during construction, so install
+    # the eager fallback before model/optimizer setup in every GPU mode.
+    if prepare_native_ddp_reducer() and is_main:
+        print("[torch] TorchDynamo unavailable; using eager execution.")
     run = initialize_wandb(config, wandb_config) if is_main else None
     device = initialize_gpu(config.random_seed, high_precision=False)
 

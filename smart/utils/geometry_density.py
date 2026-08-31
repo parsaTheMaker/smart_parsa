@@ -1,6 +1,30 @@
 from __future__ import annotations
 
+import ctypes
 import os
+from pathlib import Path
+import sys
+
+
+def _load_conda_libstdcpp() -> None:
+    """Load the active Conda C++ runtime before optional kNN extensions.
+
+    Some cluster shells resolve an older system ``libstdc++`` first. The
+    optional torch-cluster and scikit-learn backends then cannot load even
+    though the active Conda environment contains a compatible runtime.
+    """
+    lib_dir = Path(sys.prefix) / "lib"
+    for candidate in (lib_dir / "libstdc++.so.6.0.34", lib_dir / "libstdc++.so.6"):
+        if not candidate.is_file():
+            continue
+        try:
+            ctypes.CDLL(str(candidate), mode=ctypes.RTLD_GLOBAL)
+        except OSError:
+            pass
+        break
+
+
+_load_conda_libstdcpp()
 
 import numpy as np
 import torch

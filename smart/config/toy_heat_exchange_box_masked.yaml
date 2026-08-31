@@ -1,0 +1,32 @@
+defaults:
+  - toy_heat_exchange
+  - _self_
+
+experiment:
+  name: "HEAT_EXCHANGE_SMART_BOX_MASKED"
+  model_name: "SMART_HEAT_EXCHANGE_BOX_MASKED"
+  model_tag: ""
+
+  # Delete a 2-sigma axis-aligned box around a random surface center.
+  geometry_epoch_seeded_sampling: False
+  num_body_points: 0
+  train_shared_shift_sampling_mode: ""
+  train_primary_sampling_mode: "uniform_wor"
+  train_secondary_sampling_mode: "box_mask"
+  eval_aligned_sampling_mode: "uniform_wor"
+  eval_shifted_sampling_mode: "uniform_wor"
+  primary_view_geometry_points: 65536
+  secondary_view_geometry_points: 65536
+  shared_shift_view_geometry_points: 0
+  eval_aligned_view_geometry_points: 65536
+  eval_shifted_view_geometry_points: 65536
+  gaussian_mask_std_fraction_of_largest_extent: 0.05
+  gaussian_mask_min_survivors: 8192
+  fuse_consistency_views: False
+  prediction_consistency_weight: 1.0
+  prediction_consistency_smooth_l1_beta: 0.05
+  use_latent_consistency: False
+  consistency_warmup_epochs: 30
+  task_weighting_method: "fixed_sum"
+  config_task_base_weights: [0.2, 0.2, 0.6]
+  fixed_sum_use_view_losses: True

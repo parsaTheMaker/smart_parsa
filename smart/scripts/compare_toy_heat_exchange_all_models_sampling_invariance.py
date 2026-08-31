@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Paper-style all-model SATLOSS comparison on held-out toy heat exchangers.
+"""Paper-style all-model DeAL comparison on held-out heat exchangers.
 
-The candidate ranking is deliberately internal: every base/SATLOSS pair is
+The candidate ranking is deliberately internal: every base/DeAL pair is
 evaluated on the same positive sampling and remeshing conditions, then only
 the selected cases are written and visualised.  This prevents a selected-case
 plot from accidentally including a different condition or a different query
@@ -44,17 +44,17 @@ from train_consistency_common import sample_geometry_view
 MODEL_SPECS: "OrderedDict[str, dict[str, Any]]" = OrderedDict(
     [
         ("SMART", {"label": "SMART", "ctor": SMART, "config": "toy_heat_exchange", "pair": "SMART"}),
-        ("SMART_SATLOSS7", {"label": "SMART-SATLOSS", "ctor": SMART, "config": "toy_heat_exchange_satloss7", "pair": "SMART"}),
+        ("SMART_SATLOSS7", {"label": "SMART-DeAL", "ctor": SMART, "config": "toy_heat_exchange_satloss7", "pair": "SMART"}),
         ("MSPT", {"label": "MSPT", "ctor": MSPT, "config": "toy_heat_exchange_mspt", "pair": "MSPT"}),
-        ("MSPT_SATLOSS7", {"label": "MSPT-SATLOSS", "ctor": MSPT, "config": "toy_heat_exchange_mspt_satloss7", "pair": "MSPT"}),
+        ("MSPT_SATLOSS7", {"label": "MSPT-DeAL", "ctor": MSPT, "config": "toy_heat_exchange_mspt_satloss7", "pair": "MSPT"}),
         ("LNO", {"label": "LNO", "ctor": LNO, "config": "toy_heat_exchange_lno", "pair": "LNO"}),
-        ("LNO_SATLOSS7", {"label": "LNO-SATLOSS", "ctor": LNO, "config": "toy_heat_exchange_lno_satloss7", "pair": "LNO"}),
+        ("LNO_SATLOSS7", {"label": "LNO-DeAL", "ctor": LNO, "config": "toy_heat_exchange_lno_satloss7", "pair": "LNO"}),
         ("POINTNET2_SSG", {"label": "PointNet++-SSG", "ctor": PointNet2SSG, "config": "toy_heat_exchange_pointnet2_ssg", "pair": "POINTNET2_SSG"}),
-        ("POINTNET2_SSG_SATLOSS7", {"label": "PointNet++-SSG-SATLOSS", "ctor": PointNet2SSG, "config": "toy_heat_exchange_pointnet2_ssg_satloss7", "pair": "POINTNET2_SSG"}),
+        ("POINTNET2_SSG_SATLOSS7", {"label": "PointNet++-SSG-DeAL", "ctor": PointNet2SSG, "config": "toy_heat_exchange_pointnet2_ssg_satloss7", "pair": "POINTNET2_SSG"}),
         ("TRANSOLVERPP", {"label": "TransolverPP", "ctor": TransolverPP, "config": "toy_heat_exchange_transolverpp", "pair": "TRANSOLVERPP"}),
-        ("TRANSOLVERPP_SATLOSS7", {"label": "TransolverPP-SATLOSS", "ctor": TransolverPP, "config": "toy_heat_exchange_transolverpp_satloss7", "pair": "TRANSOLVERPP"}),
+        ("TRANSOLVERPP_SATLOSS7", {"label": "TransolverPP-DeAL", "ctor": TransolverPP, "config": "toy_heat_exchange_transolverpp_satloss7", "pair": "TRANSOLVERPP"}),
         ("POINT_TRANSFORMER_V3", {"label": "PointTransformerV3", "ctor": PointTransformerV3, "config": "toy_heat_exchange_point_transformer_v3", "pair": "POINT_TRANSFORMER_V3"}),
-        ("POINT_TRANSFORMER_V3_SATLOSS7", {"label": "PointTransformerV3-SATLOSS", "ctor": PointTransformerV3, "config": "toy_heat_exchange_point_transformer_v3_satloss7", "pair": "POINT_TRANSFORMER_V3"}),
+        ("POINT_TRANSFORMER_V3_SATLOSS7", {"label": "PointTransformerV3-DeAL", "ctor": PointTransformerV3, "config": "toy_heat_exchange_point_transformer_v3_satloss7", "pair": "POINT_TRANSFORMER_V3"}),
     ]
 )
 
@@ -75,6 +75,14 @@ SOURCE_LABELS = {
     "isotropic_div10": "Isotropic div10",
     "voxel_div5": "Voxel div5",
     "voxel_div10": "Voxel div10",
+}
+V4_SOURCE_LABELS = {
+    "angle_div5": "Feature-aware div5",
+    "angle_div10": "Feature-aware div10",
+    "isotropic_div5": "QEM div5",
+    "isotropic_div10": "QEM div10",
+    "voxel_div5": "Voxel-grid clustering div5",
+    "voxel_div10": "Voxel-grid clustering div10",
 }
 METHOD_EDGES = {"angle": "#222222", "isotropic": "#1B7837", "voxel": "#B15928"}
 FACTOR_ALPHAS = {5: 0.50, 10: 1.00}
@@ -284,7 +292,7 @@ def candidate_score(
     ranking_families: list[str],
     ranking_modes: list[str],
 ) -> float:
-    """Mean paired SATLOSS improvement used only for internal case selection."""
+    """Mean paired DeAL improvement used only for internal case selection."""
     values: list[float] = []
     row_map = {(row["model_name"], row["sampling_mode"]): row for row in rows}
     for family in ranking_families:
@@ -357,8 +365,8 @@ def plot_endpoint_bars(aggregate: list[dict[str, Any]], mode: str, out_path: Pat
     ax.grid(axis="y", which="both", alpha=0.20)
     ax.legend(handles=[
         Patch(facecolor="none", edgecolor="black", label="Base (no hatch)"),
-        Patch(facecolor="none", edgecolor="black", hatch="///", label="SATLOSS (hatch)"),
-        Patch(facecolor="none", edgecolor="none", label="SATLOSS labels: % vs base"),
+        Patch(facecolor="none", edgecolor="black", hatch="///", label="DeAL (hatch)"),
+        Patch(facecolor="none", edgecolor="none", label="DeAL labels: % vs base"),
     ], loc="upper left", bbox_to_anchor=(1.01, 1.0), fontsize=font, framealpha=0.92)
     fig.savefig(out_path, dpi=280, bbox_inches="tight", pad_inches=0.10)
     plt.close(fig)
@@ -368,7 +376,7 @@ def plot_geometry_factor_average_bars(aggregate: list[dict[str, Any]], modes: li
     """Average remeshing methods, retaining paired div5/div10 comparisons.
 
     A div5 bar is the mean error over angle, isotropic, and voxel div5 inputs
-    for the same model and selected cases. The matching SATLOSS bar uses the
+    for the same model and selected cases. The matching DeAL bar uses the
     same three sources. This keeps the plot readable without privileging one
     remesher or silently changing the paired numerator/denominator.
     """
@@ -420,9 +428,9 @@ def plot_geometry_factor_average_bars(aggregate: list[dict[str, Any]], modes: li
     ax.add_artist(opacity)
     ax.legend(handles=[
         Patch(facecolor="none", edgecolor="black", label="Base (no hatch)"),
-        Patch(facecolor="none", edgecolor="black", hatch="///", label="SATLOSS (hatch)"),
+        Patch(facecolor="none", edgecolor="black", hatch="///", label="DeAL (hatch)"),
         Patch(facecolor="none", edgecolor="none", label="Each div bar: mean of three remeshers"),
-        Patch(facecolor="none", edgecolor="none", label="SATLOSS labels: % vs base"),
+        Patch(facecolor="none", edgecolor="none", label="DeAL labels: % vs base"),
     ], loc="upper left", bbox_to_anchor=(1.01, 0.67), fontsize=font, framealpha=0.92)
     fig.savefig(out_path, dpi=280, bbox_inches="tight", pad_inches=0.10)
     plt.close(fig)
@@ -430,7 +438,7 @@ def plot_geometry_factor_average_bars(aggregate: list[dict[str, Any]], modes: li
 
 def write_summary_table(aggregate: list[dict[str, Any]], modes: list[str], path: Path) -> None:
     row_map = {(row["model_name"], row["sampling_mode"]): row for row in aggregate}
-    fields = ["model", *[f"{mode}_satloss_improvement_percent" for mode in modes]]
+    fields = ["model", *[f"{mode}_deal_improvement_percent" for mode in modes]]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -439,7 +447,7 @@ def write_summary_table(aggregate: list[dict[str, Any]], modes: list[str], path:
             for mode in modes:
                 base = float(row_map[(family, mode)]["combined_global_rel_l2"])
                 sat = float(row_map[(f"{family}_SATLOSS7", mode)]["combined_global_rel_l2"])
-                record[f"{mode}_satloss_improvement_percent"] = 100.0 * (base - sat) / max(abs(base), 1.0e-12)
+                record[f"{mode}_deal_improvement_percent"] = 100.0 * (base - sat) / max(abs(base), 1.0e-12)
             writer.writerow(record)
 
 
@@ -489,8 +497,8 @@ def plot_satloss_improvements(aggregate: list[dict[str, Any]], modes: list[str],
     ax.set_ylim(min(all_values) - margin, max(all_values) + margin)
     ax.axhline(0.0, color="black", linewidth=1.0)
     ax.set_xticks(x, [SOURCE_LABELS.get(mode, mode.replace("_", " ").title()) for mode in modes], rotation=18, ha="right")
-    ax.set_ylabel("SATLOSS improvement versus base (%)", fontsize=font + 1)
-    ax.set_title("Toy heat exchange: SATLOSS improvement by shift", fontsize=font + 1.5)
+    ax.set_ylabel("DeAL improvement versus base (%)", fontsize=font + 1)
+    ax.set_title("Heat Exchanger: DeAL improvement by shift", fontsize=font + 1.5)
     ax.tick_params(axis="both", labelsize=font)
     ax.grid(axis="y", alpha=0.2)
     ax.legend(fontsize=font, ncol=3, loc="best", framealpha=0.92)
@@ -506,7 +514,7 @@ def plot_density_validation(dataset: ToyHeatExchangeDataset, case_index: int, in
         ax.hist(density[indices].numpy(), bins=48, density=True, histtype="step", linewidth=2.1, color=color, label=shift.replace("_", " "))
     ax.set_xlabel("KDE-16 log density")
     ax.set_ylabel("Probability density")
-    ax.set_title("Toy heat exchange: encoder density under positive shifts")
+    ax.set_title("Heat Exchanger: encoder density under positive shifts")
     ax.grid(alpha=0.2)
     ax.legend(framealpha=0.92)
     fig.savefig(out_path, dpi=260, bbox_inches="tight", pad_inches=0.10)
@@ -567,6 +575,7 @@ def export_analysis(dataset: ToyHeatExchangeDataset, selected: list[int], models
 
 
 def main() -> None:
+    global SOURCE_LABELS
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-root", default="/mnt/ssdraid/parsa/toy_heat_exchange_fem_v1")
     parser.add_argument("--candidate-pool-size", type=int, default=100)
@@ -601,12 +610,20 @@ def main() -> None:
     parser.add_argument("--isotropic-decimated-vtp-dir", default="/mnt/ssdraid/parsa/toy_heat_exchange_surface_vtp_isotropic")
     parser.add_argument("--voxel-decimated-vtp-dir", default="/mnt/ssdraid/parsa/toy_heat_exchange_surface_vtp_voxel")
     parser.add_argument("--original-vtp-dir", default="/mnt/ssdraid/parsa/toy_heat_exchange_surface_vtp")
+    parser.add_argument(
+        "--geometry-label-preset",
+        choices=("legacy", "v4"),
+        default="legacy",
+        help="Use 'v4' for feature-aware, QEM, and voxel-grid-clustering remesh inputs.",
+    )
     parser.add_argument("--font-scale", type=float, default=1.2)
     parser.add_argument("--analysis-case-count", type=int, default=1)
     parser.add_argument("--output-dir", required=True)
     for key in MODEL_SPECS:
         parser.add_argument(f"--{key.lower().replace('_', '-')}-checkpoint", type=Path, required=True)
     args = parser.parse_args()
+    if args.geometry_label_preset == "v4":
+        SOURCE_LABELS = dict(V4_SOURCE_LABELS)
 
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -709,17 +726,24 @@ def main() -> None:
 
     for mode, title_name in (("beta", "beta"), ("sine_x", "sine-x"), ("sine_y", "sine-y")):
         for scale in ("linear", "log"):
-            plot_endpoint_bars(aggregate, mode, output_dir / f"all_models_combined_global_endpoint_bars_{mode}_{scale}.png", f"Toy heat exchange: {title_name} endpoint", scale, args.font_scale)
+            plot_endpoint_bars(
+                aggregate,
+                mode,
+                output_dir / f"all_models_combined_global_endpoint_bars_{mode}_{scale}.png",
+                f"Heat Exchanger: {title_name} endpoint",
+                scale,
+                args.font_scale,
+            )
     geometry_modes = [f"{method}_div{factor}" for method in parse_csv(args.active_geometry_sources) for factor in parse_csv(args.geometry_decimation_factors, int)]
     for scale in ("linear", "log"):
-        plot_geometry_factor_average_bars(aggregate, geometry_modes, output_dir / f"all_models_combined_global_geometry_sources_bars_{scale}.png", "Toy heat exchange: mean remeshing by decimation factor", scale, args.font_scale)
+        plot_geometry_factor_average_bars(aggregate, geometry_modes, output_dir / f"all_models_combined_global_geometry_sources_bars_{scale}.png", "Heat Exchanger: mean remeshing by decimation factor", scale, args.font_scale)
     summary_modes = ["beta", "sine_x", "sine_y", *geometry_modes]
-    write_summary_table(aggregate, summary_modes, output_dir / "all_models_combined_global_satloss_endpoint_improvement.csv")
-    write_improvement_markdown(aggregate, summary_modes, output_dir / "all_models_combined_global_satloss_endpoint_improvement.md")
-    plot_satloss_improvements(aggregate, summary_modes, output_dir / "all_models_combined_global_satloss_endpoint_improvement.png", args.font_scale)
+    write_summary_table(aggregate, summary_modes, output_dir / "all_models_combined_global_deal_endpoint_improvement.csv")
+    write_improvement_markdown(aggregate, summary_modes, output_dir / "all_models_combined_global_deal_endpoint_improvement.md")
+    plot_satloss_improvements(aggregate, summary_modes, output_dir / "all_models_combined_global_deal_endpoint_improvement.png", args.font_scale)
     plot_density_validation(dataset, selected_indices[0], input_points, args, output_dir / "density_shift_validation.png")
     compact_summary = {
-        "benchmark": "toy_heat_exchange",
+        "benchmark": "heat_exchanger",
         "metric": "combined_global_rel_l2",
         "models": [MODEL_SPECS[name]["label"] for name in MODEL_SPECS],
         "conditions": summary_modes,
@@ -729,8 +753,8 @@ def main() -> None:
     }
     (output_dir / "results.json").write_text(json.dumps(compact_summary, indent=2) + "\n", encoding="utf-8")
     (output_dir / "summary.md").write_text(
-        "# Toy Heat-Exchange Sampling-Invariance Comparison\n\n"
-        "Each base/SATLOSS pair uses its checkpoint-matched architecture, its common 65,536-point encoder budget, and identical 32,768-point surface and volume query clouds. "
+        "# Heat-Exchanger Sampling-Invariance Comparison\n\n"
+        "Each base/DeAL pair uses its checkpoint-matched architecture, its common 65,536-point encoder budget, and identical 32,768-point surface and volume query clouds. "
         "Only the encoder cloud changes under beta, sine, or remeshed-input conditions.\n",
         encoding="utf-8",
     )

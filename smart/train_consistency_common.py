@@ -1809,7 +1809,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
         **dl_common,
     )
     # Validation is also distributed.  Keeping the complete test set on rank
-    # 0 makes SATLOSS8 appear to hang after an epoch because PTv3 evaluates
+    # 0 makes distributed PTv3 evaluation appear to hang after an epoch because it evaluates
     # every held-out geometry, including the expensive local-query decoder,
     # while all other ranks wait at the barrier.  Each rank evaluates a
     # disjoint deterministic shard; evaluate_loader all-reduces the metrics.

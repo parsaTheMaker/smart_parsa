@@ -292,68 +292,64 @@ def remesh_voxel_grid(
     """Simplify an existing surface by voxel-grid quadric vertex clustering.
 
     This is deliberately *not* occupancy voxelization or marching cubes.
-    Original vertices are assigned to spatial voxels, each occupied cell is
-    contracted by quadric error, and only the original triangles that survive
-    the vertex collapse are retained.  Therefore the output follows the
-    source surface instead of becoming a blocky voxel isosurface.
+    VTK's compiled ``vtkQuadricClustering`` partitions the original vertices
+    with a uniform spatial grid and contracts each occupied grid cell using
+    its accumulated quadric.  The output therefore follows the source
+    surface rather than becoming a blocky voxel isosurface.  Keeping this
+    native VTK implementation also avoids Open3D's optional ML dependency
+    chain, which is not ABI-compatible with the active NumPy environment.
     """
-    try:
-        import open3d as o3d
-    except ImportError as exc:  # pragma: no cover - environment setup
-        raise RuntimeError("open3d is required for voxel-grid quadric vertex clustering.") from exc
-
     if len(points) == 0 or len(faces) == 0:
         raise RuntimeError("Voxel clustering requires a nonempty triangular mesh.")
     target_faces = float(source_faces) / float(factor)
-    # Quadric-contracted clusters retain more surface detail than an
-    # equilateral triangulation at the same cell width. This calibrated start
-    # point keeps the target search close for smooth and highly featured meshes.
-    voxel_size = target_edge_length(source_area, source_faces, factor) * 0.75
-    lower, upper = voxel_size / 2.5, voxel_size * 2.5
-    source_mesh = o3d.geometry.TriangleMesh(
-        o3d.utility.Vector3dVector(np.ascontiguousarray(points, dtype=np.float64)),
-        o3d.utility.Vector3iVector(np.ascontiguousarray(faces, dtype=np.int32)),
-    )
+    extent = np.maximum(np.asarray(points.max(axis=0) - points.min(axis=0), dtype=np.float64), 1.0e-9)
+    aspect = extent / np.cbrt(np.prod(extent))
+    # The output triangle count scales monotonically with the grid resolution.
+    # This area/aspect-aware estimate places the short calibration search near
+    # the requested div5 or div10 target on both slender and compact Pump meshes.
+    target_cells = max(128.0, target_faces)
+    resolution = np.cbrt(target_cells / max(float(np.prod(aspect)), 1.0e-12))
+    lower, upper = resolution / 2.5, resolution * 2.5
+    source_poly = build_polydata(vtk, np.asarray(points, dtype=np.float64), faces)
     best = None
     try:
         for _ in range(int(args.voxel_adjustments)):
-            clustered = source_mesh.simplify_vertex_clustering(
-                voxel_size=float(voxel_size),
-                contraction=o3d.geometry.SimplificationContraction.Quadric,
-            )
-            candidate_points = np.asarray(clustered.vertices, dtype=np.float64)
-            candidate_faces = remove_degenerate_faces(
-                candidate_points,
-                np.asarray(clustered.triangles, dtype=np.int64),
-            )
-            if len(candidate_faces) == 0:
-                del clustered
-                raise RuntimeError(f"Voxel clustering produced no triangles at cell size={voxel_size:.6g}.")
-            candidate = build_polydata(vtk, candidate_points, candidate_faces)
+            divisions = tuple(int(value) for value in np.maximum(np.rint(aspect * resolution), 8))
+            cluster = vtk.vtkQuadricClustering()
+            cluster.SetInputData(source_poly)
+            cluster.SetNumberOfDivisions(*divisions)
+            cluster.AutoAdjustNumberOfDivisionsOff()
+            cluster.UseFeatureEdgesOff()
+            cluster.UseFeaturePointsOff()
+            cluster.UseInputPointsOn()
+            cluster.Update()
+            candidate = geometry_only(vtk, cluster.GetOutput())
             actual_faces = triangle_count(candidate)
+            if actual_faces == 0:
+                raise RuntimeError(f"Voxel clustering produced no triangles at divisions={divisions}.")
             error = abs(float(actual_faces) - target_faces) / target_faces
             if best is None or error < best[0]:
-                best = (error, candidate, voxel_size, int(len(candidate_points)))
+                best = (error, candidate, divisions, int(candidate.GetNumberOfPoints()))
             else:
                 del candidate
-            del clustered, candidate_points, candidate_faces
+            del cluster
             if error <= float(args.face_tolerance):
                 break
-            # Finer cells retain more faces; coarser cells collapse more.
+            # Finer grids retain more triangles; coarser grids collapse more.
             if actual_faces > target_faces:
-                lower = voxel_size
-                voxel_size = math.sqrt(voxel_size * upper)
+                upper = resolution
+                resolution = math.sqrt(lower * resolution)
             else:
-                upper = voxel_size
-                voxel_size = math.sqrt(lower * voxel_size)
+                lower = resolution
+                resolution = math.sqrt(resolution * upper)
     finally:
-        del source_mesh
+        del source_poly
 
     assert best is not None
-    best_error, result, best_voxel_size, output_vertices = best
+    best_error, result, best_divisions, output_vertices = best
     return result, {
-        "backend": "open3d_voxel_grid_quadric_vertex_clustering_cpu",
-        "voxel_size": float(best_voxel_size),
+        "backend": "vtk_voxel_grid_quadric_vertex_clustering_cpu",
+        "grid_divisions": list(best_divisions),
         "output_vertices": output_vertices,
         "best_relative_error": float(best_error),
     }
@@ -596,7 +592,16 @@ def remesh_one(path: Path, args: argparse.Namespace, factors: Iterable[int], met
             out_dir = output_root / method / case_name
             out_path = out_dir / f"{path.stem}_faces_div{factor}.vtp"
             if out_path.is_file() and not args.overwrite:
-                records.append({"input": str(path), "output": str(out_path), "method": method, "factor": factor, "status": "existing"})
+                records.append(
+                    {
+                        "input": str(path),
+                        "output": str(out_path),
+                        "case_id": numeric_id(path),
+                        "method": method,
+                        "factor": factor,
+                        "status": "existing",
+                    }
+                )
                 continue
             started = time.perf_counter()
             print(f"[{case_name}] {method} div{factor}: starting", flush=True)
@@ -815,7 +820,7 @@ def main() -> int:
         "strict_topology": bool(args.strict_topology),
         "failures": failures,
         "method_definitions": {
-            "voxel": "Open3D voxel-grid vertex clustering with quadric-contracted cluster representatives",
+            "voxel": "VTK voxel-grid quadric clustering with quadric-contracted cluster representatives",
             "quadric": "VTK volume-preserving quadric-error simplification",
             "isotropic": "MeshLab explicit isotropic remeshing: split/collapse/flip/smooth/reproject",
             "feature": "VTK topology-preserving feature-aware edge-collapse",

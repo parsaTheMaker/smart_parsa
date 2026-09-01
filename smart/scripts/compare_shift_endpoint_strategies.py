@@ -19,13 +19,16 @@ applied to a remeshed source.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import json
+import struct
 import sys
 from contextlib import nullcontext
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from xml.etree import ElementTree
 
 import numpy as np
 import torch
@@ -37,10 +40,10 @@ if str(SMART_ROOT) not in sys.path:
 
 from data.pump_dataset import PumpDataset  # noqa: E402
 from data.shift_submarine_dataset import ShiftSubmarineDataset  # noqa: E402
+from data.toy_heat_exchange_dataset import ToyHeatExchangeDataset  # noqa: E402
 from models.smart.smart import SMART  # noqa: E402
 from scripts.compare_shift_submarine_sampling_invariance import (  # noqa: E402
     load_checkpoint,
-    load_vtp_points,
     mode_records,
     normalize_positions,
     sample_encoder_indices,
@@ -61,6 +64,7 @@ DATASET_DEFAULTS = {
         "surface_channels": 4,
         "volume_channels": 4,
         "parameter_channels": 0,
+        "native_geometry_file": "surface_coords.npy",
     },
     "pump": {
         "data_root": Path("/mnt/ssdraid/parsa/shift_pump_preprocessed"),
@@ -72,6 +76,19 @@ DATASET_DEFAULTS = {
         "surface_channels": 7,
         "volume_channels": 4,
         "parameter_channels": 13,
+        "native_geometry_file": "surface_coords.npy",
+    },
+    "heat_exchanger": {
+        "data_root": Path("/mnt/ssdraid/parsa/toy_heat_exchange_fem_v1"),
+        "base_config": "toy_heat_exchange",
+        "satloss_config": "toy_heat_exchange_satloss7",
+        "downsample_config": "toy_heat_exchange_downsample",
+        "gaussian_config": "toy_heat_exchange_gaussian_ball_masked",
+        "box_config": "toy_heat_exchange_box_masked",
+        "surface_channels": 1,
+        "volume_channels": 1,
+        "parameter_channels": 0,
+        "native_geometry_file": "geometry_coords.npy",
     },
 }
 
@@ -126,7 +143,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--volume-query-points", type=int, default=65536)
     parser.add_argument("--query-chunk-size", type=int, default=65536)
     parser.add_argument("--devices", default="cuda:0")
+    parser.add_argument(
+        "--min-free-gib",
+        type=float,
+        default=4.0,
+        help="Fail before model placement when a requested CUDA device has insufficient free VRAM.",
+    )
     parser.add_argument("--geometry-decimation-factors", default="5,10")
+    parser.add_argument(
+        "--active-geometry-sources",
+        default="angle,isotropic,voxel",
+        help=(
+            "Comma-separated remesh sources to include in the div5/div10 means: "
+            "angle, isotropic, voxel. Defaults to all available sources."
+        ),
+    )
     parser.add_argument(
         "--geometry-label-preset",
         choices=("legacy", "v4"),
@@ -159,11 +190,89 @@ def parse_devices(value: str) -> list[torch.device]:
     return devices
 
 
+def require_free_cuda_memory(devices: list[torch.device], minimum_gib: float) -> None:
+    """Prevent a driver-level OOM/segfault from concurrent training jobs."""
+    if minimum_gib < 0:
+        raise ValueError("--min-free-gib must be non-negative.")
+    minimum_bytes = int(float(minimum_gib) * (1024**3))
+    checked: set[int] = set()
+    for device in devices:
+        if device.type != "cuda" or device.index in checked:
+            continue
+        checked.add(device.index)
+        with torch.cuda.device(device):
+            free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        free_gib = free_bytes / float(1024**3)
+        total_gib = total_bytes / float(1024**3)
+        print(f"[vram] {device}: {free_gib:.1f}/{total_gib:.1f} GiB free", flush=True)
+        if free_bytes < minimum_bytes:
+            raise RuntimeError(
+                f"{device} has only {free_gib:.1f} GiB free, below --min-free-gib={minimum_gib:.1f}. "
+                "Choose idle GPUs or wait for the active training jobs to finish."
+            )
+
+
 def parse_factors(value: str) -> set[int]:
     factors = {int(item.strip()) for item in str(value).split(",") if item.strip()}
     if not factors or any(item <= 1 for item in factors):
         raise ValueError("--geometry-decimation-factors must contain integers greater than one.")
     return factors
+
+
+def load_vtp_points(path: Path) -> np.ndarray:
+    """Read inline VTP point coordinates without invoking VTK's XML reader.
+
+    The v4 feature-aware Pump outputs are valid inline-base64 VTPs, but the
+    installed VTK reader can segfault while decoding some of those payloads.
+    The comparison needs coordinates only, so decoding the documented VTK XML
+    ``Points/DataArray`` format directly is both safer and substantially
+    lighter than constructing a full polydata object.
+    """
+    try:
+        root = ElementTree.parse(path).getroot()
+    except (OSError, ElementTree.ParseError) as exc:
+        raise RuntimeError(f"Could not parse VTP XML: {path}") from exc
+    data_array = root.find(".//Points/DataArray")
+    if data_array is None:
+        raise RuntimeError(f"VTP contains no point DataArray: {path}")
+    components = int(data_array.attrib.get("NumberOfComponents", "1"))
+    if components != 3:
+        raise ValueError(f"VTP points must have three components, got {components}: {path}")
+    vtk_type = data_array.attrib.get("type", "Float32")
+    type_map = {"Float32": "f4", "Float64": "f8"}
+    if vtk_type not in type_map:
+        raise ValueError(f"Unsupported VTP point type {vtk_type!r}: {path}")
+    byte_order = root.attrib.get("byte_order", "LittleEndian")
+    endian = "<" if byte_order == "LittleEndian" else ">"
+    dtype = np.dtype(endian + type_map[vtk_type])
+    format_name = data_array.attrib.get("format", "ascii").lower()
+    text = "".join((data_array.text or "").split())
+    if format_name == "ascii":
+        values = np.fromstring(text, sep=" ", dtype=dtype)
+    elif format_name == "binary":
+        try:
+            payload = base64.b64decode(text, validate=True)
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid inline-base64 VTP point payload: {path}") from exc
+        header_type = root.attrib.get("header_type", "UInt32")
+        header_formats = {"UInt32": "I", "UInt64": "Q"}
+        if header_type not in header_formats:
+            raise ValueError(f"Unsupported VTP binary header {header_type!r}: {path}")
+        header_size = struct.calcsize(header_formats[header_type])
+        if len(payload) < header_size:
+            raise RuntimeError(f"Truncated VTP point payload header: {path}")
+        point_bytes = struct.unpack(endian + header_formats[header_type], payload[:header_size])[0]
+        if point_bytes > len(payload) - header_size or point_bytes % dtype.itemsize:
+            raise RuntimeError(f"Invalid VTP point payload size: {path}")
+        values = np.frombuffer(payload, dtype=dtype, count=point_bytes // dtype.itemsize, offset=header_size)
+    else:
+        raise ValueError(f"Unsupported VTP point encoding {format_name!r}: {path}")
+    if values.size % 3:
+        raise RuntimeError(f"VTP point payload is not divisible into XYZ triplets: {path}")
+    points = np.asarray(values.reshape(-1, 3), dtype=np.float32)
+    if points.shape[0] == 0 or not np.isfinite(points).all():
+        raise ValueError(f"Invalid VTP points: {path}")
+    return np.ascontiguousarray(points)
 
 
 def load_config(dataset_name: str, config_name: str):
@@ -172,12 +281,18 @@ def load_config(dataset_name: str, config_name: str):
     defaults = DATASET_DEFAULTS[dataset_name]
     base = OmegaConf.load(str(SMART_ROOT / "config" / f"{defaults['base_config']}.yaml"))
     variant = OmegaConf.load(str(SMART_ROOT / "config" / f"{config_name}.yaml"))
+    if dataset_name == "heat_exchanger":
+        # These YAML files use Hydra defaults.  This standalone comparator
+        # composes their shared experiment settings explicitly so checkpoint
+        # inference uses the same 65K encoder budget as training.
+        common = OmegaConf.load(str(SMART_ROOT / "config" / "toy_heat_exchange_common.yaml"))
+        base = OmegaConf.merge(common, base)
     return OmegaConf.merge(base, variant)
 
 
 def model_input_budget(config, dataset_name: str) -> int:
     experiment = config.experiment
-    if str(experiment.dataset).lower() == "naca4":
+    if str(getattr(experiment, "dataset", "")).lower() == "naca4":
         return int(getattr(experiment, "num_body_points", 0))
     primary = int(getattr(experiment, "primary_view_geometry_points", 0))
     if primary > 0:
@@ -192,9 +307,11 @@ def model_input_budget(config, dataset_name: str) -> int:
 
 
 def make_model(dataset_name: str, config_name: str, checkpoint: Path, device: torch.device, query_chunk_size: int):
+    from omegaconf import OmegaConf
+
     info = DATASET_DEFAULTS[dataset_name]
     config = load_config(dataset_name, config_name)
-    architecture = dict(config.experiment.architecture)
+    architecture = OmegaConf.to_container(config.experiment.architecture, resolve=True)
     model = SMART(
         spatial_dim=3,
         surface_channels=info["surface_channels"],
@@ -208,7 +325,8 @@ def make_model(dataset_name: str, config_name: str, checkpoint: Path, device: to
 
 
 def fixed_queries(run_id: int, root: Path, dataset, surface_budget: int, volume_budget: int, seed: int) -> dict:
-    run_dir = root / f"run_{run_id}"
+    del root
+    run_dir = dataset._run_dir(run_id)
     surface_coords = np.load(run_dir / "surface_coords.npy", mmap_mode="r")
     surface_data = np.load(run_dir / "surface_data.npy", mmap_mode="r")
     volume_coords = np.load(run_dir / "volume_coords.npy", mmap_mode="r")
@@ -233,6 +351,21 @@ def fixed_queries(run_id: int, root: Path, dataset, surface_budget: int, volume_
         "span": span,
         "params": params,
     }
+
+
+def native_geometry(run_id: int, dataset_name: str, dataset) -> np.ndarray:
+    """Load the full native encoder cloud without confusing it with queries.
+
+    Pump's geometry and surface-query cloud coincide.  Heat Exchanger stores
+    a distinct, non-uniform FEM geometry cloud, which is the correct native
+    encoder source for its distribution-shift experiment.
+    """
+    filename = DATASET_DEFAULTS[dataset_name]["native_geometry_file"]
+    points = np.load(dataset._run_dir(run_id) / filename, mmap_mode="r")
+    points = np.asarray(points, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 3 or not np.isfinite(points).all():
+        raise ValueError(f"Invalid native geometry for case {run_id}: {dataset._run_dir(run_id) / filename}")
+    return np.ascontiguousarray(points)
 
 
 def predict(model, device: torch.device, geometry: np.ndarray, queries: dict) -> tuple[np.ndarray, np.ndarray]:
@@ -309,7 +442,7 @@ def normalize_study_summary(summary: dict) -> dict:
             aliases = {"feature": "angle", "quadric": "isotropic", "voxel": "voxel"}
             by_case: dict[int, dict[str, str]] = {}
             for item in records:
-                if str(item.get("status", "ok")) != "ok":
+                if str(item.get("status", "ok")) not in {"ok", "existing"}:
                     continue
                 method = aliases.get(str(item.get("method", "")))
                 factor = item.get("factor")
@@ -339,6 +472,43 @@ def normalize_study_summary(summary: dict) -> dict:
     normalized = dict(summary)
     normalized["records"] = records
     return normalized
+
+
+def discover_completed_remesh_records(output_root: Path, factors: set[int], dataset: str) -> list[dict]:
+    """Discover fully written v4 remesh cases before the batch summary is finalized.
+
+    The bulk remesher writes its summary only after every worker exits.  For a
+    long Pump run that leaves a valid but stale smoke-test summary on disk for
+    hours.  A case is usable as soon as every source required by this protocol
+    exists, so construct the same normalized record structure directly from
+    the output tree.  Partial cases are deliberately excluded.
+    """
+    aliases = {"feature": "angle", "quadric": "isotropic", "voxel": "voxel"}
+    backends = ("quadric", "voxel") if dataset == "submarine" else ("feature", "quadric", "voxel")
+    reference_root = output_root / backends[0]
+    if not reference_root.is_dir():
+        return []
+
+    records: list[dict] = []
+    for case_dir in sorted(path for path in reference_root.iterdir() if path.is_dir()):
+        try:
+            run_id = int(case_dir.name.rsplit("_", 1)[-1])
+        except ValueError:
+            continue
+        outputs: dict[str, str] = {}
+        complete = True
+        for backend in backends:
+            for factor in sorted(factors):
+                matches = sorted((output_root / backend / case_dir.name).glob(f"*_faces_div{factor}.vtp"))
+                if len(matches) != 1:
+                    complete = False
+                    break
+                outputs[f"{aliases[backend]}_div{factor}"] = str(matches[0])
+            if not complete:
+                break
+        if complete:
+            records.append({"run_id": run_id, "outputs": outputs})
+    return records
 
 
 def select_top_candidates(rows: list[dict], top_k: int) -> tuple[list[int], list[dict]]:
@@ -651,7 +821,20 @@ def main() -> int:
     data_root = args.data_root or DATASET_DEFAULTS[args.dataset]["data_root"]
     factors = parse_factors(args.geometry_decimation_factors)
     summary = normalize_study_summary(json.loads(args.study_summary.read_text(encoding="utf-8")))
-    dataset_cls = ShiftSubmarineDataset if args.dataset == "submarine" else PumpDataset
+    if args.case_selection == "study":
+        discovered_records = discover_completed_remesh_records(args.study_summary.parent, factors, args.dataset)
+        if len(discovered_records) > len(summary.get("records", [])):
+            print(
+                f"[study] Using {len(discovered_records)} fully completed cases discovered from "
+                f"{args.study_summary.parent}; the remesher summary is not finalized yet.",
+                flush=True,
+            )
+            summary = {**summary, "records": discovered_records}
+    dataset_cls = {
+        "submarine": ShiftSubmarineDataset,
+        "pump": PumpDataset,
+        "heat_exchanger": ToyHeatExchangeDataset,
+    }[args.dataset]
     dataset = dataset_cls(
         data_root,
         if_test=True,
@@ -671,7 +854,11 @@ def main() -> int:
         rng = np.random.default_rng(args.seed + 8811)
         run_ids = sorted(int(item) for item in rng.choice(np.asarray(available), size=count, replace=False))
     if len(run_ids) != int(args.num_runs) and not args.run_ids:
-        raise ValueError(f"Only {len(run_ids)} test cases are available, requested {args.num_runs}.")
+        scope = "fully completed remeshing-study cases" if args.case_selection == "study" else "test cases"
+        raise ValueError(
+            f"Only {len(run_ids)} {scope} are available, requested {args.num_runs}. "
+            "The remesher summary is written only after its workers finish; rerun after more complete cases are present."
+        )
 
     defaults = DATASET_DEFAULTS[args.dataset]
     config_names = {
@@ -689,6 +876,7 @@ def main() -> int:
         "box_masked": args.box_masked_checkpoint,
     }
     devices = parse_devices(args.devices)
+    require_free_cuda_memory(devices, args.min_free_gib)
     model_items = OrderedDict()
     for index, model in enumerate(MODEL_ORDER):
         device = devices[index % len(devices)]
@@ -699,7 +887,19 @@ def main() -> int:
     sine_x_mode = mode_records(["sine_x"], (0.0, 1.0))["sine_x_1.00"]
     sine_y_mode = mode_records(["sine_y"], (0.0, 1.0))["sine_y_1.00"]
     endpoint_modes = OrderedDict([("sine_x_1", sine_x_mode), ("sine_y_1", sine_y_mode)])
-    remesh_prefixes = ("isotropic", "voxel") if args.dataset == "submarine" else REMESH_PREFIXES
+    requested_remesh_prefixes = tuple(
+        item.strip().lower() for item in str(args.active_geometry_sources).split(",") if item.strip()
+    )
+    available_remesh_prefixes = ("isotropic", "voxel") if args.dataset == "submarine" else REMESH_PREFIXES
+    if not requested_remesh_prefixes:
+        raise ValueError("--active-geometry-sources must include at least one remesh source.")
+    invalid_remesh_prefixes = sorted(set(requested_remesh_prefixes) - set(available_remesh_prefixes))
+    if invalid_remesh_prefixes:
+        raise ValueError(
+            f"Unsupported remesh sources for {args.dataset}: {invalid_remesh_prefixes}. "
+            f"Available: {list(available_remesh_prefixes)}"
+        )
+    remesh_prefixes = tuple(dict.fromkeys(requested_remesh_prefixes))
     remesh_groups = {
         "remeshing_div5_mean": tuple(f"{prefix}_div5" for prefix in remesh_prefixes),
         "remeshing_div10_mean": tuple(f"{prefix}_div10" for prefix in remesh_prefixes),
@@ -727,7 +927,7 @@ def main() -> int:
         device = group["device"]
         context = torch.cuda.device(device) if device.type == "cuda" else nullcontext()
         with context:
-            for model_index, model in group["models"]:
+            for _model_index, model in group["models"]:
                 item = model_items[model]
                 budget = int(item["budget"])
                 seed = (
@@ -735,10 +935,11 @@ def main() -> int:
                     + 1000003 * int(run_id)
                     + 10007 * run_index
                     + 1009 * view_index
-                    + 7001 * model_index
                     + stable_tag(category)
                     + stable_tag(source_name)
                 )
+                # Keep the encoder realization paired across methods.  The
+                # model is the only varying factor in a per-case comparison.
                 if source_name == "original":
                     indices = sample_encoder_indices(original, density, mode, budget, seed)
                 else:
@@ -767,8 +968,7 @@ def main() -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict] = []
     for run_index, run_id in enumerate(run_ids):
-        run_dir = data_root / f"run_{run_id}"
-        original = np.ascontiguousarray(np.asarray(np.load(run_dir / "surface_coords.npy", mmap_mode="r"), dtype=np.float32))
+        original = native_geometry(run_id, args.dataset, dataset)
         density = dataset._load_density(run_id, original).numpy().astype(np.float32, copy=False)
         queries = fixed_queries(run_id, data_root, dataset, args.surface_query_points, args.volume_query_points, args.seed)
         source_paths = {name: path for name, path in source_records(summary, run_id) if name in active_sources and path is not None}

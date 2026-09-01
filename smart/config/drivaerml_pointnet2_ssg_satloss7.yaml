@@ -1,5 +1,5 @@
 defaults:
-  - drivaerml_pointnet2_ssg_satloss6
+  - drivaerml_satloss7
   - _self_
 
 experiment:
@@ -10,6 +10,24 @@ experiment:
   init_ckpt: ""
   resume_ckpt: ""
   resume_full_state: False
+  architecture:
+    latent_dim: 256
+    sa1_npoint: 2048
+    sa1_radius: 0.02
+    sa1_nsample: 64
+    sa2_npoint: 512
+    sa2_radius: 0.05
+    sa2_nsample: 128
+    query_neighbors: 3
+    centroid_sampling: random
+    density_histogram_bins: 8
+    pos_scale_factor: 1.0
+    query_chunk_size: 65536
+    dropout: 0.0
+  view_geometry_points: 65536
+  eval_view_geometry_points: 65536
+  geometry_epoch_seeded_sampling: False
+  cuda_batch_prefetch: True
   shared_shift_view_geometry_points: 65536
   train_shared_shift_sampling_mode: "random_beta_sine"
   shared_shift_family_probabilities: [0.3333333333, 0.3333333333, 0.3333333334]

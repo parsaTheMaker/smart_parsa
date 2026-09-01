@@ -159,7 +159,7 @@ class _SharedPointMLP(nn.Module):
             layers.extend([
                 nn.Linear(current, width),
                 # Group/set-local normalization avoids running-statistic drift
-                # when SATLOSS6 processes differently sampled views together.
+                # when consistency training processes differently sampled views together.
                 nn.LayerNorm(width),
                 nn.ReLU(),
             ])

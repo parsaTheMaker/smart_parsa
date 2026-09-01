@@ -1,5 +1,5 @@
 defaults:
-  - drivaerml_lno_satloss6
+  - drivaerml_satloss7
   - _self_
 
 experiment:
@@ -10,6 +10,25 @@ experiment:
   init_ckpt: ""
   resume_ckpt: ""
   resume_full_state: False
+  architecture:
+    n_block: 8
+    n_mode: 256
+    n_dim: 256
+    n_head: 8
+    n_layer: 2
+    attn: "Galerkin"
+    activation: "GELU"
+    pos_scale_factor: 1.0
+    query_chunk_size: 65536
+    dropout: 0.0
+    normalize_scores: True
+    encode_score_temperature: 2.0
+    decode_score_temperature: 1.0
+  view_geometry_points: 65536
+  eval_view_geometry_points: 65536
+  batch_size: 2
+  geometry_epoch_seeded_sampling: False
+  cuda_batch_prefetch: True
   shared_shift_view_geometry_points: 65536
   train_shared_shift_sampling_mode: "random_beta_sine"
   shared_shift_family_probabilities: [0.3333333333, 0.3333333333, 0.3333333334]

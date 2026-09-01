@@ -1,5 +1,5 @@
 defaults:
-  - drivaerml_point_gnn_satloss6
+  - drivaerml_satloss7
   - _self_
 
 experiment:
@@ -7,6 +7,24 @@ experiment:
   model_name: "POINT_GNN_SATLOSS7"
   model_tag: ""
   epochs: 150
+  architecture:
+    latent_dim: 256
+    node_dim: 64
+    edge_hidden_dim: 128
+    graph_radii: [0.035, 0.08, 0.16, 0.24]
+    graph_max_neighbors: 16
+    pool_voxel_sizes: [0.025, 0.06, 0.12]
+    auto_center_layers: [true, true, true, true]
+    auto_center_offset_scale: 0.05
+    query_neighbors: 8
+    query_chunk_size: 32768
+    num_query_blocks: 3
+    pos_scale_factor: 100.0
+    local_sum_scale: 0.25
+    global_sum_scale: 0.015625
+    edge_chunk_size: 262144
+    dropout: 0.0
+  batch_size: 2
   shared_shift_view_geometry_points: 131072
   train_shared_shift_sampling_mode: "random_beta_sine"
   shared_shift_family_probabilities: [0.3333333333, 0.3333333333, 0.3333333334]

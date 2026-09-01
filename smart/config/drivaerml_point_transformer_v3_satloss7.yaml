@@ -1,5 +1,5 @@
 defaults:
-  - drivaerml_point_transformer_v3_satloss6
+  - drivaerml_satloss7
   - _self_
 
 experiment:
@@ -10,6 +10,48 @@ experiment:
   init_ckpt: ""
   resume_ckpt: ""
   resume_full_state: False
+  architecture:
+    in_channels: 3
+    grid_size: 0.0078125
+    latent_dim: 192
+    num_latents: 64
+    order: [z, z-trans, hilbert, hilbert-trans]
+    stride: [2, 2, 2, 2]
+    enc_depths: [1, 1, 2, 4, 1]
+    enc_channels: [24, 48, 96, 192, 256]
+    enc_heads: [2, 4, 4, 8, 16]
+    enc_patch_size: [1024, 1024, 1024, 1024, 1024]
+    dec_depths: [1, 1, 1, 1]
+    dec_channels: [48, 48, 96, 192]
+    dec_heads: [2, 2, 4, 8]
+    dec_patch_size: [1024, 1024, 1024, 1024]
+    mlp_ratio: 2.0
+    drop_path: 0.3
+    shuffle_orders: true
+    enable_flash: true
+    spconv_algo: native
+    attn_drop: 0.0
+    proj_drop: 0.0
+    pos_scale_factor: 100
+    query_chunk_size: 65536
+    local_query_neighbors: 4
+    local_query_chunk_size: 8192
+    use_local_query_features: true
+    geometry_input_scale: 1.0
+    voxel_density_power: 0.0
+    preserve_density: false
+    dropout: 0.0
+  view_geometry_points: 131072
+  eval_view_geometry_points: 131072
+  batch_size: 2
+  gradient_norm: null
+  track_gradient_diagnostics: true
+  amp_scaler_init_scale: 1024.0
+  amp_scaler_growth_interval: 1000000
+  amp_scaler_reset_on_resume: true
+  scheduler_reset_on_resume: true
+  geometry_epoch_seeded_sampling: false
+  cuda_batch_prefetch: true
   shared_shift_view_geometry_points: 131072
   train_shared_shift_sampling_mode: "random_beta_sine"
   shared_shift_family_probabilities: [0.3333333333, 0.3333333333, 0.3333333334]

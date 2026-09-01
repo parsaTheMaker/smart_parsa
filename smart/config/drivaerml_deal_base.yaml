@@ -9,68 +9,57 @@ hydra:
     dir: .
 
 wandb:
-  project: "smart_drivaerml"
+  project: "smart"
   entity: "parsa-vatani99-technical-university-of-munich"
 
 experiment:
-  name: "DrivAerML_POINT_GNN_SATLOSS6"
-  model_name: "POINT_GNN_SATLOSS6"
+  name: "DrivAerML_DEAL_BASE"
+  model_name: "SMART_DEAL_BASE"
   model_tag: ""
   random_seed: 42
   manifest_variant: "full"
 
   architecture:
     latent_dim: 256
-    node_dim: 64
-    edge_hidden_dim: 128
-    graph_radii: [0.035, 0.08, 0.16, 0.24]
-    graph_max_neighbors: 16
-    pool_voxel_sizes: [0.025, 0.06, 0.12]
-    auto_center_layers: [true, true, true, true]
-    auto_center_offset_scale: 0.05
-    query_neighbors: 8
-    query_chunk_size: 32768
-    num_query_blocks: 3
-    pos_scale_factor: 100.0
-    local_sum_scale: 0.25
-    global_sum_scale: 0.015625
-    edge_chunk_size: 262144
-    dropout: 0.0
+    latent_geometry_points: 4096
+    subsampled_geometry_points: 16384
+    subsampled_geometry_with_replacement: True
+    num_encoder_decoder_blocks: 6
+    pos_scale_factor: 100
 
   optimizer: "adamw"
   loss_fn: "rel_l2"
   scheduler: "cosine"
   scheduler_warmup_fraction: 0.2
-  batch_size: 2
+  batch_size: 1
   epochs: 300
   learning_rate: 2.e-4
   gradient_norm: null
-  amp: true
+  amp: True
   precision: "float16"
   log_every_n_steps: 5
-  inspect_first_sample: false
-  init_ckpt: ""
+  inspect_first_sample: False
+  init_ckpt: "/home/parsa/smart_parsa/checkpoints/smart-smart-drivaerml-131k16kwr-drivaerml-s42_best.pt"
   resume_ckpt: ""
-  resume_full_state: false
-  wandb_watch_model: false
+  resume_full_state: False
+  wandb_watch_model: False
   multi_gpu_strategy: "auto"
 
   dataset: "DrivAerML"
   data_path: "/mnt/ssdraid/parsa/drivaerml_preprocessed"
   num_workers: 4
   prefetch_factor: 2
-  pin_memory: true
-  cuda_batch_prefetch: true
+  pin_memory: True
+  cuda_batch_prefetch: True
   geometry_density_cache_dtype: "float16"
   density_knn_k: 16
   density_neighbor_hops: 1
   density_estimator: "kde"
-  geometry_epoch_seeded_sampling: false
-  # Keep the full source cloud so both 131k views are real resamplings.
+  geometry_epoch_seeded_sampling: False
   num_body_points: 0
   num_surface_points: 65536
   num_volume_points: 65536
-  scale_positions: false
+  scale_positions: False
 
   view_geometry_points: 131072
   eval_view_geometry_points: 131072
@@ -79,21 +68,21 @@ experiment:
   eval_aligned_sampling_mode: "uniform_wor"
   eval_shifted_sampling_mode: "inverse_density_wor"
   inverse_density_beta: 1.0
-  randomize_primary_inverse_density_beta: true
+  randomize_primary_inverse_density_beta: True
   primary_inverse_density_beta_min: 0.0
   primary_inverse_density_beta_max: 0.5
-  randomize_secondary_inverse_density_beta: true
+  randomize_secondary_inverse_density_beta: True
   secondary_inverse_density_beta_min: 0.0
   secondary_inverse_density_beta_max: 0.5
   mixed_inverse_density_prob: 1.0
-  use_prediction_consistency: true
+  use_prediction_consistency: True
   prediction_consistency_weight: 1.0
   prediction_consistency_smooth_l1_beta: 0.1
-  use_latent_consistency: false
+  use_latent_consistency: False
   consistency_warmup_epochs: 20
-  fuse_consistency_views: true
+  fuse_consistency_views: True
 
-  use_learned_task_weighting: true
+  use_learned_task_weighting: True
   task_weight_lr: 5.e-4
   task_weight_init_logits: [0.0, 0.0, 0.0]
   task_weight_logit_min: -3.0

@@ -101,34 +101,18 @@ MODEL_ORDER = [
     "SMART_SATLOSS4",
     "SMART_SATLOSS5",
     "SMART_SATLOSS5_NOPM",
-    "SMART_SATLOSS6",
-    "SMART_SATLOSS6_FIXEDSUM",
-    "SMART_SATLOSS6_GRADNORM",
-    "SMART_SATLOSS6_CONFIG_FULL",
-    "SMART_SATLOSS6_CONFIG_LAYER",
     "SMART_SATLOSS7",
-    "SMART_SATLOSS8",
     "TRANSOLVERPP",
     "TRANSOLVERPP_SATLOSS3",
-    "TRANSOLVERPP_SATLOSS6",
     "TRANSOLVERPP_SATLOSS7",
-    "TRANSOLVERPP_SATLOSS8",
     "POINTNET2_SSG",
-    "POINTNET2_SSG_SATLOSS6",
     "POINTNET2_SSG_SATLOSS7",
-    "POINTNET2_SSG_SATLOSS8",
     "LNO",
-    "LNO_SATLOSS6",
     "LNO_SATLOSS7",
-    "LNO_SATLOSS8",
     "MSPT",
-    "MSPT_SATLOSS6",
     "MSPT_SATLOSS7",
-    "MSPT_SATLOSS8",
     "POINT_TRANSFORMER_V3",
-    "POINT_TRANSFORMER_V3_SATLOSS6",
     "POINT_TRANSFORMER_V3_SATLOSS7",
-    "POINT_TRANSFORMER_V3_SATLOSS8",
 ]
 MODEL_LABELS = {
     "SMART": "SMART",
@@ -139,34 +123,18 @@ MODEL_LABELS = {
     "SMART_SATLOSS4": "SMART-DeAL4",
     "SMART_SATLOSS5": "SMART-DeAL5",
     "SMART_SATLOSS5_NOPM": "SMART-DeAL5-NOPM",
-    "SMART_SATLOSS6": "SMART-DeAL6",
-    "SMART_SATLOSS6_FIXEDSUM": "SMART-DeAL6-FIXEDSUM",
-    "SMART_SATLOSS6_GRADNORM": "SMART-DeAL6-GRADNORM",
-    "SMART_SATLOSS6_CONFIG_FULL": "SMART-DeAL6-ConFIG-FULL",
-    "SMART_SATLOSS6_CONFIG_LAYER": "SMART-DeAL6-ConFIG-LAYER",
     "SMART_SATLOSS7": "SMART-DeAL",
-    "SMART_SATLOSS8": "SMART-DeAL8",
     "TRANSOLVERPP": "TransolverPP",
     "TRANSOLVERPP_SATLOSS3": "TransolverPP-DeAL3",
-    "TRANSOLVERPP_SATLOSS6": "TransolverPP-DeAL6",
     "TRANSOLVERPP_SATLOSS7": "TransolverPP-DeAL",
-    "TRANSOLVERPP_SATLOSS8": "TransolverPP-DeAL8",
     "POINTNET2_SSG": "PointNet++-SSG",
-    "POINTNET2_SSG_SATLOSS6": "PointNet++-SSG-DeAL6",
     "POINTNET2_SSG_SATLOSS7": "PointNet++-SSG-DeAL",
-    "POINTNET2_SSG_SATLOSS8": "PointNet++-SSG-DeAL8",
     "LNO": "LNO",
-    "LNO_SATLOSS6": "LNO-DeAL6",
     "LNO_SATLOSS7": "LNO-DeAL",
-    "LNO_SATLOSS8": "LNO-DeAL8",
     "MSPT": "MSPT",
-    "MSPT_SATLOSS6": "MSPT-DeAL6",
     "MSPT_SATLOSS7": "MSPT-DeAL",
-    "MSPT_SATLOSS8": "MSPT-DeAL8",
     "POINT_TRANSFORMER_V3": "PointTransformerV3",
-    "POINT_TRANSFORMER_V3_SATLOSS6": "PointTransformerV3-DeAL6",
     "POINT_TRANSFORMER_V3_SATLOSS7": "PointTransformerV3-DeAL",
-    "POINT_TRANSFORMER_V3_SATLOSS8": "PointTransformerV3-DeAL8",
 }
 MODEL_COLORS = {
     "SMART": "#6C6F7D",
@@ -177,34 +145,18 @@ MODEL_COLORS = {
     "SMART_SATLOSS4": "#72B7B2",
     "SMART_SATLOSS5": "#E45756",
     "SMART_SATLOSS5_NOPM": "#9D755D",
-    "SMART_SATLOSS6": "#54A24B",
-    "SMART_SATLOSS6_FIXEDSUM": "#2CA02C",
-    "SMART_SATLOSS6_GRADNORM": "#FF7F0E",
-    "SMART_SATLOSS6_CONFIG_FULL": "#9467BD",
-    "SMART_SATLOSS6_CONFIG_LAYER": "#17BECF",
     "SMART_SATLOSS7": "#4C78A8",
-    "SMART_SATLOSS8": "#76A5D5",
     "TRANSOLVERPP": "#6C6F7D",
     "TRANSOLVERPP_SATLOSS3": "#E45756",
-    "TRANSOLVERPP_SATLOSS6": "#FF9896",
     "TRANSOLVERPP_SATLOSS7": "#FFBB78",
-    "TRANSOLVERPP_SATLOSS8": "#F6B26B",
     "POINTNET2_SSG": "#17BECF",
-    "POINTNET2_SSG_SATLOSS6": "#2CA02C",
     "POINTNET2_SSG_SATLOSS7": "#98DF8A",
-    "POINTNET2_SSG_SATLOSS8": "#78C679",
     "LNO": "#E45756",
-    "LNO_SATLOSS6": "#F58518",
     "LNO_SATLOSS7": "#FFBB78",
-    "LNO_SATLOSS8": "#F08080",
     "MSPT": "#BCBD22",
-    "MSPT_SATLOSS6": "#9467BD",
     "MSPT_SATLOSS7": "#C5B0D5",
-    "MSPT_SATLOSS8": "#B39DDB",
     "POINT_TRANSFORMER_V3": "#1B9E77",
-    "POINT_TRANSFORMER_V3_SATLOSS6": "#66A61E",
     "POINT_TRANSFORMER_V3_SATLOSS7": "#A6D854",
-    "POINT_TRANSFORMER_V3_SATLOSS8": "#B7E085",
 }
 # Standard Matplotlib tab10 colors for line plots.  These are intentionally
 # separate from the broader chart palette used by bars and heatmaps.
@@ -219,26 +171,6 @@ LINE_MODEL_COLORS = {
     "MSPT": "#2CA02C",
     "POINT_TRANSFORMER_V3": "#7F3C8D",
 }
-# In the dedicated SMART/SATLOSS6 weighting comparison, each weighting method
-# is an independent experiment. Keep this separate from the usual paired
-# vanilla-vs-SATLOSS family colors used by the broader comparison plots.
-INDEPENDENT_SATLOSS6_MODELS = {
-    "SMART_SATLOSS6",
-    "SMART_SATLOSS6_FIXEDSUM",
-    "SMART_SATLOSS6_GRADNORM",
-    "SMART_SATLOSS6_CONFIG_FULL",
-    "SMART_SATLOSS6_CONFIG_LAYER",
-}
-INDEPENDENT_SATLOSS6_COLORS = {
-    "SMART_SATLOSS6": "#2CA02C",
-    "SMART_SATLOSS6_FIXEDSUM": "#FF7F0E",
-    "SMART_SATLOSS6_GRADNORM": "#9467BD",
-    "SMART_SATLOSS6_CONFIG_FULL": "#D62728",
-    "SMART_SATLOSS6_CONFIG_LAYER": "#17BECF",
-}
-# Set once in main after the active checkpoints are known. Plot workers are
-# forked on the target Linux environment and inherit this read-only context.
-_INDEPENDENT_SATLOSS6_LINE_MODE = False
 _COMPUTE_PLOT_STD = True
 _SATLOSS_ONLY_PERCENT_LABELS = False
 _PLOT_FONT_SCALE = 1.0
@@ -280,11 +212,6 @@ DRAG_RANK_MODELS = [
     "SMART_SATLOSS3",
     "SMART_SATLOSS5",
     "SMART_SATLOSS5_NOPM",
-    "SMART_SATLOSS6",
-    "SMART_SATLOSS6_FIXEDSUM",
-    "SMART_SATLOSS6_GRADNORM",
-    "SMART_SATLOSS6_CONFIG_FULL",
-    "SMART_SATLOSS6_CONFIG_LAYER",
 ]
 FAMILY_GROUPS = OrderedDict(
     [
@@ -299,34 +226,18 @@ FAMILY_GROUPS = OrderedDict(
                 "SMART_SATLOSS4",
                 "SMART_SATLOSS5",
                 "SMART_SATLOSS5_NOPM",
-                "SMART_SATLOSS6",
-                "SMART_SATLOSS6_FIXEDSUM",
-                "SMART_SATLOSS6_GRADNORM",
-                "SMART_SATLOSS6_CONFIG_FULL",
-                "SMART_SATLOSS6_CONFIG_LAYER",
                 "SMART_SATLOSS7",
-                "SMART_SATLOSS8",
             ],
         ),
-        (
-            "smart_satloss6_weighting_family",
-            [
-                "SMART_SATLOSS6_FIXEDSUM",
-                "SMART_SATLOSS6_GRADNORM",
-                "SMART_SATLOSS6_CONFIG_FULL",
-                "SMART_SATLOSS6_CONFIG_LAYER",
-            ],
-        ),
-        ("transolverpp_family", ["TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6", "TRANSOLVERPP_SATLOSS7", "TRANSOLVERPP_SATLOSS8"]),
-        ("pointnet2_ssg_family", ["POINTNET2_SSG", "POINTNET2_SSG_SATLOSS6", "POINTNET2_SSG_SATLOSS7", "POINTNET2_SSG_SATLOSS8"]),
-        ("lno_family", ["LNO", "LNO_SATLOSS6", "LNO_SATLOSS7", "LNO_SATLOSS8"]),
-        ("mspt_family", ["MSPT", "MSPT_SATLOSS6", "MSPT_SATLOSS7", "MSPT_SATLOSS8"]),
-        ("point_transformer_v3_family", ["POINT_TRANSFORMER_V3", "POINT_TRANSFORMER_V3_SATLOSS6", "POINT_TRANSFORMER_V3_SATLOSS7", "POINT_TRANSFORMER_V3_SATLOSS8"]),
+        ("transolverpp_family", ["TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS7"]),
+        ("pointnet2_ssg_family", ["POINTNET2_SSG", "POINTNET2_SSG_SATLOSS7"]),
+        ("lno_family", ["LNO", "LNO_SATLOSS7"]),
+        ("mspt_family", ["MSPT", "MSPT_SATLOSS7"]),
+        ("point_transformer_v3_family", ["POINT_TRANSFORMER_V3", "POINT_TRANSFORMER_V3_SATLOSS7"]),
     ]
 )
 FAMILY_TITLES = {
-    "smart_family": "SMART vs SMART-DOWNSAMPLE vs SMART-GAUSSIAN-BALL-MASKED vs SMART-BOX-MASKED vs SMART-DeAL3 vs SMART-DeAL4 vs SMART-DeAL5 vs SMART-DeAL5-NOPM vs SMART-DeAL6 vs DeAL6 weighting variants",
-    "smart_satloss6_weighting_family": "SMART-SATLOSS6-FIXEDSUM vs SMART-SATLOSS6-GRADNORM vs SMART-SATLOSS6-ConFIG-FULL vs SMART-SATLOSS6-ConFIG-LAYER",
+    "smart_family": "SMART and retained DeAL variants",
     "transolverpp_family": "TransolverPP and DeAL variants",
     "pointnet2_ssg_family": "PointNet++ SSG and DeAL variants",
     "lno_family": "LNO and DeAL variants",
@@ -342,34 +253,18 @@ VTK_PRESSURE_MODELS = [
     "SMART_SATLOSS4",
     "SMART_SATLOSS5",
     "SMART_SATLOSS5_NOPM",
-    "SMART_SATLOSS6",
-    "SMART_SATLOSS6_FIXEDSUM",
-    "SMART_SATLOSS6_GRADNORM",
-    "SMART_SATLOSS6_CONFIG_FULL",
-    "SMART_SATLOSS6_CONFIG_LAYER",
     "SMART_SATLOSS7",
-    "SMART_SATLOSS8",
     "TRANSOLVERPP",
     "TRANSOLVERPP_SATLOSS3",
-    "TRANSOLVERPP_SATLOSS6",
     "TRANSOLVERPP_SATLOSS7",
-    "TRANSOLVERPP_SATLOSS8",
     "POINTNET2_SSG",
-    "POINTNET2_SSG_SATLOSS6",
     "POINTNET2_SSG_SATLOSS7",
-    "POINTNET2_SSG_SATLOSS8",
     "LNO",
-    "LNO_SATLOSS6",
     "LNO_SATLOSS7",
-    "LNO_SATLOSS8",
     "MSPT",
-    "MSPT_SATLOSS6",
     "MSPT_SATLOSS7",
-    "MSPT_SATLOSS8",
     "POINT_TRANSFORMER_V3",
-    "POINT_TRANSFORMER_V3_SATLOSS6",
     "POINT_TRANSFORMER_V3_SATLOSS7",
-    "POINT_TRANSFORMER_V3_SATLOSS8",
 ]
 
 
@@ -393,34 +288,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smart-satloss4-config", default="drivaerml_satloss4")
     p.add_argument("--smart-satloss5-config", default="drivaerml_satloss5")
     p.add_argument("--smart-satloss5-nopm-config", default="drivaerml_satloss5_nopm")
-    p.add_argument("--smart-satloss6-config", default="drivaerml_satloss6")
-    p.add_argument("--smart-satloss6-fixedsum-config", default="drivaerml_satloss6_fixedsum")
-    p.add_argument("--smart-satloss6-gradnorm-config", default="drivaerml_satloss6_gradnorm")
-    p.add_argument("--smart-satloss6-config-full-config", default="drivaerml_satloss6_config_full")
-    p.add_argument("--smart-satloss6-config-layer-config", default="drivaerml_satloss6_config")
     p.add_argument("--smart-satloss7-config", "--smart-satloss-config", dest="smart_satloss7_config", default="drivaerml_satloss7")
-    p.add_argument("--smart-satloss8-config", default="drivaerml_satloss8")
     p.add_argument("--transolverpp-config", default="drivaerml_transolverpp")
     p.add_argument("--transolverpp-satloss3-config", default="drivaerml_transolverpp_satloss3")
-    p.add_argument("--transolverpp-satloss6-config", default="drivaerml_transolverpp_satloss6")
     p.add_argument("--transolverpp-satloss7-config", "--transolverpp-satloss-config", dest="transolverpp_satloss7_config", default="drivaerml_transolverpp_satloss7")
-    p.add_argument("--transolverpp-satloss8-config", default="drivaerml_transolverpp_satloss8")
     p.add_argument("--pointnet2-ssg-config", default="drivaerml_pointnet2_ssg")
-    p.add_argument("--pointnet2-ssg-satloss6-config", default="drivaerml_pointnet2_ssg_satloss6")
     p.add_argument("--pointnet2-ssg-satloss7-config", "--pointnet2-ssg-satloss-config", dest="pointnet2_ssg_satloss7_config", default="drivaerml_pointnet2_ssg_satloss7")
-    p.add_argument("--pointnet2-ssg-satloss8-config", default="drivaerml_pointnet2_ssg_satloss8")
     p.add_argument("--lno-config", default="drivaerml_lno")
-    p.add_argument("--lno-satloss6-config", default="drivaerml_lno_satloss6")
     p.add_argument("--lno-satloss7-config", "--lno-satloss-config", dest="lno_satloss7_config", default="drivaerml_lno_satloss7")
-    p.add_argument("--lno-satloss8-config", default="drivaerml_lno_satloss8")
     p.add_argument("--mspt-config", default="drivaerml_mspt")
-    p.add_argument("--mspt-satloss6-config", default="drivaerml_mspt_satloss6")
     p.add_argument("--mspt-satloss7-config", "--mspt-satloss-config", dest="mspt_satloss7_config", default="drivaerml_mspt_satloss7")
-    p.add_argument("--mspt-satloss8-config", default="drivaerml_mspt_satloss8")
     p.add_argument("--point-transformer-v3-config", default="drivaerml_point_transformer_v3")
-    p.add_argument("--point-transformer-v3-satloss6-config", default="drivaerml_point_transformer_v3_satloss6")
     p.add_argument("--point-transformer-v3-satloss7-config", "--point-transformer-v3-satloss-config", dest="point_transformer_v3_satloss7_config", default="drivaerml_point_transformer_v3_satloss7")
-    p.add_argument("--point-transformer-v3-satloss8-config", default="drivaerml_point_transformer_v3_satloss8")
     p.add_argument("--smart-checkpoint", default=None)
     p.add_argument(
         "--smart-downsample-checkpoint",
@@ -439,34 +318,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--smart-satloss4-checkpoint", default=None)
     p.add_argument("--smart-satloss5-checkpoint", default=None)
     p.add_argument("--smart-satloss5-nopm-checkpoint", default=None)
-    p.add_argument("--smart-satloss6-checkpoint", default=None)
-    p.add_argument("--smart-satloss6-fixedsum-checkpoint", default=None)
-    p.add_argument("--smart-satloss6-gradnorm-checkpoint", default=None)
-    p.add_argument("--smart-satloss6-config-full-checkpoint", default=None)
-    p.add_argument("--smart-satloss6-config-layer-checkpoint", default=None)
     p.add_argument("--smart-satloss7-checkpoint", "--smart-satloss-checkpoint", dest="smart_satloss7_checkpoint", default=None)
-    p.add_argument("--smart-satloss8-checkpoint", default=None)
     p.add_argument("--transolverpp-checkpoint", default=None)
     p.add_argument("--transolverpp-satloss3-checkpoint", default=None)
-    p.add_argument("--transolverpp-satloss6-checkpoint", default=None)
     p.add_argument("--transolverpp-satloss7-checkpoint", "--transolverpp-satloss-checkpoint", dest="transolverpp_satloss7_checkpoint", default=None)
-    p.add_argument("--transolverpp-satloss8-checkpoint", default=None)
     p.add_argument("--pointnet2-ssg-checkpoint", default=None)
-    p.add_argument("--pointnet2-ssg-satloss6-checkpoint", default=None)
     p.add_argument("--pointnet2-ssg-satloss7-checkpoint", "--pointnet2-ssg-satloss-checkpoint", dest="pointnet2_ssg_satloss7_checkpoint", default=None)
-    p.add_argument("--pointnet2-ssg-satloss8-checkpoint", default=None)
     p.add_argument("--lno-checkpoint", default=None)
-    p.add_argument("--lno-satloss6-checkpoint", default=None)
     p.add_argument("--lno-satloss7-checkpoint", "--lno-satloss-checkpoint", dest="lno_satloss7_checkpoint", default=None)
-    p.add_argument("--lno-satloss8-checkpoint", default=None)
     p.add_argument("--mspt-checkpoint", default=None)
-    p.add_argument("--mspt-satloss6-checkpoint", default=None)
     p.add_argument("--mspt-satloss7-checkpoint", "--mspt-satloss-checkpoint", dest="mspt_satloss7_checkpoint", default=None)
-    p.add_argument("--mspt-satloss8-checkpoint", default=None)
     p.add_argument("--point-transformer-v3-checkpoint", default=None)
-    p.add_argument("--point-transformer-v3-satloss6-checkpoint", default=None)
     p.add_argument("--point-transformer-v3-satloss7-checkpoint", "--point-transformer-v3-satloss-checkpoint", dest="point_transformer_v3_satloss7_checkpoint", default=None)
-    p.add_argument("--point-transformer-v3-satloss8-checkpoint", default=None)
     p.add_argument("--num-runs", type=int, default=8, help="Number of test runs to evaluate.")
     p.add_argument("--run-ids", default=None, help="Optional comma-separated explicit run ids.")
     p.add_argument(
@@ -740,36 +603,18 @@ def choose_ckpt(config, explicit: str | None) -> str:
         "SMART_SATLOSS4": "smart-satloss4-",
         "SMART_SATLOSS5": "smart-satloss5-",
         "SMART_SATLOSS5_NOPM": "smart-satloss5-nopm-",
-        # Keep the generic SATLOSS6 family separate from its weighting
-        # variants; all of them share the ``smart-satloss6-`` prefix.
-        "SMART_SATLOSS6": "smart-satloss6-smart-satloss6-",
-        "SMART_SATLOSS6_FIXEDSUM": "smart-satloss6-fixedsum-",
-        "SMART_SATLOSS6_GRADNORM": "smart-satloss6-gradnorm-",
-        "SMART_SATLOSS6_CONFIG_FULL": "smart-satloss6-config-full-",
-        "SMART_SATLOSS6_CONFIG_LAYER": "smart-satloss6-config-layer-",
         "SMART_SATLOSS7": "smart-satloss7-",
-        "SMART_SATLOSS8": "smart-satloss8-",
         "TRANSOLVERPP": "transolverpp-",
         "TRANSOLVERPP_SATLOSS3": "transolverpp-satloss3-",
-        "TRANSOLVERPP_SATLOSS6": "transolverpp-satloss6-",
         "TRANSOLVERPP_SATLOSS7": "transolverpp-satloss7-",
-        "TRANSOLVERPP_SATLOSS8": "transolverpp-satloss8-",
         "POINTNET2_SSG": "pointnet2-ssg-",
-        "POINTNET2_SSG_SATLOSS6": "pointnet2-ssg-satloss6-",
         "POINTNET2_SSG_SATLOSS7": "pointnet2-ssg-satloss7-",
-        "POINTNET2_SSG_SATLOSS8": "pointnet2-ssg-satloss8-",
         "LNO": "lno-",
-        "LNO_SATLOSS6": "lno-satloss6-",
         "LNO_SATLOSS7": "lno-satloss7-",
-        "LNO_SATLOSS8": "lno-satloss8-",
         "MSPT": "mspt-",
-        "MSPT_SATLOSS6": "mspt-satloss6-",
         "MSPT_SATLOSS7": "mspt-satloss7-",
-        "MSPT_SATLOSS8": "mspt-satloss8-",
         "POINT_TRANSFORMER_V3": "point-transformer-v3-",
-        "POINT_TRANSFORMER_V3_SATLOSS6": "point-transformer-v3-satloss6-",
         "POINT_TRANSFORMER_V3_SATLOSS7": "point-transformer-v3-satloss7-",
-        "POINT_TRANSFORMER_V3_SATLOSS8": "point-transformer-v3-satloss8-",
     }
     required_prefix = prefix_map.get(str(config.model_name), f"{model_slug}-")
     dataset_slug = str(config.dataset).lower()
@@ -793,9 +638,7 @@ def choose_ckpt(config, explicit: str | None) -> str:
 
 PTV3_MODEL_NAMES = {
     "POINT_TRANSFORMER_V3",
-    "POINT_TRANSFORMER_V3_SATLOSS6",
     "POINT_TRANSFORMER_V3_SATLOSS7",
-    "POINT_TRANSFORMER_V3_SATLOSS8",
 }
 
 
@@ -872,24 +715,18 @@ def build_model(config, ckpt_path: str, device: torch.device, batched_query_subr
         "SMART_SATLOSS4",
         "SMART_SATLOSS5",
         "SMART_SATLOSS5_NOPM",
-        "SMART_SATLOSS6",
-        "SMART_SATLOSS6_FIXEDSUM",
-        "SMART_SATLOSS6_GRADNORM",
-        "SMART_SATLOSS6_CONFIG_FULL",
-        "SMART_SATLOSS6_CONFIG_LAYER",
         "SMART_SATLOSS7",
-        "SMART_SATLOSS8",
     }:
         model = SMART(**base_kwargs, **arch)
-    elif model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6", "TRANSOLVERPP_SATLOSS7", "TRANSOLVERPP_SATLOSS8"}:
+    elif model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS7"}:
         model = TransolverPP(**base_kwargs, **arch)
-    elif model_name in {"POINTNET2_SSG", "POINTNET2_SSG_SATLOSS6", "POINTNET2_SSG_SATLOSS7", "POINTNET2_SSG_SATLOSS8"}:
+    elif model_name in {"POINTNET2_SSG", "POINTNET2_SSG_SATLOSS7"}:
         model = PointNet2SSG(**base_kwargs, **arch)
-    elif model_name in {"LNO", "LNO_SATLOSS6", "LNO_SATLOSS7", "LNO_SATLOSS8"}:
+    elif model_name in {"LNO", "LNO_SATLOSS7"}:
         model = LNO(**base_kwargs, **arch)
-    elif model_name in {"MSPT", "MSPT_SATLOSS6", "MSPT_SATLOSS7", "MSPT_SATLOSS8"}:
+    elif model_name in {"MSPT", "MSPT_SATLOSS7"}:
         model = MSPT(**base_kwargs, **arch)
-    elif model_name in {"POINT_TRANSFORMER_V3", "POINT_TRANSFORMER_V3_SATLOSS6", "POINT_TRANSFORMER_V3_SATLOSS7", "POINT_TRANSFORMER_V3_SATLOSS8"}:
+    elif model_name in {"POINT_TRANSFORMER_V3", "POINT_TRANSFORMER_V3_SATLOSS7"}:
         model = PointTransformerV3(**base_kwargs, **arch)
     else:
         raise ValueError(f"Unsupported model_name for this evaluator: {model_name}")
@@ -1945,13 +1782,7 @@ def predict_audi_surface_pressure(
             "SMART_SATLOSS4",
             "SMART_SATLOSS5",
             "SMART_SATLOSS5_NOPM",
-            "SMART_SATLOSS6",
-            "SMART_SATLOSS6_FIXEDSUM",
-            "SMART_SATLOSS6_GRADNORM",
-            "SMART_SATLOSS6_CONFIG_FULL",
-            "SMART_SATLOSS6_CONFIG_LAYER",
             "SMART_SATLOSS7",
-            "SMART_SATLOSS8",
         }:
             intermediate_latent_geometries, latent_geo_pos = model.encode(geo_b, None)
 
@@ -1961,7 +1792,7 @@ def predict_audi_surface_pressure(
 
             return decode_chunk
 
-        if model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS6", "TRANSOLVERPP_SATLOSS7", "TRANSOLVERPP_SATLOSS8"}:
+        if model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS7"}:
             def decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
                 pred_surf, _ = model.inference(geo_b, chunk, dummy_vol_b, None)
                 return pred_surf[:, :, 0]
@@ -2314,11 +2145,6 @@ def model_line_visuals(model_name: str) -> Tuple[str, str]:
         str(model_name),
     )
     if satloss_match:
-        if (
-            (_INDEPENDENT_SATLOSS6_LINE_MODE or os.environ.get("SMART_COMPARE_INDEPENDENT_SATLOSS6", "0") == "1")
-            and model_name in INDEPENDENT_SATLOSS6_MODELS
-        ):
-            return INDEPENDENT_SATLOSS6_COLORS[model_name], "--"
         vanilla_name = satloss_match.group(1)
         color = LINE_MODEL_COLORS.get(vanilla_name, MODEL_COLORS[model_name])
         return color, "-."
@@ -2810,17 +2636,11 @@ def _vanilla_model_name(model_name: str) -> str:
 
 SATLOSS_ENDPOINT_PAIRS = (
     ("SMART", "SMART_SATLOSS7"),
-    ("SMART", "SMART_SATLOSS8"),
     ("TRANSOLVERPP", "TRANSOLVERPP_SATLOSS7"),
-    ("TRANSOLVERPP", "TRANSOLVERPP_SATLOSS8"),
     ("POINTNET2_SSG", "POINTNET2_SSG_SATLOSS7"),
-    ("POINTNET2_SSG", "POINTNET2_SSG_SATLOSS8"),
     ("LNO", "LNO_SATLOSS7"),
-    ("LNO", "LNO_SATLOSS8"),
     ("MSPT", "MSPT_SATLOSS7"),
-    ("MSPT", "MSPT_SATLOSS8"),
     ("POINT_TRANSFORMER_V3", "POINT_TRANSFORMER_V3_SATLOSS7"),
-    ("POINT_TRANSFORMER_V3", "POINT_TRANSFORMER_V3_SATLOSS8"),
 )
 
 
@@ -3566,15 +3386,7 @@ def plot_endpoint_error_bars(
                     if np.isfinite(baseline)
                     else math.nan
                 )
-                independent_satloss = (
-                    _INDEPENDENT_SATLOSS6_LINE_MODE
-                    and model_name in INDEPENDENT_SATLOSS6_MODELS
-                )
-                color = (
-                    INDEPENDENT_SATLOSS6_COLORS[model_name]
-                    if independent_satloss
-                    else LINE_MODEL_COLORS.get(base_name, MODEL_COLORS.get(model_name, "#777777"))
-                )
+                color = LINE_MODEL_COLORS.get(base_name, MODEL_COLORS.get(model_name, "#777777"))
                 is_satloss = model_name != base_name
                 hatch = "///" if is_satloss else ""
                 alpha = 0.90 if endpoint_idx == 0 else 1.0
@@ -4154,7 +3966,7 @@ def plot_percentage_degradation_bars(
 
 
 def main():
-    global _INDEPENDENT_SATLOSS6_LINE_MODE, _COMPUTE_PLOT_STD, _SATLOSS_ONLY_PERCENT_LABELS, _PLOT_FONT_SCALE
+    global _COMPUTE_PLOT_STD, _SATLOSS_ONLY_PERCENT_LABELS, _PLOT_FONT_SCALE
     global GEOMETRY_SOURCE_LABELS, GEOMETRY_METHOD_LABELS
     args = parse_args()
     if args.geometry_label_preset == "v4":
@@ -4180,34 +3992,18 @@ def main():
             ("SMART_SATLOSS4", args.smart_satloss4_config),
             ("SMART_SATLOSS5", args.smart_satloss5_config),
             ("SMART_SATLOSS5_NOPM", args.smart_satloss5_nopm_config),
-            ("SMART_SATLOSS6", args.smart_satloss6_config),
-            ("SMART_SATLOSS6_FIXEDSUM", args.smart_satloss6_fixedsum_config),
-            ("SMART_SATLOSS6_GRADNORM", args.smart_satloss6_gradnorm_config),
-            ("SMART_SATLOSS6_CONFIG_FULL", args.smart_satloss6_config_full_config),
-            ("SMART_SATLOSS6_CONFIG_LAYER", args.smart_satloss6_config_layer_config),
             ("SMART_SATLOSS7", args.smart_satloss7_config),
-            ("SMART_SATLOSS8", args.smart_satloss8_config),
             ("TRANSOLVERPP", args.transolverpp_config),
             ("TRANSOLVERPP_SATLOSS3", args.transolverpp_satloss3_config),
-            ("TRANSOLVERPP_SATLOSS6", args.transolverpp_satloss6_config),
             ("TRANSOLVERPP_SATLOSS7", args.transolverpp_satloss7_config),
-            ("TRANSOLVERPP_SATLOSS8", args.transolverpp_satloss8_config),
             ("POINTNET2_SSG", args.pointnet2_ssg_config),
-            ("POINTNET2_SSG_SATLOSS6", args.pointnet2_ssg_satloss6_config),
             ("POINTNET2_SSG_SATLOSS7", args.pointnet2_ssg_satloss7_config),
-            ("POINTNET2_SSG_SATLOSS8", args.pointnet2_ssg_satloss8_config),
             ("LNO", args.lno_config),
-            ("LNO_SATLOSS6", args.lno_satloss6_config),
             ("LNO_SATLOSS7", args.lno_satloss7_config),
-            ("LNO_SATLOSS8", args.lno_satloss8_config),
             ("MSPT", args.mspt_config),
-            ("MSPT_SATLOSS6", args.mspt_satloss6_config),
             ("MSPT_SATLOSS7", args.mspt_satloss7_config),
-            ("MSPT_SATLOSS8", args.mspt_satloss8_config),
             ("POINT_TRANSFORMER_V3", args.point_transformer_v3_config),
-            ("POINT_TRANSFORMER_V3_SATLOSS6", args.point_transformer_v3_satloss6_config),
             ("POINT_TRANSFORMER_V3_SATLOSS7", args.point_transformer_v3_satloss7_config),
-            ("POINT_TRANSFORMER_V3_SATLOSS8", args.point_transformer_v3_satloss8_config),
         ]
     )
     configs = OrderedDict((model_name, load_cfg(cfg_name)) for model_name, cfg_name in config_name_map.items())
@@ -4297,34 +4093,18 @@ def main():
         "SMART_SATLOSS4": args.smart_satloss4_checkpoint,
         "SMART_SATLOSS5": args.smart_satloss5_checkpoint,
         "SMART_SATLOSS5_NOPM": args.smart_satloss5_nopm_checkpoint,
-        "SMART_SATLOSS6": args.smart_satloss6_checkpoint,
-        "SMART_SATLOSS6_FIXEDSUM": args.smart_satloss6_fixedsum_checkpoint,
-        "SMART_SATLOSS6_GRADNORM": args.smart_satloss6_gradnorm_checkpoint,
-        "SMART_SATLOSS6_CONFIG_FULL": args.smart_satloss6_config_full_checkpoint,
-        "SMART_SATLOSS6_CONFIG_LAYER": args.smart_satloss6_config_layer_checkpoint,
         "SMART_SATLOSS7": args.smart_satloss7_checkpoint,
-        "SMART_SATLOSS8": args.smart_satloss8_checkpoint,
         "TRANSOLVERPP": args.transolverpp_checkpoint,
         "TRANSOLVERPP_SATLOSS3": args.transolverpp_satloss3_checkpoint,
-        "TRANSOLVERPP_SATLOSS6": args.transolverpp_satloss6_checkpoint,
         "TRANSOLVERPP_SATLOSS7": args.transolverpp_satloss7_checkpoint,
-        "TRANSOLVERPP_SATLOSS8": args.transolverpp_satloss8_checkpoint,
         "POINTNET2_SSG": args.pointnet2_ssg_checkpoint,
-        "POINTNET2_SSG_SATLOSS6": args.pointnet2_ssg_satloss6_checkpoint,
         "POINTNET2_SSG_SATLOSS7": args.pointnet2_ssg_satloss7_checkpoint,
-        "POINTNET2_SSG_SATLOSS8": args.pointnet2_ssg_satloss8_checkpoint,
         "LNO": args.lno_checkpoint,
-        "LNO_SATLOSS6": args.lno_satloss6_checkpoint,
         "LNO_SATLOSS7": args.lno_satloss7_checkpoint,
-        "LNO_SATLOSS8": args.lno_satloss8_checkpoint,
         "MSPT": args.mspt_checkpoint,
-        "MSPT_SATLOSS6": args.mspt_satloss6_checkpoint,
         "MSPT_SATLOSS7": args.mspt_satloss7_checkpoint,
-        "MSPT_SATLOSS8": args.mspt_satloss8_checkpoint,
         "POINT_TRANSFORMER_V3": args.point_transformer_v3_checkpoint,
-        "POINT_TRANSFORMER_V3_SATLOSS6": args.point_transformer_v3_satloss6_checkpoint,
         "POINT_TRANSFORMER_V3_SATLOSS7": args.point_transformer_v3_satloss7_checkpoint,
-        "POINT_TRANSFORMER_V3_SATLOSS8": args.point_transformer_v3_satloss8_checkpoint,
     }
     requested_model_names = [model_name for model_name in MODEL_ORDER if checkpoint_arg_map[model_name] is not None]
     if not requested_model_names:
@@ -4341,60 +4121,6 @@ def main():
                 f"missing={missing}, extra={extra}"
             )
         print("[comparison scope] dedicated SMART training-strategy comparison")
-    active_model_set = set(requested_model_names)
-    _INDEPENDENT_SATLOSS6_LINE_MODE = bool(
-        active_model_set.intersection(INDEPENDENT_SATLOSS6_MODELS)
-        and active_model_set <= ({"SMART"} | INDEPENDENT_SATLOSS6_MODELS)
-    )
-    os.environ["SMART_COMPARE_INDEPENDENT_SATLOSS6"] = "1" if _INDEPENDENT_SATLOSS6_LINE_MODE else "0"
-    if _INDEPENDENT_SATLOSS6_LINE_MODE:
-        print(
-            "[plot styles] SMART/SATLOSS6 weighting comparison detected: "
-            "SATLOSS6 variants use independent colors and dashed lines; SMART uses a solid line."
-        )
-    # SATLOSS8 configs declare the geometry-domain split used for training.
-    # Apply that split automatically when an SATLOSS8 checkpoint participates,
-    # unless the caller explicitly supplied a CLI override.
-    if not args.domain_split_json:
-        configured_domain_splits = {
-            str(getattr(configs[name], "geometry_domain_split_json", "")).strip()
-            for name in requested_model_names
-            if str(name).endswith("_SATLOSS8")
-            and str(getattr(configs[name], "geometry_domain_split_json", "")).strip()
-        }
-        if len(configured_domain_splits) > 1:
-            raise ValueError(
-                "Active SATLOSS8 configs declare different geometry-domain split files: "
-                f"{sorted(configured_domain_splits)}. Pass --domain-split-json explicitly."
-            )
-        if configured_domain_splits:
-            args.domain_split_json = next(iter(configured_domain_splits))
-            satloss8_configs = [
-                configs[name]
-                for name in requested_model_names
-                if str(name).endswith("_SATLOSS8")
-            ]
-            train_clusters = {
-                int(getattr(config, "geometry_domain_split_train_cluster", 0))
-                for config in satloss8_configs
-            }
-            test_clusters = {
-                int(getattr(config, "geometry_domain_split_test_cluster", 1))
-                for config in satloss8_configs
-            }
-            if len(train_clusters) != 1 or len(test_clusters) != 1:
-                raise ValueError(
-                    "Active SATLOSS8 configs declare inconsistent train/test clusters. "
-                    "Pass --domain-train-cluster and --domain-test-cluster explicitly."
-                )
-            args.domain_train_cluster = next(iter(train_clusters))
-            args.domain_test_cluster = next(iter(test_clusters))
-            print(
-                "[domain split] automatically using SATLOSS8 config: "
-                f"train_cluster={args.domain_train_cluster} "
-                f"test_cluster={args.domain_test_cluster} "
-                f"split={args.domain_split_json}"
-            )
     # A PTv3 checkpoint can load with a mismatched YAML because the density-
     # sensitive changes preserve parameter shapes. Resolve this before any
     # model is built so the benchmark cannot silently use the wrong backbone.

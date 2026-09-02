@@ -50,6 +50,12 @@ PUMP_FIELDS = (
     "wall_shear_y",
     "wall_shear_z",
 )
+VOLUME_FIELDS = (
+    "pressure",
+    "velocity_x",
+    "velocity_y",
+    "velocity_z",
+)
 
 
 def load_experiment_config(name: str, stack: tuple[str, ...] = ()):
@@ -236,6 +242,11 @@ def sampled_conditions(
     seed: int,
 ) -> dict[str, np.ndarray]:
     conditions: dict[str, np.ndarray] = {}
+    rng = np.random.default_rng(np.random.SeedSequence([seed, run_id, 17]))
+    conditions["unshifted"] = np.ascontiguousarray(
+        full_geometry[uniform_indices(full_geometry.shape[0], budget, rng)],
+        dtype=np.float32,
+    )
     for name, axis in (("sine_x", 0), ("sine_y", 1)):
         rng = np.random.default_rng(np.random.SeedSequence([seed, run_id, 101 + axis]))
         weights = sine_weights(full_geometry, axis=axis)
@@ -272,6 +283,8 @@ def field_payload(
         vector_groups = [("normal", 1, 4), ("wall_shear", 4, 7)]
     elif names == PUMP_FIELDS:
         vector_groups = [("velocity", 1, 4), ("wall_shear", 4, 7)]
+    elif names == VOLUME_FIELDS:
+        vector_groups = [("velocity", 1, 4)]
     for group, start, stop in vector_groups:
         for prefix, values in (("ground_truth", ground_truth), ("base", base), ("deal", deal)):
             payload[f"{prefix}_{group}"] = values[:, start:stop]
@@ -366,8 +379,8 @@ def export_drivaerml(args: argparse.Namespace, devices: tuple[torch.device, torc
         for condition_index, (condition, geometry) in enumerate(conditions.items()):
             base_future = pool.submit(infer, "SMART", base, devices[0], geometry, condition_index)
             deal_future = pool.submit(infer, "SMART_SATLOSS7_RANGE100", deal, devices[1], geometry, condition_index)
-            base_surface, _ = base_future.result()
-            deal_surface, _ = deal_future.result()
+            base_surface, base_volume = base_future.result()
+            deal_surface, deal_volume = deal_future.result()
             write_point_cloud(
                 output_dir / f"drivaerml_run_{args.run_id}_{condition}_surface_fields.vtk",
                 surface_query,
@@ -378,9 +391,16 @@ def export_drivaerml(args: argparse.Namespace, devices: tuple[torch.device, torc
                 geometry,
                 {},
             )
+            write_point_cloud(
+                output_dir / f"drivaerml_run_{args.run_id}_{condition}_volume_fields.vtk",
+                volume_query,
+                field_payload(VOLUME_FIELDS, volume_gt, base_volume, deal_volume),
+            )
             metrics[condition] = {
                 "base_surface_relative_l2": relative_l2(surface_gt, base_surface),
                 "deal_surface_relative_l2": relative_l2(surface_gt, deal_surface),
+                "base_volume_relative_l2": relative_l2(volume_gt, base_volume),
+                "deal_volume_relative_l2": relative_l2(volume_gt, deal_volume),
             }
             print(f"[DrivAerML] exported {condition}", flush=True)
 
@@ -437,16 +457,21 @@ def export_pump(args: argparse.Namespace, devices: tuple[torch.device, torch.dev
     output_dir.mkdir(parents=True, exist_ok=True)
     surface_mean = dataset.mean_surf_data.numpy()
     surface_std = dataset.std_surf_data.numpy()
+    volume_mean = dataset.mean_vol_data.numpy()
+    volume_std = dataset.std_vol_data.numpy()
     surface_gt = queries["surface_y"] * surface_std + surface_mean
+    volume_gt = queries["volume_y"] * volume_std + volume_mean
     metrics = {}
     with ThreadPoolExecutor(max_workers=2) as pool:
         for condition, geometry in conditions.items():
             base_future = pool.submit(infer, base, devices[0], geometry)
             deal_future = pool.submit(infer, deal, devices[1], geometry)
-            base_surface_norm, _ = base_future.result()
-            deal_surface_norm, _ = deal_future.result()
+            base_surface_norm, base_volume_norm = base_future.result()
+            deal_surface_norm, deal_volume_norm = deal_future.result()
             base_surface = base_surface_norm * surface_std + surface_mean
             deal_surface = deal_surface_norm * surface_std + surface_mean
+            base_volume = base_volume_norm * volume_std + volume_mean
+            deal_volume = deal_volume_norm * volume_std + volume_mean
             write_point_cloud(
                 output_dir / f"pump_run_{args.run_id}_{condition}_surface_fields.vtk",
                 queries["surface_q_physical"],
@@ -457,9 +482,16 @@ def export_pump(args: argparse.Namespace, devices: tuple[torch.device, torch.dev
                 geometry,
                 {},
             )
+            write_point_cloud(
+                output_dir / f"pump_run_{args.run_id}_{condition}_volume_fields.vtk",
+                queries["volume_q"] * span + minimum,
+                field_payload(VOLUME_FIELDS, volume_gt, base_volume, deal_volume),
+            )
             metrics[condition] = {
                 "base_surface_relative_l2": endpoint.relative_l2(queries["surface_y"], base_surface_norm),
                 "deal_surface_relative_l2": endpoint.relative_l2(queries["surface_y"], deal_surface_norm),
+                "base_volume_relative_l2": endpoint.relative_l2(queries["volume_y"], base_volume_norm),
+                "deal_volume_relative_l2": endpoint.relative_l2(queries["volume_y"], deal_volume_norm),
             }
             print(f"[Pump] exported {condition}", flush=True)
 

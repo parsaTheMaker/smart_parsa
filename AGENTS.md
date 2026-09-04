@@ -1,6 +1,6 @@
 # DeAL Research Workflow
 
-Use the project-local Codex skills below when their trigger matches the task:
+Use the DeAL Codex skills below when their trigger matches the task:
 
 | Task | Skill |
 | --- | --- |

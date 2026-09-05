@@ -1,0 +1,48 @@
+defaults:
+  - _self_
+  - override hydra/hydra_logging: disabled
+  - override hydra/job_logging: disabled
+
+hydra:
+  output_subdir: null
+  run:
+    dir: .
+
+wandb:
+  project: "smart_shift_pump"
+  entity: "parsa-vatani99-technical-university-of-munich"
+
+experiment:
+  name: "PUMP_ARCHITECTURE_BASE"
+  model_name: "PUMP_ARCHITECTURE"
+  model_tag: ""
+  random_seed: 42
+  dataset: "Pump"
+  data_path: "/mnt/data/parsa/shift_pump_random1400_preprocessed"
+  coordinate_normalization: "global_train_bounds"
+  geometry_epoch_seeded_sampling: True
+  num_body_points: 16384
+  num_surface_points: 65536
+  num_volume_points: 65536
+  scale_positions: False
+  optimizer: "adamw"
+  loss_fn: "rel_l2"
+  scheduler: "cosine"
+  scheduler_warmup_fraction: 0.2
+  batch_size: 1
+  epochs: 300
+  learning_rate: 2.e-4
+  gradient_norm: null
+  amp: True
+  precision: "float16"
+  log_every_n_steps: 10
+  track_gradient_diagnostics: False
+  wandb_watch_model: False
+  multi_gpu_strategy: "single"
+  resume_ckpt: ""
+  resume_full_state: False
+  init_ckpt: ""
+  num_workers: 4
+  prefetch_factor: 2
+  pin_memory: True
+  cuda_batch_prefetch: True

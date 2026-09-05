@@ -115,6 +115,8 @@ CATEGORY_LABELS = {
     "remeshing_div5_mean": "Remeshing div5 mean",
     "remeshing_div10_mean": "Remeshing div10 mean",
 }
+ORIGINAL_CATEGORY = "original_uniform"
+ORIGINAL_CATEGORY_LABEL = "Original input"
 REMESH_PREFIXES = ("angle", "isotropic", "voxel")
 REMESH_METHOD_LABELS = {
     "angle": "Angle (div5+div10)",
@@ -128,8 +130,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", choices=tuple(DATASET_DEFAULTS), required=True)
     parser.add_argument("--data-root", type=Path, default=None)
     parser.add_argument("--study-summary", type=Path, required=True)
-    parser.add_argument("--num-runs", type=int, default=15)
+    parser.add_argument("--num-runs", type=int, default=15, help="Number of cases to evaluate; 0 means every available complete case.")
     parser.add_argument("--top-k", type=int, default=10, help="Number of selected candidates to plot after ranking the pool.")
+    parser.add_argument(
+        "--selection-policy",
+        choices=("top_deal_vs_classical", "all_cases"),
+        default="top_deal_vs_classical",
+        help=(
+            "Use the legacy positive-improvement ranking, or aggregate every requested held-out case. "
+            "Use all_cases for an unbiased evaluation cohort."
+        ),
+    )
+    parser.add_argument(
+        "--include-original",
+        action="store_true",
+        help="Include the unshifted uniform encoder representation as a nominal-accuracy condition.",
+    )
+    parser.add_argument(
+        "--original-base-only",
+        action="store_true",
+        help=(
+            "When --include-original is set, evaluate the unshifted nominal control only for Base SMART. "
+            "Shifted conditions still evaluate every configured model."
+        ),
+    )
     parser.add_argument("--run-ids", default=None)
     parser.add_argument(
         "--case-selection",
@@ -139,6 +163,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--views-per-test", type=int, default=2)
+    parser.add_argument(
+        "--inference-batch-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of independently sampled views evaluated together per model/GPU. "
+            "This changes throughput only; metrics remain one row per view."
+        ),
+    )
     parser.add_argument("--surface-query-points", type=int, default=65536)
     parser.add_argument("--volume-query-points", type=int, default=65536)
     parser.add_argument("--query-chunk-size", type=int, default=65536)
@@ -275,19 +308,57 @@ def load_vtp_points(path: Path) -> np.ndarray:
     return np.ascontiguousarray(points)
 
 
-def load_config(dataset_name: str, config_name: str):
+def compose_config(config_name: str, stack: tuple[str, ...] = ()):
+    """Resolve the repository's small Hydra defaults graph for inference.
+
+    Evaluation previously merged a base YAML with a leaf file directly.  That
+    ignores nested ``defaults`` entries such as ``pump_deal_from_smart_full ->
+    pump_satloss7 -> pump`` and can silently omit training-time settings.  A
+    recursive local composition is sufficient here because the experiment
+    configs use file-level defaults only; it avoids initializing Hydra inside a
+    long-lived multi-model inference process.
+    """
     from omegaconf import OmegaConf
 
-    defaults = DATASET_DEFAULTS[dataset_name]
-    base = OmegaConf.load(str(SMART_ROOT / "config" / f"{defaults['base_config']}.yaml"))
-    variant = OmegaConf.load(str(SMART_ROOT / "config" / f"{config_name}.yaml"))
-    if dataset_name == "heat_exchanger":
-        # These YAML files use Hydra defaults.  This standalone comparator
-        # composes their shared experiment settings explicitly so checkpoint
-        # inference uses the same 65K encoder budget as training.
-        common = OmegaConf.load(str(SMART_ROOT / "config" / "toy_heat_exchange_common.yaml"))
-        base = OmegaConf.merge(common, base)
-    return OmegaConf.merge(base, variant)
+    if config_name in stack:
+        chain = " -> ".join((*stack, config_name))
+        raise ValueError(f"Cyclic config defaults: {chain}")
+    path = SMART_ROOT / "config" / f"{config_name}.yaml"
+    if not path.is_file():
+        raise FileNotFoundError(f"Configuration does not exist: {path}")
+    current = OmegaConf.load(str(path))
+    defaults = list(current.get("defaults", []))
+    current.pop("defaults", None)
+    resolved = OmegaConf.create()
+    inserted_self = False
+    for entry in defaults:
+        if isinstance(entry, str):
+            name = entry.strip()
+            if name == "_self_":
+                resolved = OmegaConf.merge(resolved, current)
+                inserted_self = True
+            elif name:
+                resolved = OmegaConf.merge(resolved, compose_config(name, (*stack, config_name)))
+        else:
+            grouped_entry = OmegaConf.to_container(entry, resolve=True) if OmegaConf.is_config(entry) else entry
+            if isinstance(grouped_entry, dict) and all("hydra/" in str(key) for key in grouped_entry):
+                # Runtime logging choices have no bearing on a standalone
+                # inference config and are normally consumed by Hydra itself.
+                continue
+            # This repository does not currently use model config groups in
+            # this comparator.  Fail loudly if one is added rather than
+            # composing a checkpoint with a partial architecture.
+            if isinstance(grouped_entry, dict):
+                raise ValueError(f"Unsupported grouped default in {path}: {grouped_entry}")
+            raise ValueError(f"Unsupported defaults entry in {path}: {grouped_entry!r}")
+    if not inserted_self:
+        resolved = OmegaConf.merge(resolved, current)
+    return resolved
+
+
+def load_config(dataset_name: str, config_name: str):
+    del dataset_name
+    return compose_config(config_name)
 
 
 def model_input_budget(config, dataset_name: str) -> int:
@@ -382,6 +453,37 @@ def predict(model, device: torch.device, geometry: np.ndarray, queries: dict) ->
     return surface.float().cpu().numpy()[0], volume.float().cpu().numpy()[0]
 
 
+def predict_batch(
+    model,
+    device: torch.device,
+    geometries: list[np.ndarray],
+    queries: dict,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run several paired sampling views in one model call on one GPU.
+
+    Each view retains its own encoder cloud, while fixed physical queries are
+    broadcast across the batch. This fills the GPU without changing a sampled
+    view, its seed, or the per-view metric written to disk.
+    """
+    if not geometries:
+        raise ValueError("predict_batch requires at least one geometry view.")
+    batch_size = len(geometries)
+    geo = torch.from_numpy(np.ascontiguousarray(np.stack(geometries), dtype=np.float32)).to(device, non_blocking=True)
+    surface_q = np.broadcast_to(queries["surface_q"][None, ...], (batch_size, *queries["surface_q"].shape)).copy()
+    volume_q = np.broadcast_to(queries["volume_q"][None, ...], (batch_size, *queries["volume_q"].shape)).copy()
+    surf = torch.from_numpy(surface_q).to(device, non_blocking=True)
+    vol = torch.from_numpy(volume_q).to(device, non_blocking=True)
+    params = None
+    if queries["params"] is not None:
+        parameter_batch = np.broadcast_to(queries["params"][None, ...], (batch_size, *queries["params"].shape)).copy()
+        params = torch.from_numpy(np.ascontiguousarray(parameter_batch, dtype=np.float32)).to(device, non_blocking=True)
+    with torch.inference_mode():
+        autocast = torch.autocast(device_type="cuda", dtype=torch.float16) if device.type == "cuda" else torch.autocast(device_type="cpu", enabled=False)
+        with autocast:
+            surface, volume = model.inference(geo, surf, vol, params)
+    return surface.float().cpu().numpy(), volume.float().cpu().numpy()
+
+
 def relative_l2(target: np.ndarray, prediction: np.ndarray) -> float:
     return float(np.linalg.norm(np.asarray(prediction) - np.asarray(target)) / max(np.linalg.norm(target), 1.0e-12))
 
@@ -424,8 +526,33 @@ def grouped_stats(rows: list[dict], categories: tuple[str, ...], key_name: str) 
     return result
 
 
-def category_stats(rows: list[dict]) -> OrderedDict:
-    return grouped_stats(rows, CATEGORY_ORDER, "category")
+def category_stats(rows: list[dict], categories: tuple[str, ...]) -> OrderedDict:
+    return grouped_stats(rows, categories, "category")
+
+
+def fieldwise_category_stats(rows: list[dict], categories: tuple[str, ...], dataset) -> OrderedDict:
+    """Aggregate every physical output independently on the frozen cohort."""
+    fields = []
+    for domain, names in (("surface", dataset.surface_field_names), ("volume", dataset.volume_field_names)):
+        fields.extend((domain, str(name), f"{domain}_{name}_rel_l2") for name in names)
+    summary = OrderedDict()
+    for domain, name, metric_key in fields:
+        by_category = OrderedDict()
+        for category in categories:
+            values = [row for row in rows if row["category"] == category]
+            grouped: dict[str, list[float]] = {}
+            for row in values:
+                value = float(row[metric_key])
+                if not np.isfinite(value):
+                    raise ValueError(f"Non-finite fieldwise metric {metric_key} for {row}")
+                grouped.setdefault(str(row["model"]), []).append(value)
+            if grouped:
+                by_category[category] = OrderedDict(
+                    (model, {"mean": float(np.mean(scores)), "std": float(np.std(scores, ddof=0)), "count": len(scores)})
+                    for model, scores in grouped.items()
+                )
+        summary[f"{domain}/{name}"] = by_category
+    return summary
 
 
 def improvement_percent(base: float, current: float) -> float:
@@ -712,6 +839,9 @@ def plot_all_categories(
 def write_tables(
     stats: OrderedDict,
     output_dir: Path,
+    categories: tuple[str, ...],
+    category_labels: dict[str, str],
+    field_stats: OrderedDict | None = None,
     source_stats: OrderedDict | None = None,
     source_labels: dict[str, str] | None = None,
     method_stats: OrderedDict | None = None,
@@ -722,10 +852,10 @@ def write_tables(
     with (output_dir / "combined_global_endpoint_absolute.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=absolute_fields)
         writer.writeheader()
-        for category in CATEGORY_ORDER:
+        for category in categories:
             if category not in stats:
                 continue
-            row = {"category": category, "category_label": CATEGORY_LABELS[category]}
+            row = {"category": category, "category_label": category_labels[category]}
             for model in MODEL_ORDER:
                 if model in stats[category]:
                     row[f"{model}_mean"] = stats[category][model]["mean"]
@@ -803,21 +933,50 @@ def write_tables(
     with (output_dir / "combined_global_endpoint_relative_vs_smart.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=relative_fields)
         writer.writeheader()
-        for category in CATEGORY_ORDER:
+        for category in categories:
             if category not in stats or "base" not in stats[category]:
                 continue
             base = stats[category]["base"]["mean"]
-            row = {"category": category, "category_label": CATEGORY_LABELS[category]}
+            row = {"category": category, "category_label": category_labels[category]}
             for model in MODEL_ORDER:
                 if model != "base" and model in stats[category]:
                     row[f"{model}_improvement_vs_smart_percent"] = improvement_percent(base, stats[category][model]["mean"])
-            writer.writerow(row)
+                writer.writerow(row)
+
+    if field_stats:
+        fieldnames = ["field", "domain", "category", "category_label"]
+        for model in MODEL_ORDER:
+            fieldnames.extend([f"{model}_mean", f"{model}_std", f"{model}_count"])
+        with (output_dir / "fieldwise_endpoint_absolute.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            for field_key, per_category in field_stats.items():
+                domain, field_name = field_key.split("/", 1)
+                for category in categories:
+                    values = per_category.get(category)
+                    if not values:
+                        continue
+                    row = {
+                        "field": field_name,
+                        "domain": domain,
+                        "category": category,
+                        "category_label": category_labels[category],
+                    }
+                    for model in MODEL_ORDER:
+                        if model in values:
+                            row[f"{model}_mean"] = values[model]["mean"]
+                            row[f"{model}_std"] = values[model]["std"]
+                            row[f"{model}_count"] = values[model]["count"]
+                    writer.writerow(row)
 
 
 def main() -> int:
     args = parse_args()
-    if args.num_runs <= 0 or args.views_per_test <= 0 or args.top_k <= 0:
-        raise ValueError("--num-runs, --top-k, and --views-per-test must be positive.")
+    if args.num_runs < 0 or args.views_per_test <= 0 or args.top_k <= 0 or args.inference_batch_size <= 0:
+        raise ValueError(
+            "--num-runs must be non-negative; --top-k, --views-per-test, and "
+            "--inference-batch-size must be positive."
+        )
     data_root = args.data_root or DATASET_DEFAULTS[args.dataset]["data_root"]
     factors = parse_factors(args.geometry_decimation_factors)
     summary = normalize_study_summary(json.loads(args.study_summary.read_text(encoding="utf-8")))
@@ -843,18 +1002,22 @@ def main() -> int:
         volume_points=args.volume_query_points,
     )
     study_run_ids = sorted({int(record["run_id"]) for record in summary.get("records", [])})
-    available = study_run_ids if args.case_selection == "study" else [int(value) for value in dataset.data]
+    test_run_ids = [int(value) for value in dataset.data]
+    # A held-out case is evaluable only when all requested remeshes exist.  The
+    # old code chose from the test split alone and failed later (or silently
+    # encouraged ranking from the study pool).  Make this intersection explicit.
+    available = study_run_ids if args.case_selection == "study" else sorted(set(test_run_ids) & set(study_run_ids))
     if args.run_ids:
         run_ids = [int(item.strip()) for item in str(args.run_ids).split(",") if item.strip()]
         missing = sorted(set(run_ids) - set(available))
         if missing:
             raise ValueError(f"Requested run IDs are not in the test split: {missing}")
     else:
-        count = min(int(args.num_runs), len(available))
+        count = len(available) if int(args.num_runs) == 0 else min(int(args.num_runs), len(available))
         rng = np.random.default_rng(args.seed + 8811)
         run_ids = sorted(int(item) for item in rng.choice(np.asarray(available), size=count, replace=False))
-    if len(run_ids) != int(args.num_runs) and not args.run_ids:
-        scope = "fully completed remeshing-study cases" if args.case_selection == "study" else "test cases"
+    if int(args.num_runs) > 0 and len(run_ids) != int(args.num_runs) and not args.run_ids:
+        scope = "fully completed remeshing-study cases" if args.case_selection == "study" else "held-out cases with complete remeshes"
         raise ValueError(
             f"Only {len(run_ids)} {scope} are available, requested {args.num_runs}. "
             "The remesher summary is written only after its workers finish; rerun after more complete cases are present."
@@ -887,8 +1050,19 @@ def main() -> int:
     sine_x_mode = mode_records(["sine_x"], (0.0, 1.0))["sine_x_1.00"]
     sine_y_mode = mode_records(["sine_y"], (0.0, 1.0))["sine_y_1.00"]
     endpoint_modes = OrderedDict([("sine_x_1", sine_x_mode), ("sine_y_1", sine_y_mode)])
+    if args.include_original:
+        endpoint_modes = OrderedDict(
+            [(ORIGINAL_CATEGORY, mode_records([], (0.0, 1.0))["aligned_uniform_wor"]), *endpoint_modes.items()]
+        )
+    report_categories = tuple(endpoint_modes) + ("remeshing_div5_mean", "remeshing_div10_mean")
+    report_category_labels = {**CATEGORY_LABELS}
+    if args.include_original:
+        report_category_labels[ORIGINAL_CATEGORY] = ORIGINAL_CATEGORY_LABEL
+    source_aliases = {"feature": "angle", "quadric": "isotropic", "qem": "isotropic"}
     requested_remesh_prefixes = tuple(
-        item.strip().lower() for item in str(args.active_geometry_sources).split(",") if item.strip()
+        source_aliases.get(item.strip().lower(), item.strip().lower())
+        for item in str(args.active_geometry_sources).split(",")
+        if item.strip()
     )
     available_remesh_prefixes = ("isotropic", "voxel") if args.dataset == "submarine" else REMESH_PREFIXES
     if not requested_remesh_prefixes:
@@ -921,48 +1095,75 @@ def main() -> int:
     for model_index, model in enumerate(MODEL_ORDER):
         device = model_items[model]["device"]
         device_groups.setdefault(str(device), {"device": device, "models": []})["models"].append((model_index, model))
+    placement = ", ".join(
+        f"{device_name}=[{', '.join(model for _index, model in group['models'])}]"
+        for device_name, group in device_groups.items()
+    )
+    print(
+        f"[inference] {len(device_groups)} device groups run concurrently; "
+        f"{args.inference_batch_size} independently seeded views/model call. {placement}",
+        flush=True,
+    )
 
-    def evaluate_device_group(group, category, source_name, source_points, mode, run_id, run_index, view_index, queries):
+    def evaluate_device_group(group, category, source_name, source_points, mode, run_id, run_index, view_indices, queries):
         group_rows = []
         device = group["device"]
         context = torch.cuda.device(device) if device.type == "cuda" else nullcontext()
         with context:
-            for _model_index, model in group["models"]:
+            models = group["models"]
+            if args.original_base_only and category == ORIGINAL_CATEGORY:
+                models = [(model_index, model) for model_index, model in models if model == "base"]
+            for _model_index, model in models:
                 item = model_items[model]
                 budget = int(item["budget"])
-                seed = (
-                    args.seed
-                    + 1000003 * int(run_id)
-                    + 10007 * run_index
-                    + 1009 * view_index
-                    + stable_tag(category)
-                    + stable_tag(source_name)
-                )
-                # Keep the encoder realization paired across methods.  The
-                # model is the only varying factor in a per-case comparison.
-                if source_name == "original":
-                    indices = sample_encoder_indices(original, density, mode, budget, seed)
-                else:
-                    rng = np.random.default_rng(np.random.SeedSequence([seed, stable_tag("remeshing_uniform")]))
-                    indices = sample_uniform(source_points.shape[0], budget, rng)
-                geometry = normalize_positions(np.ascontiguousarray(source_points[indices], dtype=np.float32), queries["minimum"], queries["span"])
-                surface_prediction, volume_prediction = predict(item["model"], device, geometry, queries)
-                surface_error = relative_l2(queries["surface_y"], surface_prediction)
-                volume_error = relative_l2(queries["volume_y"], volume_prediction)
-                group_rows.append(
-                    {
+                geometries = []
+                for view_index in view_indices:
+                    seed = (
+                        args.seed
+                        + 1000003 * int(run_id)
+                        + 10007 * run_index
+                        + 1009 * view_index
+                        + stable_tag(category)
+                        + stable_tag(source_name)
+                    )
+                    # Keep each encoder realization paired across methods. The
+                    # model is the only varying factor in a paired comparison.
+                    if source_name == "original":
+                        indices = sample_encoder_indices(original, density, mode, budget, seed)
+                    else:
+                        rng = np.random.default_rng(np.random.SeedSequence([seed, stable_tag("remeshing_uniform")]))
+                        indices = sample_uniform(source_points.shape[0], budget, rng)
+                    geometries.append(normalize_positions(
+                        np.ascontiguousarray(source_points[indices], dtype=np.float32), queries["minimum"], queries["span"]
+                    ))
+                surface_predictions, volume_predictions = predict_batch(item["model"], device, geometries, queries)
+                for batch_index, view_index in enumerate(view_indices):
+                    surface_prediction, volume_prediction = surface_predictions[batch_index], volume_predictions[batch_index]
+                    surface_error = relative_l2(queries["surface_y"], surface_prediction)
+                    volume_error = relative_l2(queries["volume_y"], volume_prediction)
+                    row = {
                         "category": category,
                         "source": source_name,
                         "remeshing_method": "" if source_name == "original" else source_name.split("_div", 1)[0],
                         "run_id": int(run_id),
                         "view": int(view_index),
                         "model": model,
-                        "point_count": int(indices.shape[0]),
+                        "point_count": budget,
                         "surface_rel_l2": surface_error,
                         "volume_rel_l2": volume_error,
                         "combined_rel_l2": 0.5 * (surface_error + volume_error),
                     }
-                )
+                    for field_index, field_name in enumerate(dataset.surface_field_names):
+                        row[f"surface_{field_name}_rel_l2"] = relative_l2(
+                            queries["surface_y"][:, field_index : field_index + 1],
+                            surface_prediction[:, field_index : field_index + 1],
+                        )
+                    for field_index, field_name in enumerate(dataset.volume_field_names):
+                        row[f"volume_{field_name}_rel_l2"] = relative_l2(
+                            queries["volume_y"][:, field_index : field_index + 1],
+                            volume_prediction[:, field_index : field_index + 1],
+                        )
+                    group_rows.append(row)
         return group_rows
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -981,7 +1182,8 @@ def main() -> int:
 
         with ThreadPoolExecutor(max_workers=len(device_groups)) as executor:
             for category, source_name, source_points, mode in test_sources:
-                for view_index in range(args.views_per_test):
+                for view_start in range(0, args.views_per_test, args.inference_batch_size):
+                    view_indices = list(range(view_start, min(view_start + args.inference_batch_size, args.views_per_test)))
                     futures = [
                         executor.submit(
                             evaluate_device_group,
@@ -992,7 +1194,7 @@ def main() -> int:
                             mode,
                             run_id,
                             run_index,
-                            view_index,
+                            view_indices,
                             queries,
                         )
                         for group in device_groups.values()
@@ -1001,7 +1203,11 @@ def main() -> int:
                         rows.extend(future.result())
         print(f"[{run_index + 1}/{len(run_ids)}] evaluated run_{run_id}", flush=True)
 
-    selected_run_ids, selection = select_top_candidates(rows, args.top_k)
+    if args.selection_policy == "all_cases":
+        selected_run_ids = list(run_ids)
+        selection = []
+    else:
+        selected_run_ids, selection = select_top_candidates(rows, args.top_k)
     selected_set = set(selected_run_ids)
     for row in rows:
         row["selected_for_plot"] = int(row["run_id"]) in selected_set
@@ -1009,18 +1215,12 @@ def main() -> int:
 
     selection_fields = ["rank", "run_id", "score_mean_improvement_percent"]
     for category in CATEGORY_ORDER:
-        selection_fields.extend(
-            [f"{category}_improvement_percent", f"{category}_best_classical_model"]
-        )
+        selection_fields.extend([f"{category}_improvement_percent", f"{category}_best_classical_model"])
     with (args.output_dir / "top_candidate_selection.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=selection_fields)
         writer.writeheader()
         for rank, item in enumerate(selection, start=1):
-            row = {
-                "rank": rank,
-                "run_id": item["run_id"],
-                "score_mean_improvement_percent": item["score_mean_improvement_percent"],
-            }
+            row = {"rank": rank, "run_id": item["run_id"], "score_mean_improvement_percent": item["score_mean_improvement_percent"]}
             for category in CATEGORY_ORDER:
                 row[f"{category}_improvement_percent"] = item["endpoint_improvements_percent"][category]
                 row[f"{category}_best_classical_model"] = item["endpoint_errors"][category]["best_classical_model"]
@@ -1031,7 +1231,12 @@ def main() -> int:
                 "pool_run_ids": pool_run_ids,
                 "selected_run_ids": selected_run_ids,
                 "top_k": args.top_k,
-                "criterion": "mean over sine_x_1, sine_y_1, remeshing_div5_mean, and remeshing_div10_mean of DeAL improvement over the best of downsample, gaussian_ball_masked, and box_masked",
+                "selection_policy": args.selection_policy,
+                "criterion": (
+                    "all requested cases; no ranking or exclusion"
+                    if args.selection_policy == "all_cases"
+                    else "mean over sine_x_1, sine_y_1, remeshing_div5_mean, and remeshing_div10_mean of DeAL improvement over the best of downsample, gaussian_ball_masked, and box_masked"
+                ),
                 "ranking": selection,
             },
             indent=2,
@@ -1045,7 +1250,8 @@ def main() -> int:
         writer.writeheader()
         writer.writerows(rows)
     selected_rows = [row for row in rows if row["selected_for_plot"]]
-    stats = category_stats(selected_rows)
+    stats = category_stats(selected_rows, report_categories)
+    field_stats = fieldwise_category_stats(selected_rows, report_categories, dataset)
     source_stats = grouped_stats(selected_rows, tuple(active_sources), "source")
     source_labels = {
         source: f"{(v4_labels[source.split('_')[0]] if args.geometry_label_preset == 'v4' else source.split('_')[0].capitalize())} div{source.rsplit('div', 1)[1]}"
@@ -1055,15 +1261,25 @@ def main() -> int:
     write_tables(
         stats,
         args.output_dir,
+        report_categories,
+        report_category_labels,
+        field_stats=field_stats,
         source_stats=source_stats,
         source_labels=source_labels,
         method_stats=method_stats,
     )
     for scale in [item.strip() for item in str(args.plot_scales).split(",") if item.strip()]:
-        for category in CATEGORY_ORDER:
+        for category in report_categories:
             if category in stats:
-                plot_category(stats[category], category, args.output_dir / f"combined_global_endpoint_{category}_bars_{scale}.png", scale, args.font_scale, args.no_std)
-        plot_all_categories(stats, args.output_dir / f"combined_global_endpoint_bars_{scale}.png", scale, args.font_scale, args.no_std)
+                plot_category(
+                    stats[category], category, args.output_dir / f"combined_global_endpoint_{category}_bars_{scale}.png",
+                    scale, args.font_scale, args.no_std, report_category_labels,
+                )
+        plot_all_categories(
+            stats, args.output_dir / f"combined_global_endpoint_bars_{scale}.png", scale, args.font_scale, args.no_std,
+            categories=tuple(category for category in report_categories if category != ORIGINAL_CATEGORY),
+            title="SMART representation-shift evaluation",
+        )
         plot_all_categories(
             stats,
             args.output_dir / f"combined_global_remeshing_average_bars_{scale}.png",
@@ -1099,18 +1315,42 @@ def main() -> int:
         "run_ids": selected_run_ids,
         "candidate_pool_run_ids": pool_run_ids,
         "top_k": args.top_k,
-        "categories": list(CATEGORY_ORDER),
-        "category_labels": CATEGORY_LABELS,
+        "selection_policy": args.selection_policy,
+        "categories": list(report_categories),
+        "category_labels": report_category_labels,
         "remeshing_groups": {key: list(value) for key, value in remesh_groups.items()},
         "remeshing_method_groups": {key: list(value) for key, value in method_groups.items()},
         "remeshing_sources": active_sources,
         "models": {model: {"config": config_names[model], "checkpoint": str(checkpoints[model].resolve()), "input_budget": model_items[model]["budget"]} for model in MODEL_ORDER},
         "case_selection": args.case_selection,
-        "metric": "combined global relative L2; mean of surface and volume normalized relative L2",
+        "metric": "per-case combined global relative L2: 0.5 * (surface relative L2 + volume relative L2), with all output channels concatenated within each domain",
         "relative_percentage": "100 * (SMART error - method error) / abs(SMART error); positive means better than SMART",
         "stats": stats,
+        "fieldwise_stats": field_stats,
     }
     (args.output_dir / "combined_global_endpoint_metrics.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    (args.output_dir / "frozen_evaluation_manifest.json").write_text(
+        json.dumps(
+            {
+                "dataset": args.dataset,
+                "case_selection": args.case_selection,
+                "selection_policy": args.selection_policy,
+                "requested_run_count": args.num_runs,
+                "available_complete_remesh_run_ids": available,
+                "evaluated_run_ids": selected_run_ids,
+                "include_original": args.include_original,
+                "original_base_only": args.original_base_only,
+                "categories": list(report_categories),
+                "seed": args.seed,
+                "views_per_test": args.views_per_test,
+                "surface_query_points": args.surface_query_points,
+                "volume_query_points": args.volume_query_points,
+                "remeshing_sources": active_sources,
+            },
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
     print(f"Metrics: {args.output_dir / 'combined_global_endpoint_metrics.json'}", flush=True)
     return 0
 

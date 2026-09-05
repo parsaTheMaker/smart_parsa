@@ -1,0 +1,44 @@
+# Shared DeAL/SATLOSS7 protocol for Pump architecture continuations.
+# The leaf retains the matched base architecture and point budget.
+experiment:
+  geometry_epoch_seeded_sampling: False
+  num_body_points: 0
+  view_geometry_points: 16384
+  primary_view_geometry_points: 16384
+  secondary_view_geometry_points: 16384
+  shared_shift_view_geometry_points: 16384
+  eval_view_geometry_points: 16384
+  eval_aligned_view_geometry_points: 16384
+  eval_shifted_view_geometry_points: 16384
+
+  density_knn_k: 16
+  density_neighbor_hops: 1
+  density_estimator: "kde"
+  geometry_density_cache_dtype: "float16"
+  train_primary_sampling_mode: "inverse_density_wor"
+  train_secondary_sampling_mode: "inverse_density_wor"
+  eval_aligned_sampling_mode: "uniform_wor"
+  eval_shifted_sampling_mode: "inverse_density_wor"
+  train_shared_shift_sampling_mode: "random_beta_sine"
+  shared_shift_family_probabilities: [0.3333333333, 0.3333333333, 0.3333333334]
+  shared_shift_beta_min: 0.0
+  shared_shift_beta_max: 1.0
+  shared_shift_sine_min: 0.0
+  shared_shift_sine_max: 1.0
+
+  use_prediction_consistency: True
+  prediction_consistency_weight: 1.0
+  prediction_consistency_smooth_l1_beta: 0.1
+  prediction_consistency_symmetric_detached: True
+  prediction_consistency_average_groups: True
+  consistency_warmup_epochs: 0
+  fuse_consistency_views: True
+  task_weighting_method: "fixed_sum"
+  config_task_base_weights: [0.2, 0.2, 0.6]
+  fixed_sum_use_view_losses: True
+  use_learned_task_weighting: False
+
+  epochs: 150
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False

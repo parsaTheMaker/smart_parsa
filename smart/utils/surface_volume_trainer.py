@@ -516,6 +516,9 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
             target_epochs=int(config.epochs),
         )
     log_every_n_steps = getattr(config, "log_every_n_steps", 10)
+    max_train_batches = max(0, int(getattr(config, "max_train_batches", 0)))
+    max_eval_batches = max(0, int(getattr(config, "max_eval_batches", 0)))
+    save_checkpoints = bool(getattr(config, "save_checkpoints", True))
 
     try:
         for ep in tqdm(range(start_epoch, config.epochs), desc="Epochs", dynamic_ncols=True, disable=not is_main):
@@ -543,6 +546,8 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                 disable=not is_main,
             )
             for batch_idx, batch in enumerate(train_pbar):
+                if max_train_batches and batch_idx >= max_train_batches:
+                    break
                 geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, geo_log_density = _parse_batch(batch, params_dim)
                 geo_mesh = geo_mesh.to(device)
                 surf_mesh = surf_mesh.to(device)
@@ -704,7 +709,9 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                 disable=not is_main,
             )
             with torch.no_grad():
-                for batch in test_pbar:
+                for eval_batch_idx, batch in enumerate(test_pbar):
+                    if max_eval_batches and eval_batch_idx >= max_eval_batches:
+                        break
                     geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, geo_log_density = _parse_batch(batch, params_dim)
                     geo_mesh = geo_mesh.to(device)
                     surf_mesh = surf_mesh.to(device)
@@ -761,12 +768,14 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                 train_losses = average_distributed_metrics(train_losses, train_sample_count, device)
                 test_losses = average_distributed_metrics(test_losses, test_sample_count, device)
             else:
+                train_denominator = max(train_sample_count, 1)
+                test_denominator = max(test_sample_count, 1)
                 for loss_name in train_losses.keys():
-                    train_losses[loss_name] /= len(train_loader.dataset)
+                    train_losses[loss_name] /= train_denominator
                 for loss_name in test_losses.keys():
-                    test_losses[loss_name] /= len(test_loader.dataset)
+                    test_losses[loss_name] /= test_denominator
 
-            if is_main and test_losses["rel_l2"] < loss_test_min:
+            if save_checkpoints and is_main and test_losses["rel_l2"] < loss_test_min:
                 loss_test_min = test_losses["rel_l2"]
                 torch.save({
                     "epoch": ep,
@@ -783,7 +792,7 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                     "metric_values": {k: v for k, v in test_losses.items() if k.startswith("rel_l2")},
                 }, "checkpoints/" + model_checkpoint_name + "_best.pt")
 
-            if is_main:
+            if save_checkpoints and is_main:
                 torch.save({
                     "epoch": ep,
                     "global_step": global_step,
@@ -819,7 +828,7 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
         if run is not None:
             best_ckpt = os.path.join("checkpoints", model_checkpoint_name + "_best.pt")
             last_ckpt = os.path.join("checkpoints", model_checkpoint_name + "_last.pt")
-            if os.path.isfile(best_ckpt) or os.path.isfile(last_ckpt):
+            if save_checkpoints and (os.path.isfile(best_ckpt) or os.path.isfile(last_ckpt)):
                 artifact = wandb.Artifact("model", type="model")
                 if os.path.isfile(best_ckpt):
                     artifact.add_file(best_ckpt)

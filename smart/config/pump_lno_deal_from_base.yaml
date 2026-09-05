@@ -1,0 +1,14 @@
+defaults:
+  - pump_lno
+  - pump_deal_satloss7_protocol
+  - _self_
+
+experiment:
+  name: "PUMP_LNO_DEAL_FROM_BASE"
+  model_name: "LNO_PUMP_DEAL"
+  model_tag: "from-base-150ep"
+  batch_size: 1
+  multi_gpu_strategy: "single"
+
+wandb:
+  mode: "disabled"

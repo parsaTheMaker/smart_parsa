@@ -181,6 +181,30 @@ class CrossAttention(nn.Module):
         
         self.dropout = dropout
 
+    def prepare_kv(self, kv, kv_pos=None):
+        """Normalize and project fixed keys/values once for chunked decoding."""
+        kv = self.norm_kv(kv)
+        kv = self.kv(kv)
+        k_heads, v_heads = torch.tensor_split(
+            rearrange(kv, "b kv (h d) -> b h kv d", h=2 * self.num_heads, d=self.head_dim),
+            2,
+            dim=1,
+        )
+        if kv_pos is not None:
+            k_heads = self.rope(k_heads, kv_pos)
+        return k_heads, v_heads
+
+    def forward_prepared(self, q, prepared_kv, q_pos=None):
+        """Attend to precomputed keys/values while preserving the standard path."""
+        q = self.norm_q(q)
+        q = self.q(q)
+        q_heads = rearrange(q, "b q (h d) -> b h q d", h=self.num_heads, d=self.head_dim)
+        if q_pos is not None:
+            q_heads = self.rope(q_heads, q_pos)
+        k_heads, v_heads = prepared_kv
+        x = F.scaled_dot_product_attention(q_heads, k_heads, v_heads, dropout_p=(self.dropout if self.training else 0.0))
+        return self.out_proj(rearrange(x, "b h q d -> b q (h d)"))
+
     def forward(self, q, kv, q_pos=None, kv_pos=None):
         """Applies pre-norm and computes cross-attention between q and kv.
 
@@ -193,31 +217,8 @@ class CrossAttention(nn.Module):
         Returns:
             Updated queries that attend to kv with shape (batch size, number query tokens, dim).
         """
-        # Apply layer normalization
-        q = self.norm_q(q)
-        kv = self.norm_kv(kv)
-        
-        # Linear projections
-        q = self.q(q)
-        kv = self.kv(kv)
-            
-        # Split heads and keys/values
-        q_heads = rearrange(q, "b q (h d) -> b h q d", h=self.num_heads, d=self.head_dim)
-        k_heads, v_heads = torch.tensor_split(rearrange(kv, "b kv (h d) -> b h kv d", h=2*self.num_heads, d=self.head_dim), 2, dim=1)
-        
-        # Apply RoPE if positions are provided
-        if q_pos is not None and kv_pos is not None:
-            q_heads = self.rope(q_heads, q_pos)
-            k_heads = self.rope(k_heads, kv_pos)
-            
-        # Compute attention using PyTorch's scaled_dot_product_attention
-        x = F.scaled_dot_product_attention(q_heads, k_heads, v_heads, dropout_p=(self.dropout if self.training else 0.0))
-        
-        # Merge heads and output projection
-        x = rearrange(x, "b h q d -> b q (h d)")
-        x = self.out_proj(x)
-        
-        return x
+        prepared_kv = self.prepare_kv(kv, kv_pos=kv_pos)
+        return self.forward_prepared(q, prepared_kv, q_pos=q_pos)
 
 
 class Modulator(nn.Module):

@@ -1,0 +1,18 @@
+defaults:
+  - toy_heat_exchange_geo_fno
+  - toy_heat_exchange_satloss7_protocol
+  - _self_
+
+wandb:
+  mode: "online"
+
+experiment:
+  name: "HEAT_EXCHANGER_GeoFNO_MEDIUM_V2_DEAL_FROM_BASE"
+  model_name: "GEOFNO_HEAT_EXCHANGER_DEAL"
+  model_tag: "medium-v2-from-base-150ep"
+  # Fused two-view batches retain the base model's effective batch of four.
+  batch_size: 2
+  multi_gpu_strategy: "single"
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False

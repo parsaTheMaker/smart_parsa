@@ -1,0 +1,28 @@
+defaults:
+  - drivaerml_architecture_common
+  - _self_
+
+wandb:
+  mode: "online"
+
+experiment:
+  name: "DrivAerML_GAOT_CAPACITY_OPTIMIZED_BASE"
+  model_name: "GAOT"
+  model_tag: "expanded-v3"
+  batch_size: 4
+  scheduler_warmup_fraction: 0.2
+  num_workers: 4
+  prefetch_factor: 1
+  cuda_batch_prefetch: False
+  architecture:
+    hidden_dim: 192
+    regional_tokens: 1024
+    encoder_neighbors: [16, 32]
+    decoder_neighbors: [8, 16]
+    processor_depth: 6
+    num_heads: 6
+    geometry_groups: 8
+    dropout: 0.0
+    pos_scale_factor: 100.0
+    encoder_knn_chunk_size: 32
+    query_chunk_size: 2048

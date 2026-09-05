@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -12,10 +11,9 @@ def gumbel_softmax(logits, tau=1.0):
 
 
 def _distributed_sum(value):
-    # The upstream implementation reduces across distributed workers. A
-    # single-process run must skip that collective.
-    if dist.is_available() and dist.is_initialized():
-        dist.all_reduce(value, op=dist.ReduceOp.SUM)
+    # This repository uses data parallelism, not sequence parallelism. Each
+    # rank owns different cases, so reducing token statistics across ranks
+    # would mix unrelated geometries.
     return value
 
 
@@ -57,7 +55,12 @@ class PhysicsAttention1DEidetic(nn.Module):
 
             temperature = self.proj_temperature(x_mid) + self.bias
             temperature = torch.clamp(temperature, min=0.01)
-            slice_weights = gumbel_softmax(self.in_project_slice(x_mid), temperature)
+            slice_logits = self.in_project_slice(x_mid)
+            slice_weights = (
+                gumbel_softmax(slice_logits, temperature)
+                if self.training
+                else torch.softmax(slice_logits / temperature, dim=-1)
+            )
             slice_norm = _distributed_sum(slice_weights.sum(dim=2))
             slice_token = torch.einsum("bhnc,bhng->bhgc", x_mid, slice_weights).contiguous()
             slice_token = _distributed_sum(slice_token)
@@ -157,13 +160,12 @@ class TransolverPPBase(nn.Module):
         use_token_type_embeddings=False,
     ):
         super().__init__()
-        if parameter_channels:
-            raise ValueError("The DrivAerML Transolver++ adapter does not use parameter channels.")
         self.surface_channels = int(surface_channels)
         self.volume_channels = int(volume_channels)
         self.spatial_dim = int(spatial_dim)
         self.geometry_points = int(geometry_points)
         self.use_token_type_embeddings = bool(use_token_type_embeddings)
+        self.parameter_channels = int(parameter_channels)
         self.preprocess = TransolverPlusMLP(
             self.spatial_dim, n_hidden * 2, n_hidden, n_layers=0, residual=False
         )
@@ -174,6 +176,15 @@ class TransolverPPBase(nn.Module):
         # membership explicitly when adapting it to this operator interface.
         self.token_type_embedding = (
             nn.Embedding(3, int(n_hidden)) if self.use_token_type_embeddings else None
+        )
+        self.parameter_embedding = (
+            nn.Sequential(
+                nn.Linear(self.parameter_channels, int(n_hidden)),
+                nn.GELU(),
+                nn.Linear(int(n_hidden), int(n_hidden)),
+            )
+            if self.parameter_channels > 0
+            else None
         )
         self.blocks = nn.ModuleList(
             [
@@ -222,8 +233,8 @@ class TransolverPPBase(nn.Module):
         geo_log_density=None,
         return_latent=False,
     ):
-        if params is not None:
-            raise ValueError("The DrivAerML Transolver++ adapter does not use parameter channels.")
+        if self.parameter_embedding is not None and params is None:
+            raise ValueError("Transolver++ was configured with parameter channels but received no parameters.")
         geometry_pos = self._select_geometry(geo, geo_log_density=geo_log_density)
         query_pos = torch.cat([surf_query_pos, vol_query_pos], dim=1)
         # Start the residual stream in fp32 so AMP does not introduce a
@@ -231,6 +242,8 @@ class TransolverPPBase(nn.Module):
         with torch.autocast(device_type=geo.device.type, enabled=False):
             tokens = self.preprocess(torch.cat([geometry_pos, query_pos], dim=1).float())
             tokens = tokens + self.placeholder.view(1, 1, -1)
+            if self.parameter_embedding is not None:
+                tokens = tokens + self.parameter_embedding(params).unsqueeze(1)
             if self.token_type_embedding is not None:
                 batch_size = int(geometry_pos.shape[0])
                 role_ids = torch.cat(

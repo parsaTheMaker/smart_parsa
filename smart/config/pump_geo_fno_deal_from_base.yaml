@@ -1,0 +1,18 @@
+defaults:
+  - pump_geo_fno
+  - pump_deal_satloss7_protocol
+  - _self_
+
+wandb:
+  mode: "disabled"
+
+experiment:
+  name: "PUMP_GeoFNO_MEDIUM_V2_DEAL_FROM_BASE"
+  model_name: "GEOFNO_PUMP_DEAL"
+  model_tag: "medium-v2-from-base-150ep"
+  # Two views are fused; this retains the base effective batch of four.
+  batch_size: 2
+  multi_gpu_strategy: "single"
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False

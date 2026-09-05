@@ -1,0 +1,18 @@
+defaults:
+  - pump_architecture_common
+  - _self_
+
+experiment:
+  name: "PUMP_TRANSOLVERPP_BASE"
+  model_name: "TRANSOLVERPP_PUMP"
+  batch_size: 2
+  multi_gpu_strategy: "single"
+  architecture:
+    n_layers: 4
+    n_hidden: 256
+    n_heads: 8
+    dropout: 0.1
+    mlp_ratio: 2
+    slice_num: 32
+    geometry_points: 0
+    use_token_type_embeddings: True

@@ -105,7 +105,8 @@ def knn_group(points, centers, k):
                 ctr_b.float().contiguous(),
                 k=k_eff,
             )
-            nbr, center = edge_index[0], edge_index[1]
+            # torch_cluster.knn returns [query_index, source_index].
+            center, nbr = edge_index[0], edge_index[1]
             nbr = nbr.view(num_centers, k_eff)
             center = center.view(num_centers, k_eff)
             if not torch.all(center[:, 0] == torch.arange(num_centers, device=points.device, dtype=center.dtype)):

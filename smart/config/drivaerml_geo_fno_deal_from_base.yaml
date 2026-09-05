@@ -1,0 +1,30 @@
+defaults:
+  - drivaerml_geo_fno
+  - drivaerml_deal_satloss7_protocol
+  - _self_
+
+wandb:
+  mode: "online"
+
+experiment:
+  name: "DrivAerML_GeoFNO_MEDIUM_V2_DEAL_FROM_BASE"
+  model_name: "GEOFNO_DEAL"
+  model_tag: "medium-v2-from-base-150ep"
+  # Two sampled views are fused for one forward pass. Halving the base batch
+  # of two keeps the per-update Fourier workload at two encoded views.
+  batch_size: 1
+  multi_gpu_strategy: "single"
+
+  # Geo-FNO's direct NDFT encoder consumes 65,536 raw points. Keep this view
+  # budget explicit so DeAL never samples points that the model later drops.
+  view_geometry_points: 65536
+  primary_view_geometry_points: 65536
+  secondary_view_geometry_points: 65536
+  shared_shift_view_geometry_points: 65536
+  eval_view_geometry_points: 65536
+  eval_aligned_view_geometry_points: 65536
+  eval_shifted_view_geometry_points: 65536
+
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False

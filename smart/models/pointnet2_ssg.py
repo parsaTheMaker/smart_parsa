@@ -398,7 +398,9 @@ class PointNet2SSG(nn.Module):
         histogram.scatter_add_(1, flat_indices, torch.ones_like(flat_indices, dtype=histogram.dtype))
         histogram = histogram / float(max(xyz.shape[1], 1))
         global_feat = global_feat + self.density_encoder(histogram.to(dtype=global_feat.dtype))
-        global_feat = self.geometry_cond(global_feat, params)
+        # CondInjection operates on token sequences; preserve the singleton
+        # token axis while conditioning the pooled global descriptor.
+        global_feat = self.geometry_cond(global_feat.unsqueeze(1), params).squeeze(1)
         return global_feat, xyz1, feat1, xyz2, feat2
 
     def decode_features(self, encoded, surf_query_pos, vol_query_pos, params=None):

@@ -1,0 +1,30 @@
+defaults:
+  - pump_architecture_common
+  - _self_
+
+wandb:
+  mode: "online"
+
+experiment:
+  name: "PUMP_GeoFNO_MEDIUM_BASE"
+  model_name: "GEOFNO_PUMP"
+  model_tag: "medium-v2-raw16k"
+  batch_size: 4
+  num_workers: 4
+  prefetch_factor: 2
+  cuda_batch_prefetch: True
+  architecture:
+    # Pump already supplies 16,384 raw encoder points, so Geo-FNO sees the
+    # complete train-aligned input cloud.
+    geometry_points: 16384
+    width: 64
+    modes: 5
+    latent_resolution: 24
+    num_fourier_blocks: 4
+    source_chunk_size: 4096
+    query_chunk_size: 8192
+    iphi_width: 128
+    iphi_fourier_bands: 8
+    max_deformation: 0.25
+    normalize_source_transform: True
+    enable_tf32: True

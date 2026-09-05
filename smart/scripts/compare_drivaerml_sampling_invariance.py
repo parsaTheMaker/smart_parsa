@@ -20,8 +20,10 @@ Workflow:
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import gc
+import inspect
 import json
 import math
 import os
@@ -55,13 +57,16 @@ CHECKPOINTS_DIR = SMART_ROOT.parent / "checkpoints"
 if str(SMART_ROOT) not in sys.path:
     sys.path.insert(0, str(SMART_ROOT))
 
+# spconv must initialize before h5py/scipy. Loading it afterwards can make its
+# CUDA algorithm registry segfault in this environment due native-library load
+# order, even though each package works independently.
+from models.point_transformer_v3 import PointTransformerV3
 from data.ahmedml_dataset_v2 import AhmedMLDatasetV2
 from models.smart.smart import SMART
 from models.transolverpp import TransolverPP
 from models.mspt import MSPT
 from models.pointnet2_ssg import PointNet2SSG
 from models.lno import LNO
-from models.point_transformer_v3 import PointTransformerV3
 from utils.geometry_density import estimate_log_sampling_density
 from utils.utils import get_model_checkpoint_name
 
@@ -397,6 +402,14 @@ def parse_args() -> argparse.Namespace:
         help="Temporary inference chunk size used to keep batched-view decoding safe.",
     )
     p.add_argument("--vtk-run-id", type=int, default=None, help="Representative run id for the full-surface VTK export. Default: first evaluated run.")
+    p.add_argument(
+        "--skip-representative-exports",
+        action="store_true",
+        help=(
+            "Exit after aggregate tables and plots are written, without optional representative VTK/VTP and sampling exports. "
+            "Use for evidence-only evaluations where postprocessing is not required."
+        ),
+    )
     p.add_argument("--vtk-surface-query-dir", default="/home/parsa/smart_parsa/CFD_audi/run_100/audi", help="Directory containing external surface_coords/normals/pressure/WSS NPY files for representative VTK export.")
     p.add_argument(
         "--surface-vtp-dir",
@@ -716,17 +729,32 @@ def build_model(config, ckpt_path: str, device: torch.device, batched_query_subr
         "SMART_SATLOSS5",
         "SMART_SATLOSS5_NOPM",
         "SMART_SATLOSS7",
-    }:
+    } or model_name.startswith("SMART_SATLOSS7_"):
         model = SMART(**base_kwargs, **arch)
     elif model_name in {"TRANSOLVERPP", "TRANSOLVERPP_SATLOSS3", "TRANSOLVERPP_SATLOSS7"}:
+        # DeAL configs inherit the SMART defaults. Transolver++ does not use
+        # SMART's latent/subsampling options and its strict base constructor
+        # correctly rejects them, so retain only its own architecture keys.
+        valid = set(inspect.signature(TransolverPP.__mro__[1].__init__).parameters) - {"self"}
+        arch = {key: value for key, value in arch.items() if key in valid}
         model = TransolverPP(**base_kwargs, **arch)
     elif model_name in {"POINTNET2_SSG", "POINTNET2_SSG_SATLOSS7"}:
         model = PointNet2SSG(**base_kwargs, **arch)
     elif model_name in {"LNO", "LNO_SATLOSS7"}:
         model = LNO(**base_kwargs, **arch)
     elif model_name in {"MSPT", "MSPT_SATLOSS7"}:
+        # Same inherited SMART options occur in the MSPT DeAL config, while
+        # MSPT has a deliberately strict constructor.
+        valid = set(inspect.signature(MSPT.__init__).parameters) - {"self"}
+        arch = {key: value for key, value in arch.items() if key in valid}
         model = MSPT(**base_kwargs, **arch)
     elif model_name in {"POINT_TRANSFORMER_V3", "POINT_TRANSFORMER_V3_SATLOSS7"}:
+        # The installed FlashAttention extension invokes a TorchDynamo API
+        # removed by the active PyTorch build. SDPA implements the same
+        # attention operation at inference and avoids that binary mismatch.
+        if bool(arch.get("enable_flash", False)):
+            print(f"[PTv3 backend] {model_name}: using PyTorch SDPA instead of incompatible FlashAttention.")
+            arch["enable_flash"] = False
         model = PointTransformerV3(**base_kwargs, **arch)
     else:
         raise ValueError(f"Unsupported model_name for this evaluator: {model_name}")
@@ -947,19 +975,59 @@ def geometry_source_vtp_path(source: str, run_id: int, geometry_vtp_dirs: Mappin
 
 
 def read_vtp_points(path: Path) -> np.ndarray:
-    """Read only point coordinates from a geometry-only VTP."""
-    try:
-        import vtk
-        from vtk.util.numpy_support import vtk_to_numpy
-    except Exception as exc:  # pragma: no cover - environment-specific
-        raise RuntimeError("VTP geometry tests require VTK Python bindings.") from exc
-    reader = vtk.vtkXMLPolyDataReader()
-    reader.SetFileName(str(path))
-    reader.Update()
-    polydata = reader.GetOutput()
-    if polydata is None or polydata.GetPoints() is None:
-        raise RuntimeError(f"VTP has no points: {path}")
-    points = np.asarray(vtk_to_numpy(polydata.GetPoints().GetData()), dtype=np.float32)
+    """Read binary-inline geometry points without importing VTK.
+
+    The comparison needs only the `Points` array from VTPs produced by this
+    repository.  VTK's native reader conflicts with the loaded HDF5/spconv
+    libraries on this host, whereas VTK XML's inline binary payload is a
+    simple base64 header followed by contiguous Float32/Float64 values.
+    """
+    raw = Path(path).read_bytes()
+    vtk_header = re.search(rb"<VTKFile\b([^>]*)>", raw)
+    points_section = re.search(rb"<Points\b[^>]*>(.*?)</Points>", raw, flags=re.DOTALL)
+    if vtk_header is None or points_section is None:
+        raise RuntimeError(f"VTP has no inline Points section: {path}")
+    if b"compressor=" in vtk_header.group(1):
+        raise RuntimeError(f"Compressed VTP points are unsupported by the lightweight reader: {path}")
+    data_array = re.search(rb"<DataArray\b([^>]*)>(.*?)</DataArray>", points_section.group(1), flags=re.DOTALL)
+    if data_array is None:
+        raise RuntimeError(f"VTP Points section has no DataArray: {path}")
+    attributes, encoded = data_array.groups()
+    value_type_match = re.search(rb'type="([^"]+)"', attributes)
+    component_match = re.search(rb'NumberOfComponents="(\d+)"', attributes)
+    format_match = re.search(rb'format="([^"]+)"', attributes)
+    if value_type_match is None or component_match is None or format_match is None:
+        raise RuntimeError(f"VTP Points DataArray lacks type, components, or format metadata: {path}")
+    value_type = value_type_match.group(1).decode("ascii")
+    dtype_map = {"Float32": np.dtype("<f4"), "Float64": np.dtype("<f8")}
+    if value_type not in dtype_map:
+        raise RuntimeError(f"Unsupported VTP point type {value_type!r}: {path}")
+    components = int(component_match.group(1))
+    if components != 3:
+        raise RuntimeError(f"Expected three VTP point components, got {components}: {path}")
+    data_format = format_match.group(1).decode("ascii").lower()
+    if data_format == "ascii":
+        values = np.fromstring(encoded.decode("ascii"), sep=" ", dtype=dtype_map[value_type])
+    elif data_format == "binary":
+        payload = base64.b64decode(b"".join(encoded.split()))
+        header_type_match = re.search(rb'header_type="([^"]+)"', vtk_header.group(1))
+        header_type = (header_type_match.group(1).decode("ascii") if header_type_match is not None else "UInt32")
+        header_dtype_map = {"UInt32": np.dtype("<u4"), "UInt64": np.dtype("<u8")}
+        if header_type not in header_dtype_map:
+            raise RuntimeError(f"Unsupported VTP binary header type {header_type!r}: {path}")
+        header_dtype = header_dtype_map[header_type]
+        if len(payload) < header_dtype.itemsize:
+            raise RuntimeError(f"Truncated VTP binary payload: {path}")
+        byte_count = int(np.frombuffer(payload, dtype=header_dtype, count=1)[0])
+        raw_values = payload[header_dtype.itemsize : header_dtype.itemsize + byte_count]
+        if len(raw_values) != byte_count:
+            raise RuntimeError(f"Truncated VTP point values: {path}")
+        values = np.frombuffer(raw_values, dtype=dtype_map[value_type])
+    else:
+        raise RuntimeError(f"Unsupported VTP point encoding {data_format!r}: {path}")
+    if values.size % components:
+        raise RuntimeError(f"VTP point payload is not divisible into xyz tuples: {path}")
+    points = np.array(values.reshape(-1, components), dtype=np.float32, copy=True)
     if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] == 0:
         raise RuntimeError(f"VTP has invalid point coordinates: {path}, shape={points.shape}")
     if not np.isfinite(points).all():
@@ -4504,6 +4572,27 @@ def main():
         model_groups = defaultdict(list)
         for model_name in model_specs:
             model_groups[model_device_by_name[model_name]].append(model_name)
+        # spconv's CUDA algorithm registry used by PointTransformerV3 is not
+        # thread-safe after h5py/scipy has initialized in this environment.
+        # Keep every other device group concurrent, but execute each PTv3
+        # model from the main thread after the parallel work completes.
+        ptv3_names = {
+            "POINT_TRANSFORMER_V3",
+            "POINT_TRANSFORMER_V3_SATLOSS7",
+        }
+        parallel_model_groups = []
+        serial_ptv3_groups = []
+        for group_names in model_groups.values():
+            regular_names = [model_name for model_name in group_names if model_name not in ptv3_names]
+            if regular_names:
+                parallel_model_groups.append(regular_names)
+            serial_ptv3_groups.extend([[model_name] for model_name in group_names if model_name in ptv3_names])
+        if serial_ptv3_groups:
+            print(
+                "[PTv3 safety] Running PointTransformerV3 groups from the main thread; "
+                f"{len(parallel_model_groups)} non-PTv3 groups remain concurrent.",
+                flush=True,
+            )
 
         def evaluate_model_group(group_names, mode_name, mode_info):
             group_per_view_rows = []
@@ -4740,14 +4829,21 @@ def main():
                         del geo_density_views
             return group_per_view_rows, group_drag_rank_rows
 
-        with ThreadPoolExecutor(max_workers=len(model_groups)) as inference_pool:
+        with ThreadPoolExecutor(max_workers=len(parallel_model_groups)) as inference_pool:
             for mode_name, mode_info in mode_defs.items():
                 futures = [
                     inference_pool.submit(evaluate_model_group, group_names, mode_name, mode_info)
-                    for group_names in model_groups.values()
+                    for group_names in parallel_model_groups
                 ]
                 for future in futures:
                     group_rows, group_drag_rows = future.result()
+                    per_view_rows.extend(group_rows)
+                    drag_rank_view_rows.extend(group_drag_rows)
+                # spconv must not be called from a worker thread or overlap
+                # other native model groups on this host. This does not alter
+                # inputs, model state, seeds, or reported metrics.
+                for group_names in serial_ptv3_groups:
+                    group_rows, group_drag_rows = evaluate_model_group(group_names, mode_name, mode_info)
                     per_view_rows.extend(group_rows)
                     drag_rank_view_rows.extend(group_drag_rows)
 
@@ -6065,6 +6161,10 @@ def main():
         for future in tqdm(futures, desc="CPU plot tasks", leave=False, dynamic_ncols=True):
             future.result()
 
+    if args.skip_representative_exports:
+        print("[postprocess] Skipping optional representative VTK/VTP and sampling exports.")
+        return
+
     vtk_surface_query_dir = Path(args.vtk_surface_query_dir).expanduser().resolve()
     representative_run_dir = Path(smart_cfg.data_path) / f"run_{vtk_run_id}"
     if not representative_run_dir.is_dir():
@@ -6081,12 +6181,6 @@ def main():
     audi_surf_query_norm = normalize_pos(torch.from_numpy(rep_surf_coords_full), min_pos, max_pos)
     rep_dummy_vol_query_norm = normalize_pos(torch.from_numpy(rep_vol_coords[:1]), min_pos, max_pos).unsqueeze(0)
     rep_input_geo_norm = normalize_pos(torch.from_numpy(rep_input_surf_coords), min_pos, max_pos)
-    rep_sampling_geo_log_density = estimate_log_sampling_density(
-        rep_input_geo_norm.unsqueeze(0),
-        knn_k=dataset.geometry_density_knn_k,
-        neighbor_hops=dataset.geometry_density_neighbor_hops,
-        estimator=dataset.geometry_density_estimator,
-    ).squeeze(0).cpu()
 
     sampling_input_surf_coords = np.load(representative_run_dir / "surface_coords.npy").astype(np.float32, copy=False)
     sampling_input_geo_norm = normalize_pos(torch.from_numpy(sampling_input_surf_coords), min_pos, max_pos)
@@ -6159,14 +6253,29 @@ def main():
                 group_results.append((model_name, None, exc))
         return group_results
 
+    # PTv3's sparse-convolution backend is not thread safe in this environment.
+    # Keep the other model/device groups concurrent, but export PTv3 from the
+    # main thread exactly as in the evaluation loop above.
+    audi_parallel_groups = []
+    audi_serial_groups = []
+    for group_names in audi_model_groups.values():
+        regular_names = [name for name in group_names if name != "POINT_TRANSFORMER_V3" and name != "POINT_TRANSFORMER_V3_SATLOSS7"]
+        ptv3_names = [name for name in group_names if name not in regular_names]
+        if regular_names:
+            audi_parallel_groups.append(regular_names)
+        if ptv3_names:
+            audi_serial_groups.append(ptv3_names)
+
     audi_results = []
-    with ThreadPoolExecutor(max_workers=len(audi_model_groups)) as audi_pool:
+    with ThreadPoolExecutor(max_workers=max(1, len(audi_parallel_groups))) as audi_pool:
         audi_futures = [
             audi_pool.submit(evaluate_audi_model_group, group_names)
-            for group_names in audi_model_groups.values()
+            for group_names in audi_parallel_groups
         ]
         for future in audi_futures:
             audi_results.extend(future.result())
+    for group_names in audi_serial_groups:
+        audi_results.extend(evaluate_audi_model_group(group_names))
 
     for model_name, pred_pressure, error in sorted(
         audi_results, key=lambda item: MODEL_ORDER.index(item[0])

@@ -418,8 +418,6 @@ class MSPT(nn.Module):
         use_token_type_embeddings=False,
     ):
         super().__init__()
-        if parameter_channels:
-            raise ValueError("MSPT DrivAerML adapter does not use parameter channels.")
         if n_hidden % num_heads != 0:
             raise ValueError(f"n_hidden={n_hidden} must be divisible by num_heads={num_heads}")
         if V <= 0 or V & (V - 1):
@@ -431,6 +429,7 @@ class MSPT(nn.Module):
         self.Q = int(Q)
         self.chunking_mode = str(chunking_mode).lower()
         self.use_token_type_embeddings = bool(use_token_type_embeddings)
+        self.parameter_channels = int(parameter_channels)
         if self.chunking_mode not in {"linear", "balltree"}:
             raise ValueError("MSPT chunking_mode must be 'linear' or 'balltree'.")
         self.subsampled_geometry_points = 0
@@ -470,6 +469,15 @@ class MSPT(nn.Module):
         # information through the spatial reordering required by MSPT.
         self.token_type_embedding = (
             nn.Embedding(3, int(n_hidden)) if self.use_token_type_embeddings else None
+        )
+        self.parameter_embedding = (
+            nn.Sequential(
+                nn.Linear(self.parameter_channels, int(n_hidden)),
+                nn.GELU(),
+                nn.Linear(int(n_hidden), int(n_hidden)),
+            )
+            if self.parameter_channels > 0
+            else None
         )
         self.initialize_weights()
         if self.token_type_embedding is not None:
@@ -529,8 +537,8 @@ class MSPT(nn.Module):
         return_latent=False,
     ):
         del geo_log_density
-        if params is not None:
-            raise ValueError("MSPT DrivAerML adapter does not use parameter channels.")
+        if self.parameter_embedding is not None and params is None:
+            raise ValueError("MSPT was configured with parameter channels but received no parameters.")
         geometry_count = int(geo.shape[1])
         surface_count = int(surf_query_pos.shape[1])
         all_positions = torch.cat([geo, surf_query_pos, vol_query_pos], dim=1)
@@ -560,6 +568,8 @@ class MSPT(nn.Module):
             chunked_role_ids.scatter_(1, inverse, role_ids)
             features = features + self.token_type_embedding(chunked_role_ids).to(dtype=features.dtype)
         features = features + self.placeholder.view(1, 1, -1)
+        if self.parameter_embedding is not None:
+            features = features + self.parameter_embedding(params).unsqueeze(1)
 
         supernodes = None
         for block in self.blocks:

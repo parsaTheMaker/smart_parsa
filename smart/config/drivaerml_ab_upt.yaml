@@ -1,0 +1,31 @@
+defaults:
+  - drivaerml_architecture_common
+  - _self_
+
+wandb:
+  mode: "online"
+
+experiment:
+  name: "DrivAerML_AB_UPT_CAPACITY_OPTIMIZED_BASE"
+  model_name: "AB_UPT"
+  model_tag: "expanded-v3"
+  batch_size: 4
+  scheduler_warmup_fraction: 0.2
+  num_workers: 4
+  prefetch_factor: 1
+  cuda_batch_prefetch: False
+  architecture:
+    hidden_dim: 192
+    num_heads: 6
+    geometry_supernodes: 2048
+    supernode_neighbors: 32
+    surface_anchors: 1024
+    volume_anchors: 1024
+    geometry_depth: 2
+    interleaved_depth: 2
+    final_self_depth: 6
+    domain_decoder_depth: 2
+    dropout: 0.0
+    pos_scale_factor: 100.0
+    knn_chunk_size: 64
+    query_chunk_size: 4096

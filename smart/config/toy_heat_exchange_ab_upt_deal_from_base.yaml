@@ -1,0 +1,15 @@
+defaults:
+  - toy_heat_exchange_ab_upt
+  - toy_heat_exchange_satloss7_protocol
+  - _self_
+
+experiment:
+  name: "HEAT_EXCHANGE_AB_UPT_DEAL_FROM_BASE"
+  model_name: "AB_UPT_HEAT_EXCHANGE_DEAL"
+  model_tag: "from-base-150ep"
+  # Fused views preserve the base effective batch of four.
+  batch_size: 2
+  multi_gpu_strategy: "single"
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False

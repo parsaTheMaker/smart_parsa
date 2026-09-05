@@ -1,0 +1,24 @@
+defaults:
+  - pump_architecture_common
+  - _self_
+
+experiment:
+  name: "PUMP_POINTNET2_SSG_BASE"
+  model_name: "POINTNET2_SSG_PUMP"
+  batch_size: 4
+  multi_gpu_strategy: "single"
+  architecture:
+    latent_dim: 256
+    sa1_npoint: 2048
+    sa1_radius: 0.03
+    sa1_nsample: 64
+    sa2_npoint: 512
+    sa2_radius: 0.06
+    sa2_nsample: 128
+    query_neighbors: 3
+    centroid_sampling: "random"
+    deterministic_eval_centroids: True
+    density_histogram_bins: 8
+    pos_scale_factor: 1.0
+    query_chunk_size: 65536
+    dropout: 0.0

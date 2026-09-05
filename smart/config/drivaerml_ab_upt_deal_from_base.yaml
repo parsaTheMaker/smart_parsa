@@ -1,0 +1,13 @@
+defaults:
+  - drivaerml_ab_upt
+  - drivaerml_deal_satloss7_protocol
+  - _self_
+
+experiment:
+  name: "DrivAerML_AB_UPT_DEAL_FROM_BASE"
+  model_name: "AB_UPT_DEAL"
+  model_tag: "from-base-150ep"
+  # Two views are fused before the forward pass; this preserves the base
+  # model's effective batch size of four on a 24 GiB GPU.
+  batch_size: 2
+  multi_gpu_strategy: "single"

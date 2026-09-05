@@ -18,8 +18,13 @@ from types import SimpleNamespace
 
 def make_grad_scaler(config):
     """Build an AMP scaler with optional model-specific stability settings."""
+    # GradScaler only protects float16's narrow exponent range.  Keeping it
+    # enabled for BF16 is unnecessary and can carry an incompatible FP16 scale
+    # across a resumed run.
+    enabled = bool(getattr(config, "amp", True)) and str(getattr(config, "precision", "float16")).lower() == "float16"
     return torch.amp.GradScaler(
         "cuda",
+        enabled=enabled,
         init_scale=float(getattr(config, "amp_scaler_init_scale", 65536.0)),
         growth_factor=float(getattr(config, "amp_scaler_growth_factor", 2.0)),
         backoff_factor=float(getattr(config, "amp_scaler_backoff_factor", 0.5)),

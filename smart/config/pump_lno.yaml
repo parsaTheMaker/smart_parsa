@@ -1,0 +1,23 @@
+defaults:
+  - pump_architecture_common
+  - _self_
+
+experiment:
+  name: "PUMP_LNO_BASE"
+  model_name: "LNO_PUMP"
+  batch_size: 4
+  multi_gpu_strategy: "single"
+  architecture:
+    n_block: 8
+    n_mode: 256
+    n_dim: 256
+    n_head: 8
+    n_layer: 2
+    attn: "Galerkin"
+    activation: "GELU"
+    pos_scale_factor: 1.0
+    query_chunk_size: 65536
+    dropout: 0.0
+    normalize_scores: True
+    encode_score_temperature: 2.0
+    decode_score_temperature: 1.0

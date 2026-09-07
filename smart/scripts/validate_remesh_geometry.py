@@ -22,7 +22,11 @@ from tqdm.auto import tqdm
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dataset", choices=("drivaerml", "pump", "heat_exchanger"), required=True)
+    parser.add_argument(
+        "--dataset",
+        choices=("drivaerml", "pump", "heat_exchanger", "c_core_magnetic"),
+        required=True,
+    )
     parser.add_argument("--source-dir", type=Path, required=True, help="Directory containing the original VTPs.")
     parser.add_argument("--remesh-dir", type=Path, required=True, help="Root containing method/case/remeshed.vtp.")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -157,7 +161,7 @@ def original_path(dataset: str, source_dir: Path, remesh: Path) -> Path:
         return source_dir / case_name / f"{stem}.vtp"
     if dataset == "pump":
         return source_dir / case_name / f"{stem}.vtp"
-    if dataset == "heat_exchanger":
+    if dataset in {"heat_exchanger", "c_core_magnetic"}:
         return source_dir / case_name / f"{stem}.vtp"
     raise AssertionError(dataset)
 

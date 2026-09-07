@@ -1,0 +1,16 @@
+defaults:
+  - c_core_magnetic_ab_upt
+  - c_core_magnetic_deal_protocol
+  - _self_
+
+experiment:
+  name: "C_CORE_MAGNETIC_AB_UPT_DEAL_FROM_BASE"
+  model_name: "AB_UPT_C_CORE_MAGNETIC_DEAL"
+  model_tag: "from-base-150ep"
+  # Native C-core clouds have variable cardinality. One case produces two
+  # fused DeAL views, matching the base model's effective batch of two.
+  batch_size: 1
+  multi_gpu_strategy: "single"
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False

@@ -61,6 +61,11 @@ DATASET_DEFAULTS = {
         "output_dir": Path("/mnt/ssdraid/parsa/toy_heat_exchange_surface_vtp_remesh_v2"),
         "pattern": "case_*/*_surface.vtp",
     },
+    "c_core_magnetic": {
+        "source_dir": Path("/mnt/data/parsa/c_core_magnetic_fem_v1_raw"),
+        "output_dir": Path("/mnt/data/parsa/c_core_magnetic_surface_vtp_remesh_v4"),
+        "pattern": "case_*/*_solid_surface.vtp",
+    },
 }
 
 
@@ -280,8 +285,44 @@ def remove_degenerate_faces(points: np.ndarray, faces: np.ndarray) -> np.ndarray
     return np.ascontiguousarray(faces[keep], dtype=np.int64)
 
 
+def sanitize_clustered_mesh(vtk, vtk_to_numpy, polydata):
+    """Remove collapsed/duplicate cells emitted by vertex clustering."""
+    if polydata.GetPoints() is None or polydata.GetPolys() is None:
+        raise RuntimeError("Vertex clustering returned an empty polydata object.")
+    points = np.asarray(vtk_to_numpy(polydata.GetPoints().GetData()), dtype=np.float64)
+    cells = np.asarray(vtk_to_numpy(polydata.GetPolys().GetData()), dtype=np.int64)
+    if cells.size % 4 != 0 or not np.all(cells[::4] == 3):
+        raise RuntimeError("Vertex clustering output is not purely triangular.")
+    faces = cells.reshape(-1, 4)[:, 1:]
+    faces = faces[
+        (faces[:, 0] != faces[:, 1])
+        & (faces[:, 1] != faces[:, 2])
+        & (faces[:, 0] != faces[:, 2])
+    ]
+    faces = remove_degenerate_faces(points, faces)
+    if len(faces) == 0:
+        raise RuntimeError("Vertex clustering left no positive-area triangles.")
+    canonical = np.sort(faces, axis=1)
+    _, unique_indices = np.unique(canonical, axis=0, return_index=True)
+    faces = np.ascontiguousarray(faces[np.sort(unique_indices)], dtype=np.int64)
+    rebuilt = build_polydata(vtk, points, faces)
+    cleaner = vtk.vtkCleanPolyData()
+    cleaner.SetInputData(rebuilt)
+    cleaner.PointMergingOn()
+    cleaner.ToleranceIsAbsoluteOn()
+    cleaner.SetAbsoluteTolerance(0.0)
+    cleaner.ConvertLinesToPointsOff()
+    cleaner.ConvertPolysToLinesOff()
+    cleaner.ConvertStripsToPolysOff()
+    cleaner.Update()
+    result = geometry_only(vtk, cleaner.GetOutput())
+    del cleaner, rebuilt
+    return result
+
+
 def remesh_voxel_grid(
     vtk,
+    vtk_to_numpy,
     points: np.ndarray,
     faces: np.ndarray,
     source_faces: int,
@@ -323,7 +364,7 @@ def remesh_voxel_grid(
             cluster.UseFeaturePointsOff()
             cluster.UseInputPointsOn()
             cluster.Update()
-            candidate = geometry_only(vtk, cluster.GetOutput())
+            candidate = sanitize_clustered_mesh(vtk, vtk_to_numpy, cluster.GetOutput())
             actual_faces = triangle_count(candidate)
             if actual_faces == 0:
                 raise RuntimeError(f"Voxel clustering produced no triangles at divisions={divisions}.")
@@ -608,7 +649,9 @@ def remesh_one(path: Path, args: argparse.Namespace, factors: Iterable[int], met
             if method == "voxel":
                 if points is None or faces is None:
                     raise RuntimeError("Voxel-grid vertex clustering requires source point and face arrays.")
-                output, details = remesh_voxel_grid(vtk, points, faces, source_faces, source_area, factor, args)
+                output, details = remesh_voxel_grid(
+                    vtk, vtk_to_numpy, points, faces, source_faces, source_area, factor, args
+                )
             elif method == "quadric":
                 output, details = remesh_fast_quadric(vtk, vtk_to_numpy, original, source_faces, factor, args)
             elif method == "isotropic":

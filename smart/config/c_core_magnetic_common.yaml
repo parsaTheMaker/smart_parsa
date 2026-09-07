@@ -1,0 +1,23 @@
+defaults:
+  - toy_heat_exchange_common
+  - _self_
+
+wandb:
+  project: "smart_c_core_magnetic"
+  entity: "parsa-vatani99-technical-university-of-munich"
+  mode: "online"
+
+experiment:
+  name: "C_CORE_MAGNETIC"
+  model_name: "C_CORE_MAGNETIC"
+  dataset: "CCoreMagnetic"
+  data_path: "/mnt/data/parsa/c_core_magnetic_fem_v1"
+  geometry_epoch_seeded_sampling: true
+  num_body_points: 32768
+  num_surface_points: 65536
+  num_volume_points: 65536
+  batch_size: 1
+  epochs: 300
+  num_workers: 4
+  prefetch_factor: 2
+

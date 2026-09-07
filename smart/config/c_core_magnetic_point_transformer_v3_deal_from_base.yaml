@@ -1,0 +1,15 @@
+defaults:
+  - c_core_magnetic_point_transformer_v3
+  - c_core_magnetic_deal_protocol
+  - _self_
+
+experiment:
+  name: "C_CORE_MAGNETIC_POINT_TRANSFORMER_V3_DEAL_FROM_BASE"
+  model_name: "POINT_TRANSFORMER_V3_C_CORE_MAGNETIC_DEAL"
+  model_tag: "from-base-150ep"
+  batch_size: 1
+  multi_gpu_strategy: "single"
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False
+

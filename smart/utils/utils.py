@@ -101,6 +101,11 @@ def infer_fields_from_config(config):
             "surface": ["pressure", "wall_shear_x", "wall_shear_y", "wall_shear_z"],
             "volume": ["pressure", "velocity_x", "velocity_y", "velocity_z"],
         }
+    if dataset == "CCoreMagnetic":
+        return {
+            "surface": ["B_x", "B_y", "B_z"],
+            "volume": ["B_x", "B_y", "B_z"],
+        }
     return None
 
 

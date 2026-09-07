@@ -1,0 +1,15 @@
+defaults:
+  - c_core_magnetic_common
+  - _self_
+
+experiment:
+  name: "C_CORE_MAGNETIC_SMART_BASE"
+  model_name: "SMART_C_CORE_MAGNETIC"
+  batch_size: 1
+  architecture:
+    latent_dim: 256
+    latent_geometry_points: 1024
+    subsampled_geometry_points: 4096
+    subsampled_geometry_with_replacement: true
+    num_encoder_decoder_blocks: 6
+    pos_scale_factor: 100

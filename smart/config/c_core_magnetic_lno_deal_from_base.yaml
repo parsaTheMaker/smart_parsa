@@ -1,0 +1,28 @@
+defaults:
+  - c_core_magnetic_lno
+  - c_core_magnetic_deal_protocol
+  - _self_
+
+experiment:
+  name: "C_CORE_MAGNETIC_LNO_DEAL_FROM_BASE"
+  model_name: "LNO_C_CORE_MAGNETIC_DEAL"
+  model_tag: "from-base-150ep"
+  batch_size: 1
+  # Galerkin attention can overflow in float16 for strongly concentrated
+  # density-shifted views. Keep this continuation in full precision and clip
+  # rare large updates without changing the DeAL objective or point budgets.
+  amp: False
+  precision: "float32"
+  gradient_norm: 1.0
+  num_body_points: 0
+  view_geometry_points: 16384
+  primary_view_geometry_points: 16384
+  secondary_view_geometry_points: 16384
+  shared_shift_view_geometry_points: 16384
+  eval_view_geometry_points: 16384
+  eval_aligned_view_geometry_points: 16384
+  eval_shifted_view_geometry_points: 16384
+  multi_gpu_strategy: "single"
+  init_ckpt: ""
+  resume_ckpt: ""
+  resume_full_state: False

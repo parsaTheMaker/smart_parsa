@@ -9,6 +9,9 @@ experiment:
   model_tag: "from-base-150ep"
   batch_size: 1
   multi_gpu_strategy: "single"
+  # The matched LNO base is trained in BF16; FP16 overflows its latent
+  # projections immediately after loading that checkpoint.
+  precision: "bfloat16"
 
 wandb:
   mode: "disabled"

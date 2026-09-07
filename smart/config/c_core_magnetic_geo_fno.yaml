@@ -1,0 +1,21 @@
+defaults:
+  - c_core_magnetic_common
+  - _self_
+
+experiment:
+  name: "C_CORE_MAGNETIC_GEOFNO_BASE"
+  model_name: "GEOFNO_C_CORE_MAGNETIC"
+  batch_size: 2
+  architecture:
+    geometry_points: 16384
+    width: 64
+    modes: 5
+    latent_resolution: 24
+    num_fourier_blocks: 4
+    source_chunk_size: 4096
+    query_chunk_size: 8192
+    iphi_width: 128
+    iphi_fourier_bands: 8
+    max_deformation: 0.25
+    normalize_source_transform: true
+    enable_tf32: true

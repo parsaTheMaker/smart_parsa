@@ -7,6 +7,7 @@ from data.shift_submarine_dataset import ShiftSubmarineDataset
 from data.pump_dataset import PumpDataset
 from data.naca4_dataset import NACA4Dataset
 from data.toy_heat_exchange_dataset import ToyHeatExchangeDataset
+from data.c_core_magnetic_dataset import CCoreMagneticDataset
 
 
 # Mapping of dataset names to their corresponding classes and properties
@@ -20,6 +21,7 @@ datasets = {"ShapeNetCar": {"dataset": ShapeNetCarDataset, "spatial_dim": 3, "su
             "Pump": {"dataset": PumpDataset, "spatial_dim": 3, "surf_channels": 7, "vol_channels": 4, "params_dim": 13, "fields": {"surface": ["pressure", "velocity_x", "velocity_y", "velocity_z", "wall_shear_x", "wall_shear_y", "wall_shear_z"], "volume": ["pressure", "velocity_x", "velocity_y", "velocity_z"]}},
             "NACA4": {"dataset": NACA4Dataset, "spatial_dim": 2, "surf_channels": 3, "vol_channels": 4, "params_dim": 0, "fields": {"surface": ["pressure", "normal_x", "normal_y"], "volume": ["pressure", "sdf", "velocity_x", "velocity_y"]}},
             "ToyHeatExchange": {"dataset": ToyHeatExchangeDataset, "spatial_dim": 3, "surf_channels": 1, "vol_channels": 1, "params_dim": 0, "fields": {"surface": ["outward_heat_flux"], "volume": ["temperature"]}},
+            "CCoreMagnetic": {"dataset": CCoreMagneticDataset, "spatial_dim": 3, "surf_channels": 3, "vol_channels": 3, "params_dim": 0, "fields": {"surface": ["B_x", "B_y", "B_z"], "volume": ["B_x", "B_y", "B_z"]}},
            }
 
 
@@ -137,7 +139,7 @@ def get_dataset(config):
                     config, "geometry_density_cache_dtype", "float16"
                 )
             dataset_kwargs["split_seed"] = int(getattr(config, "random_seed", 42))
-        if dataset == "ToyHeatExchange":
+        if dataset in {"ToyHeatExchange", "CCoreMagnetic"}:
             model_name = str(getattr(config, "model_name", ""))
             dataset_kwargs["coordinate_normalization"] = getattr(
                 config, "coordinate_normalization", "global_train_bounds"

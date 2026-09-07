@@ -1,0 +1,28 @@
+defaults:
+  - pump_geo_fno
+  - _self_
+
+# Moderate isolated capacity study; production Geo-FNO artifacts are untouched.
+wandb:
+  mode: "disabled"
+
+experiment:
+  name: "PUMP_GeoFNO_CAPACITY_M6_R28_BASE"
+  model_name: "GEOFNO_PUMP_CAPACITY_STUDY"
+  model_tag: "m6-r28-raw16k"
+  batch_size: 6
+  epochs: 300
+  multi_gpu_strategy: "single"
+  architecture:
+    geometry_points: 16384
+    width: 64
+    modes: 6
+    latent_resolution: 28
+    num_fourier_blocks: 4
+    source_chunk_size: 4096
+    query_chunk_size: 8192
+    iphi_width: 128
+    iphi_fourier_bands: 8
+    max_deformation: 0.25
+    normalize_source_transform: True
+    enable_tf32: True

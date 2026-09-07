@@ -1,0 +1,26 @@
+defaults:
+  - c_core_magnetic_common
+  - _self_
+
+experiment:
+  name: "C_CORE_MAGNETIC_MSPT_BASE"
+  model_name: "MSPT_C_CORE_MAGNETIC"
+  num_body_points: 16384
+  batch_size: 2
+  architecture:
+    num_blocks: 4
+    n_hidden: 192
+    num_heads: 4
+    dropout: 0.1
+    activation: "gelu"
+    mlp_ratio: 1
+    V: 128
+    Q: 1
+    attn_pool: "mean"
+    chunking_mode: "balltree"
+    use_rope: false
+    rope_base: 10000.0
+    use_flash_attn: false
+    use_checkpoint: true
+    use_token_type_embeddings: true
+

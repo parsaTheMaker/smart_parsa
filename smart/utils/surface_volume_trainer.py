@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from timeit import default_timer
 
 import hydra
@@ -333,6 +334,10 @@ class CudaPrefetchLoader:
 def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_density=False):
     config = cfg.experiment
     wandb_config = cfg.wandb
+    # Save under the repository, not under whichever shell happened to launch
+    # this trainer. The module lives at <repo>/smart/utils.
+    checkpoint_dir = Path(__file__).resolve().parents[2] / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     multi_gpu_strategy = str(getattr(config, "multi_gpu_strategy", "single")).lower()
     if multi_gpu_strategy not in {"single", "data_parallel", "ddp"}:
         raise ValueError(
@@ -790,7 +795,7 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                     "surface_fields": fields["surface"],
                     "volume_fields": fields["volume"],
                     "metric_values": {k: v for k, v in test_losses.items() if k.startswith("rel_l2")},
-                }, "checkpoints/" + model_checkpoint_name + "_best.pt")
+                }, checkpoint_dir / (model_checkpoint_name + "_best.pt"))
 
             if save_checkpoints and is_main:
                 torch.save({
@@ -806,7 +811,7 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                     "surface_fields": fields["surface"],
                     "volume_fields": fields["volume"],
                     "metric_values": {k: v for k, v in test_losses.items() if k.startswith("rel_l2")},
-                }, "checkpoints/" + model_checkpoint_name + "_last.pt")
+                }, checkpoint_dir / (model_checkpoint_name + "_last.pt"))
 
             t2 = default_timer()
             if is_main:
@@ -826,8 +831,8 @@ def run_surface_volume_training(cfg: DictConfig, model_cls, accepts_geo_log_dens
                 wandb.log(wandb_dict, step=global_step)
     finally:
         if run is not None:
-            best_ckpt = os.path.join("checkpoints", model_checkpoint_name + "_best.pt")
-            last_ckpt = os.path.join("checkpoints", model_checkpoint_name + "_last.pt")
+            best_ckpt = checkpoint_dir / (model_checkpoint_name + "_best.pt")
+            last_ckpt = checkpoint_dir / (model_checkpoint_name + "_last.pt")
             if save_checkpoints and (os.path.isfile(best_ckpt) or os.path.isfile(last_ckpt)):
                 artifact = wandb.Artifact("model", type="model")
                 if os.path.isfile(best_ckpt):

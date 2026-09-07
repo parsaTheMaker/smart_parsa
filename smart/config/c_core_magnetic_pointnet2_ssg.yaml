@@ -1,0 +1,24 @@
+defaults:
+  - c_core_magnetic_common
+  - _self_
+
+experiment:
+  name: "C_CORE_MAGNETIC_POINTNET2_SSG_BASE"
+  model_name: "POINTNET2_SSG_C_CORE_MAGNETIC"
+  num_body_points: 16384
+  batch_size: 2
+  architecture:
+    latent_dim: 256
+    sa1_npoint: 512
+    sa1_radius: 0.03
+    sa1_nsample: 64
+    sa2_npoint: 128
+    sa2_radius: 0.06
+    sa2_nsample: 128
+    query_neighbors: 3
+    centroid_sampling: "random"
+    deterministic_eval_centroids: true
+    density_histogram_bins: 8
+    pos_scale_factor: 1.0
+    query_chunk_size: 65536
+    dropout: 0.0

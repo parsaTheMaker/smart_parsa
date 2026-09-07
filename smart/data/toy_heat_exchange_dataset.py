@@ -29,6 +29,7 @@ class ToyHeatExchangeDataset(Dataset):
     CACHE_VERSION = "toy_heat_exchange_fem_train_stats_v1"
     SURFACE_FIELDS = ("outward_heat_flux",)
     VOLUME_FIELDS = ("temperature",)
+    DATASET_LABEL = "ToyHeatExchange"
 
     def __init__(
         self,
@@ -92,7 +93,7 @@ class ToyHeatExchangeDataset(Dataset):
         self.volume_field_names = list(self.VOLUME_FIELDS)
         self._load_train_statistics()
         print(
-            f"[ToyHeatExchange] split={'custom' if case_ids is not None else ('validation' if self.if_test else 'train')}, cases={len(self.data)}, "
+            f"[{self.DATASET_LABEL}] split={'custom' if case_ids is not None else ('validation' if self.if_test else 'train')}, cases={len(self.data)}, "
             f"geometry_points={'full' if self.geometry_points == 0 else self.geometry_points}, "
             f"surface_queries={self.surface_points}, volume_queries={self.volume_points}, "
             f"density={self.return_geometry_density}"

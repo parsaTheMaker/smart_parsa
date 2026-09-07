@@ -10,8 +10,11 @@ experiment:
   name: "PUMP_GeoFNO_MEDIUM_V2_DEAL_FROM_BASE"
   model_name: "GEOFNO_PUMP_DEAL"
   model_tag: "medium-v2-from-base-150ep"
-  # Two views are fused; this retains the base effective batch of four.
-  batch_size: 2
+  # DeAL samples each view from the full variable-length source surface before
+  # Geo-FNO encoding, so one physical geometry is processed per update.
+  batch_size: 1
+  # Keep collation in the main process for cached geometry-density tensors.
+  num_workers: 0
   multi_gpu_strategy: "single"
   init_ckpt: ""
   resume_ckpt: ""

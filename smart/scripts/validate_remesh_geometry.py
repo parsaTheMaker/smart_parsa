@@ -33,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--methods", default="voxel,quadric,feature")
     parser.add_argument("--factors", default="5,10")
     parser.add_argument("--max-cases", type=int, default=0, help="0 validates every available remeshed case.")
+    parser.add_argument(
+        "--case-ids",
+        default="",
+        help="Optional comma-separated numeric case IDs; takes precedence over --max-cases.",
+    )
     parser.add_argument("--distance-samples", type=int, default=50000)
     parser.add_argument("--normal-samples", type=int, default=5000)
     parser.add_argument("--workers", type=int, default=8)
@@ -232,7 +237,18 @@ def main() -> int:
         if source.is_file():
             candidates.append((source, path, method, int(match.group(1))))
     case_names = sorted({item[1].parent.name for item in candidates})
-    if args.max_cases > 0:
+    requested_ids = {int(item) for item in args.case_ids.split(",") if item.strip()}
+    if requested_ids:
+        selected_cases = {
+            name for name in case_names
+            if int(re.search(r"(\d+)$", name).group(1)) in requested_ids
+        }
+        found_ids = {int(re.search(r"(\d+)$", name).group(1)) for name in selected_cases}
+        missing = sorted(requested_ids - found_ids)
+        if missing:
+            raise ValueError(f"Requested case IDs do not have complete remesh pairs: {missing}")
+        candidates = [item for item in candidates if item[1].parent.name in selected_cases]
+    elif args.max_cases > 0:
         if args.max_cases > len(case_names):
             raise ValueError(f"Requested {args.max_cases} cases, but only {len(case_names)} complete remeshed cases exist.")
         selected_cases = set(np.random.default_rng(args.seed).choice(case_names, size=args.max_cases, replace=False).tolist())

@@ -200,8 +200,17 @@ class PumpDataset(Dataset):
         surface_coords = arrays["surface_coords"]; surface_data = arrays["surface_data"]; volume_coords = arrays["volume_coords"]; volume_data = arrays["volume_data"]
         if surface_data.shape[1] != 7 or volume_data.shape[1] != 4:
             raise ValueError(f"Unexpected Pump channel shapes in run_{run_id}: {surface_data.shape}, {volume_data.shape}")
-        geometry_rng = np.random.default_rng(np.random.SeedSequence([self.split_seed, int(self._shared_epoch.value), run_id, 0])) if self.geometry_epoch_seeded_sampling else np.random.default_rng()
-        query_rng = np.random.default_rng()
+        evaluation_seed = getattr(self, "deterministic_evaluation_seed", None)
+        if evaluation_seed is not None:
+            geometry_rng = np.random.default_rng(
+                np.random.SeedSequence([int(evaluation_seed), run_id, 0])
+            )
+            query_rng = np.random.default_rng(
+                np.random.SeedSequence([int(evaluation_seed), run_id, 1])
+            )
+        else:
+            geometry_rng = np.random.default_rng(np.random.SeedSequence([self.split_seed, int(self._shared_epoch.value), run_id, 0])) if self.geometry_epoch_seeded_sampling else np.random.default_rng()
+            query_rng = np.random.default_rng()
         geo_idx = self._sample(surface_coords.shape[0], self.geometry_points, geometry_rng)
         surf_idx = self._sample(surface_coords.shape[0], self.surface_points, query_rng)
         vol_idx = self._sample(volume_coords.shape[0], self.volume_points, query_rng)

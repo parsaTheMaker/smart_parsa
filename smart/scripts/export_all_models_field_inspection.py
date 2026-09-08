@@ -68,7 +68,9 @@ MODEL_SPECS: dict[str, tuple[ModelSpec, ...]] = {
         ModelSpec("pointnet2_ssg", "drivaerml_pointnet2_ssg", "drivaerml_pointnet2_ssg_satloss7", "pointnet2-ssg-pointnet2-ssg-drivaerml-65k-v2-drivaerml-s42_best.pt", "pointnet2-ssg-satloss7-pointnet2-ssg-satloss7-drivaerml-65k-drivaerml-s42_best.pt"),
         ModelSpec("lno", "drivaerml_lno", "drivaerml_lno_satloss7", "lno-lno-drivaerml-65k-drivaerml-s42_best.pt", "lno-satloss7-lno-satloss7-drivaerml-65k-drivaerml-s42_best.pt"),
         ModelSpec("mspt", "drivaerml_mspt", "drivaerml_mspt_satloss7", "mspt-mspt-drivaerml-uniform-epochseeded-gpu6-200ep-drivaerml-s42_best.pt", "mspt-satloss7-mspt-satloss7-drivaerml-65k-drivaerml-s42_best.pt"),
-        ModelSpec("point_transformer_v3", "drivaerml_point_transformer_v3_density_sensitive", "drivaerml_point_transformer_v3_satloss7_density_sensitive", "point-transformer-v3-ptv3-density-sensitive-drivaerml-drivaerml-s42_best.pt", "point-transformer-v3-satloss7-ptv3-satloss7-density-sensitive-drivaerml-131k-drivaerml-s42_best.pt"),
+        # This DeAL checkpoint predates the density-sensitive PTv3 runtime
+        # configuration, so retain its recorded standard PTv3 inference setup.
+        ModelSpec("point_transformer_v3", "drivaerml_point_transformer_v3_density_sensitive", "drivaerml_point_transformer_v3_satloss7", "point-transformer-v3-ptv3-density-sensitive-drivaerml-drivaerml-s42_best.pt", "point-transformer-v3-satloss7-ptv3-satloss7-density-sensitive-drivaerml-131k-drivaerml-s42_best.pt"),
         ModelSpec("ab_upt", "drivaerml_ab_upt", "drivaerml_ab_upt_deal_from_base", "ab-upt-expanded-v3-drivaerml-s42_best.pt", "ab-upt-deal-from-base-150ep-drivaerml-s42_best.pt"),
         ModelSpec("geo_fno", "drivaerml_geo_fno", "drivaerml_geo_fno_deal_from_base", "geofno-medium-v2-raw65k-drivaerml-s42_best.pt", "geofno-deal-medium-v2-from-base-150ep-drivaerml-s42_best.pt", 65536),
     ),
@@ -127,6 +129,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path)
     parser.add_argument("--remesh-root", type=Path)
     parser.add_argument("--checkpoint-root", type=Path, default=ROOT / "checkpoints")
+    parser.add_argument(
+        "--checkpoint-policy",
+        choices=("best", "last"),
+        default="best",
+        help="Select best-validation or final-epoch checkpoints for paired field export.",
+    )
     parser.add_argument("--models", default="", help="Optional comma-separated architecture slugs.")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--seed", type=int, default=42)
@@ -151,6 +159,13 @@ def checkpoint_metadata(path: Path) -> dict[str, Any]:
         "sha256": digest.hexdigest(),
         "bytes": path.stat().st_size,
     }
+
+
+def checkpoint_for_policy(checkpoint_root: Path, checkpoint_name: str, policy: str) -> Path:
+    """Resolve a paired checkpoint without changing the model/config pairing."""
+    if policy == "last":
+        checkpoint_name = checkpoint_name.replace("_best.pt", "_last.pt")
+    return checkpoint_root / checkpoint_name
 
 
 def load_model(spec: ModelSpec, cfg, checkpoint: Path, device: torch.device, channels: tuple[int, int, int]):
@@ -299,8 +314,8 @@ def main() -> None:
     usable_specs: list[ModelSpec] = []
     for spec in specs:
         paths = {
-            "base": args.checkpoint_root / spec.base_checkpoint,
-            "deal": args.checkpoint_root / spec.deal_checkpoint,
+            "base": checkpoint_for_policy(args.checkpoint_root, spec.base_checkpoint, args.checkpoint_policy),
+            "deal": checkpoint_for_policy(args.checkpoint_root, spec.deal_checkpoint, args.checkpoint_policy),
         }
         availability[spec.slug] = {variant: str(path.resolve()) if path.is_file() else None for variant, path in paths.items()}
         if all(path.is_file() for path in paths.values()):
@@ -363,6 +378,7 @@ def main() -> None:
         "case_id": case_id,
         "data_root": str(data_root.resolve()),
         "remesh_root": str(remesh_root.resolve()),
+        "checkpoint_policy": args.checkpoint_policy,
         "qem_div10_source": str(qem_path.resolve()),
         "query_points": {"surface": len(surf_q), "volume": len(vol_q)},
         "physical_fields": {"surface": surface_fields, "volume": volume_fields},
@@ -401,7 +417,7 @@ def main() -> None:
             ("base", base_cfg, spec.base_checkpoint),
             ("deal", deal_cfg, spec.deal_checkpoint),
         ):
-            checkpoint = args.checkpoint_root / checkpoint_name
+            checkpoint = checkpoint_for_policy(args.checkpoint_root, checkpoint_name, args.checkpoint_policy)
             print(f"[{args.dataset}] {spec.slug}/{variant}: loading {checkpoint.name}", flush=True)
             model = load_model(spec, cfg, checkpoint, device, channels)
             model_record["variants"][variant] = {

@@ -3,27 +3,44 @@
 import hydra
 from omegaconf import DictConfig
 
-from models.ab_upt import ABUPT
-from models.geo_fno import GeoFNO
-from models.lno import LNOWithLatent
-from models.mspt import MSPT
-from models.point_transformer_v3 import PointTransformerV3WithLatent
-from models.pointnet2_ssg import PointNet2SSGWithLatent
 from models.smart.smart import SMART
-from models.transolverpp import TransolverPP
 from train_consistency_common import run_consistency_training
 
 
-MODELS = {
-    "SMART": SMART,
-    "AB_UPT": ABUPT,
-    "GEOFNO": GeoFNO,
-    "POINTNET2_SSG": PointNet2SSGWithLatent,
-    "LNO": LNOWithLatent,
-    "MSPT": MSPT,
-    "TRANSOLVERPP": TransolverPP,
-    "POINT_TRANSFORMER_V3": PointTransformerV3WithLatent,
-}
+def resolve_model_constructor(model_name: str):
+    """Load only the requested architecture and keep SMART runnable on lean installs."""
+    model_name = str(model_name).upper()
+    if model_name.startswith("SMART"):
+        return SMART
+    if model_name.startswith("AB_UPT"):
+        from models.ab_upt import ABUPT
+
+        return ABUPT
+    if model_name.startswith("GEOFNO"):
+        from models.geo_fno import GeoFNO
+
+        return GeoFNO
+    if model_name.startswith("POINTNET2_SSG"):
+        from models.pointnet2_ssg import PointNet2SSGWithLatent
+
+        return PointNet2SSGWithLatent
+    if model_name.startswith("LNO"):
+        from models.lno import LNOWithLatent
+
+        return LNOWithLatent
+    if model_name.startswith("MSPT"):
+        from models.mspt import MSPT
+
+        return MSPT
+    if model_name.startswith("TRANSOLVERPP"):
+        from models.transolverpp import TransolverPP
+
+        return TransolverPP
+    if model_name.startswith("POINT_TRANSFORMER_V3"):
+        from models.point_transformer_v3 import PointTransformerV3WithLatent
+
+        return PointTransformerV3WithLatent
+    raise ValueError(f"Unsupported C-core DeAL model_name: {model_name!r}")
 
 
 @hydra.main(
@@ -32,13 +49,9 @@ MODELS = {
     config_name="c_core_magnetic_smart_deal_from_base",
 )
 def main(cfg: DictConfig):
-    model_name = str(cfg.experiment.model_name).upper()
-    matches = [constructor for prefix, constructor in MODELS.items() if model_name.startswith(prefix)]
-    if len(matches) != 1:
-        raise ValueError(f"Could not resolve exactly one DeAL model constructor from {model_name!r}.")
-    run_consistency_training(cfg, model_ctor=matches[0], model_requires_density=False)
+    model_ctor = resolve_model_constructor(cfg.experiment.model_name)
+    run_consistency_training(cfg, model_ctor=model_ctor, model_requires_density=False)
 
 
 if __name__ == "__main__":
     main()
-

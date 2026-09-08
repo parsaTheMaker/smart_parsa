@@ -26,6 +26,7 @@ experiment:
     dropout: 0.1
     mlp_ratio: 2
     slice_num: 32
+    slice_assignment_mode: "official_gumbel"
     geometry_points: 0
 
   optimizer: "adamw"

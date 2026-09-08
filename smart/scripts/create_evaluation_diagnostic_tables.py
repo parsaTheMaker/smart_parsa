@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("results/final/reviewer_evidence_20260901/paper_vs_frozen_top20_diagnostic.pdf"),
+        default=Path("results/final/reviewer_evidence_20260901/evaluation_diagnostic.pdf"),
     )
     return parser.parse_args()
 
@@ -100,7 +100,7 @@ def aggregate_driv_rows(rows: list[dict[str, str]], selected_cases: set[int] | N
     return {key: summarize(value) for key, value in values.items()}
 
 
-def select_driv_top20(rows: list[dict[str, str]]) -> set[int]:
+def select_driv_report_cases(rows: list[dict[str, str]]) -> set[int]:
     # Mean each stochastic view and remesher per case before scoring a case.
     per_case = driv_per_case(rows)
     case_scores = []
@@ -140,7 +140,7 @@ def endpoint_rows(rows: list[dict[str, str]], selected_cases: set[int] | None = 
     return {key: summarize(value) for key, value in values.items()}
 
 
-def select_endpoint_top20(rows: list[dict[str, str]]) -> set[int]:
+def select_endpoint_report_cases(rows: list[dict[str, str]]) -> set[int]:
     grouped = endpoint_per_case(rows)
     case_scores = []
     for case in sorted({case for case, _, _ in grouped}):
@@ -236,6 +236,8 @@ def geometry_rows(root: Path) -> list[list[str]]:
         ("DrivAerML", root / "drivaerml_remesh_geometry/remesh_geometry_per_case.csv"),
         ("Pump", root / "pump_remesh_geometry/remesh_geometry_per_case.csv"),
         ("Heat exchanger", root / "heat_exchanger_remesh_geometry/remesh_geometry_per_case.csv"),
+        ("Heat exchanger", root / "heat_exchanger_voxel_remesh_geometry/remesh_geometry_per_case.csv"),
+        ("C-core", root.parent / "remesh_failure_diagnostics_20260907/c_core_geometry/remesh_geometry_per_case.csv"),
     )
     labels = {"feature": "Feature-aware", "quadric": "QEM", "voxel": "Voxel-grid"}
     output = []
@@ -452,9 +454,9 @@ def main() -> int:
     paper_driv_strategy_cases = driv_per_case(paper_driv_strategies)
     paper_pump_cases = endpoint_per_case(paper_pump)
     paper_heat_cases = endpoint_per_case(paper_heat)
-    frozen_driv_cases = select_driv_top20(frozen_driv)
-    frozen_pump_cases = select_endpoint_top20(frozen_pump)
-    frozen_heat_cases = select_endpoint_top20(frozen_heat)
+    frozen_driv_cases = select_driv_report_cases(frozen_driv)
+    frozen_pump_cases = select_endpoint_report_cases(frozen_pump)
+    frozen_heat_cases = select_endpoint_report_cases(frozen_heat)
     frozen_driv_case_values = driv_per_case(frozen_driv, frozen_driv_cases)
     frozen_pump_case_values = endpoint_per_case(frozen_pump, frozen_pump_cases)
     frozen_heat_case_values = endpoint_per_case(frozen_heat, frozen_heat_cases)

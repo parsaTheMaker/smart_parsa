@@ -1,0 +1,35 @@
+defaults:
+  - c_core_magnetic_smart
+  - _self_
+
+experiment:
+  name: "C_CORE_MAGNETIC_SMART_DOWNSAMPLE"
+  model_name: "SMART_C_CORE_MAGNETIC_DOWNSAMPLE"
+  model_tag: "downsample-300ep"
+
+  # Matched control: a full 32K view and an independently sampled 8K view.
+  # Both views are supervised at the same physical surface and volume queries.
+  geometry_epoch_seeded_sampling: false
+  num_body_points: 0
+  view_geometry_points: 32768
+  train_shared_shift_sampling_mode: ""
+  train_primary_sampling_mode: "uniform_wor"
+  train_secondary_sampling_mode: "uniform_wor"
+  primary_view_geometry_points: 32768
+  secondary_view_geometry_points: 8192
+  secondary_view_subsampled_geometry_points: 1024
+  shared_shift_view_geometry_points: 0
+  eval_aligned_view_geometry_points: 32768
+  eval_shifted_view_geometry_points: 8192
+  eval_shifted_subsampled_geometry_points: 1024
+  eval_aligned_sampling_mode: "uniform_wor"
+  eval_shifted_sampling_mode: "uniform_wor"
+  fuse_consistency_views: false
+  use_prediction_consistency: true
+  prediction_consistency_weight: 1.0
+  prediction_consistency_smooth_l1_beta: 0.05
+  use_latent_consistency: false
+  consistency_warmup_epochs: 30
+  task_weighting_method: "fixed_sum"
+  config_task_base_weights: [0.2, 0.2, 0.6]
+  fixed_sum_use_view_losses: true

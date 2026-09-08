@@ -9,16 +9,43 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
+run_with_last_checkpoints() {
+  local rewritten=() argument
+  for argument in "$@"; do
+    if [[ "$argument" == *_best.pt ]]; then
+      argument="${argument%_best.pt}_last.pt"
+    fi
+    if [[ "$argument" == *_last.pt && ! -f "${argument#*=}" ]]; then
+      printf 'Missing required last checkpoint: %s\n' "${argument#*=}" >&2
+      return 1
+    fi
+    rewritten+=("$argument")
+  done
+  "${rewritten[@]}"
+}
+
 FINAL="$ROOT/results/final"
 DRIVAER_FEATURE=/mnt/ssdraid/parsa/drivaerml_surface_vtp_remesh_v4/feature
 DRIVAER_QEM=/mnt/ssdraid/parsa/drivaerml_surface_vtp_remesh_v4/quadric
 DRIVAER_VOXEL=/mnt/ssdraid/parsa/drivaerml_surface_vtp_remesh_v4/voxel
 DRIVAER10=29,31,123,178,179,204,234,249,259,262
 DRIVAER15=29,31,123,178,179,204,234,249,259,262,263,270,289,327,333
+COHORT_REGISTRY="$FINAL/deal_canonical_evaluation/cohort_registry_all_architectures_v1.json"
+# The checkpoint name is historical. Its actual PTV3 runtime config is standard,
+# not density-sensitive; the two variants have compatible tensors but differ at inference.
+DRIVAERML_PTV3_DEAL_CONFIG=drivaerml_point_transformer_v3_satloss7
+if [[ -f "$COHORT_REGISTRY" ]]; then
+  DRIVAER10=$("$PYTHON" - "$COHORT_REGISTRY" <<'PY'
+import json, sys
+registry = json.load(open(sys.argv[1], encoding="utf-8"))
+print(",".join(map(str, registry["tasks"]["drivaerml"]["selected_case_ids"])))
+PY
+)
+fi
 
 case "${1:-}" in
   cross_architecture)
-    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 "$PYTHON" smart/scripts/compare_drivaerml_sampling_invariance.py \
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 run_with_last_checkpoints "$PYTHON" smart/scripts/compare_drivaerml_sampling_invariance.py \
       --num-runs 10 --run-ids "$DRIVAER10" --seed 42 --shift-betas 0,1 --positive-shifts-only \
       --active-shifts beta,sine_y,sine_x --active-geometry-sources angle,isotropic,voxel \
       --geometry-decimation-factors 5,10 --geometry-label-preset v4 \
@@ -37,14 +64,14 @@ case "${1:-}" in
       --mspt-checkpoint "$ROOT/checkpoints/mspt-mspt-drivaerml-uniform-epochseeded-gpu6-200ep-drivaerml-s42_best.pt" \
       --mspt-satloss7-checkpoint "$ROOT/checkpoints/mspt-satloss7-mspt-satloss7-drivaerml-65k-drivaerml-s42_best.pt" \
       --point-transformer-v3-config drivaerml_point_transformer_v3_density_sensitive \
-      --point-transformer-v3-satloss7-config drivaerml_point_transformer_v3_satloss7_density_sensitive \
+      --point-transformer-v3-satloss7-config "$DRIVAERML_PTV3_DEAL_CONFIG" \
       --point-transformer-v3-checkpoint "$ROOT/checkpoints/point-transformer-v3-ptv3-density-sensitive-drivaerml-drivaerml-s42_best.pt" \
       --point-transformer-v3-satloss7-checkpoint "$ROOT/checkpoints/point-transformer-v3-satloss7-ptv3-satloss7-density-sensitive-drivaerml-131k-drivaerml-s42_best.pt" \
       --output-dir "$FINAL/drivaerml_cross_architecture_deal_v4_full_data_10runs"
     ;;
 
   beta_range)
-    CUDA_VISIBLE_DEVICES=0,1,2,3,4 "$PYTHON" smart/scripts/compare_drivaerml_satloss7_range_ablation.py \
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4 run_with_last_checkpoints "$PYTHON" smart/scripts/compare_drivaerml_satloss7_range_ablation.py \
       --experiment-preset range_ablation_vtp --num-runs 10 --run-ids "$DRIVAER10" --candidate-split all --seed 42 \
       --beta-levels 0,0.25,0.5,0.75,1 --sine-levels 0,0.25,0.5,0.75,1 --active-shifts beta,sine_y,sine_x \
       --active-geometry-sources angle,isotropic,voxel --geometry-decimation-factors 5,10 --geometry-label-preset v4 \
@@ -63,7 +90,7 @@ case "${1:-}" in
     ;;
 
   historical_augmentations)
-    CUDA_VISIBLE_DEVICES=0,1,2,3,4 "$PYTHON" smart/scripts/compare_drivaerml_sampling_invariance.py \
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4 run_with_last_checkpoints "$PYTHON" smart/scripts/compare_drivaerml_sampling_invariance.py \
       --strategy-only --num-runs 15 --run-ids "$DRIVAER15" --seed 42 --shift-betas 0,1 --positive-shifts-only \
       --active-shifts beta,sine_y,sine_x --active-geometry-sources angle,isotropic,voxel --geometry-decimation-factors 5,10 --geometry-label-preset v4 \
       --angle-decimated-vtp-dir "$DRIVAER_FEATURE" --isotropic-decimated-vtp-dir "$DRIVAER_QEM" --voxel-decimated-vtp-dir "$DRIVAER_VOXEL" \
@@ -79,7 +106,7 @@ case "${1:-}" in
     ;;
 
   kde_ablation)
-    CUDA_VISIBLE_DEVICES=0,1,2,3,4 "$PYTHON" smart/scripts/compare_drivaerml_satloss7_range_ablation.py \
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4 run_with_last_checkpoints "$PYTHON" smart/scripts/compare_drivaerml_satloss7_range_ablation.py \
       --experiment-preset kde_ablation_vtp --num-runs 10 --run-ids "$DRIVAER10" --candidate-split all --seed 42 --shift-levels 0,0.25,0.5,0.75,1 \
       --active-shifts beta,sine_y,sine_x --active-geometry-sources angle,isotropic,voxel --geometry-decimation-factors 5,10 --geometry-label-preset v4 \
       --angle-decimated-vtp-dir "$DRIVAER_FEATURE" --isotropic-decimated-vtp-dir "$DRIVAER_QEM" --voxel-decimated-vtp-dir "$DRIVAER_VOXEL" \
@@ -96,10 +123,9 @@ case "${1:-}" in
     ;;
 
   consistency_ablation)
-    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 "$PYTHON" smart/scripts/compare_drivaerml_satloss7_consistency_ablation.py \
-      --experiment-preset consistency_ablation_vtp --num-runs 5 --run-selection top_pairwise_improvement --top-selection-candidates 247 \
-      --candidate-split all --screen-case-batch-size 8 --top-selection-improved-model SMART_SATLOSS7_RANGE025 \
-      --top-selection-reference-model SMART_SATLOSS7_RANGE050 --top-selection-conditions sine_y,sine_x,remeshing \
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 run_with_last_checkpoints "$PYTHON" smart/scripts/compare_drivaerml_satloss7_consistency_ablation.py \
+      --experiment-preset consistency_ablation_vtp --num-runs 10 --run-ids "$DRIVAER10" --run-selection random \
+      --candidate-split all --screen-case-batch-size 8 \
       --seed 42 --shift-levels 0,1 --active-shifts sine_y,sine_x --active-geometry-sources angle,isotropic,voxel \
       --geometry-decimation-factors 5,10 --geometry-label-preset v4 --angle-decimated-vtp-dir "$DRIVAER_FEATURE" \
       --isotropic-decimated-vtp-dir "$DRIVAER_QEM" --voxel-decimated-vtp-dir "$DRIVAER_VOXEL" \
@@ -114,8 +140,26 @@ case "${1:-}" in
       --output-dir "$FINAL/drivaerml_consistency_ablation_v4_pool247_top5"
     ;;
 
+  deal_weighting)
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4 run_with_last_checkpoints "$PYTHON" smart/scripts/compare_drivaerml_satloss7_range_ablation.py \
+      --experiment-preset deal_weighting_ablation_vtp --num-runs 10 --run-ids "$DRIVAER10" --run-selection random \
+      --candidate-split all --seed 42 --shift-levels 0,1 --active-shifts sine_y,sine_x \
+      --active-geometry-sources angle,isotropic,voxel --geometry-decimation-factors 5,10 --geometry-label-preset v4 \
+      --angle-decimated-vtp-dir "$DRIVAER_FEATURE" --isotropic-decimated-vtp-dir "$DRIVAER_QEM" --voxel-decimated-vtp-dir "$DRIVAER_VOXEL" \
+      --views-per-mode 2 --view-batch-size 2 --model-repeats 1 --surface-query-points 65536 --volume-query-points 65536 \
+      --batched-query-subregion-size 65536 --density-estimator kde --density-knn-k 16 --plot-scales linear,log \
+      --font-scale 1.4 --y-pad-fraction 0.10 --no-std --compact-endpoint-summary \
+      --devices cuda:0,cuda:1,cuda:2,cuda:3,cuda:4 \
+      --smart-checkpoint "$ROOT/checkpoints/smart-smart-drivaerml-131k16kwr-drivaerml-s42_best.pt" \
+      --deal-fixed-checkpoint "$ROOT/checkpoints/smart-satloss7-range100-smart-satloss7-range100-from-smart-150ep-drivaerml-s42_best.pt" \
+      --deal-gradnorm-checkpoint "$ROOT/checkpoints/smart-satloss7-gradnorm-satloss7-gradnorm-from-smart-150ep-drivaerml-s42_best.pt" \
+      --deal-uncertainty-checkpoint "$ROOT/checkpoints/smart-satloss7-uncertainty-satloss7-uncertainty-from-smart-150ep-drivaerml-s42_best.pt" \
+      --deal-config-checkpoint "$ROOT/checkpoints/smart-satloss7-config-full-satloss7-config-full-from-smart-150ep-drivaerml-s42_best.pt" \
+      --output-dir "$ROOT/results/drivaerml_deal_weighting_ablation_v4"
+    ;;
+
   pump)
-    CUDA_VISIBLE_DEVICES=0,1,2,3,4 "$PYTHON" smart/scripts/compare_shift_endpoint_strategies.py \
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4 run_with_last_checkpoints "$PYTHON" smart/scripts/compare_shift_endpoint_strategies.py \
       --dataset pump --data-root /mnt/ssdraid/parsa/shift_pump_preprocessed \
       --study-summary /mnt/ssdraid/parsa/shift_pump_surface_vtp_remesh_v4/remeshing_v2_summary.json \
       --case-selection study --num-runs 100 --top-k 2 --seed 42 --views-per-test 2 \
@@ -132,7 +176,7 @@ case "${1:-}" in
     ;;
 
   heat_exchanger)
-    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 "$PYTHON" smart/scripts/compare_toy_heat_exchange_all_models_sampling_invariance.py \
+    CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 run_with_last_checkpoints "$PYTHON" smart/scripts/compare_toy_heat_exchange_all_models_sampling_invariance.py \
       --data-root /mnt/ssdraid/parsa/toy_heat_exchange_fem_v1 --candidate-pool-size 100 --top-k 3 --candidate-split all \
       --ranking-models POINTNET2_SSG --ranking-modes isotropic_div5,isotropic_div10 --seed 42 --devices cuda:0,cuda:1,cuda:2,cuda:3,cuda:4,cuda:5 \
       --surface-query-points 32768 --volume-query-points 32768 --active-geometry-sources isotropic --geometry-decimation-factors 5,10 \
@@ -154,7 +198,7 @@ case "${1:-}" in
     ;;
 
   *)
-    echo "Usage: $0 {cross_architecture|beta_range|historical_augmentations|kde_ablation|consistency_ablation|pump|heat_exchanger}" >&2
+    echo "Usage: $0 {cross_architecture|beta_range|historical_augmentations|kde_ablation|consistency_ablation|deal_weighting|pump|heat_exchanger}" >&2
     exit 2
     ;;
 esac

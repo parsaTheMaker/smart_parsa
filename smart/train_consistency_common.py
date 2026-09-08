@@ -1125,6 +1125,7 @@ def _sample_box_mask_indices(
     num_points,
     generator,
     std_fraction_of_largest_extent,
+    min_survivors,
 ):
     """Sample a base view and remove a 2-sigma box around a random center."""
     if geo_row is None:
@@ -1149,8 +1150,14 @@ def _sample_box_mask_indices(
     remove_mask = (torch.abs(geo_subset - center.unsqueeze(0)) <= half_side).all(dim=1)
     keep_mask = ~remove_mask
 
-    if not bool(keep_mask.any()):
-        raise RuntimeError("box_mask sampling removed every point from the secondary view.")
+    min_survivors = max(1, min(int(min_survivors), int(base_idx.shape[0])))
+    if int(keep_mask.sum().item()) < min_survivors:
+        # Preserve the points least affected by the localized deletion rather
+        # than silently collapsing the secondary view on compact geometries.
+        distance_from_center = torch.abs(geo_subset - center.unsqueeze(0)).amax(dim=1)
+        keep_rel = torch.topk(distance_from_center, k=min_survivors, largest=True).indices
+        keep_mask = torch.zeros_like(keep_mask, dtype=torch.bool)
+        keep_mask[keep_rel] = True
 
     return base_idx[keep_mask].to(dtype=torch.long), "box_mask"
 
@@ -1256,6 +1263,7 @@ def _sample_single_view_indices(
             num_points=num_points,
             generator=generator,
             std_fraction_of_largest_extent=gaussian_mask_std_fraction,
+            min_survivors=gaussian_mask_min_survivors,
         )
 
     raise ValueError(f"Unsupported sampling mode: {resolved_mode}")
@@ -1627,6 +1635,7 @@ def evaluate_loader(
     model_requires_density,
     cuda_batch_prefetch,
     keep_cpu_indices=(),
+    max_batches=0,
 ):
     metrics = init_metric_dict(fields["surface"], fields["volume"])
     model.eval()
@@ -1640,6 +1649,8 @@ def evaluate_loader(
     pbar = tqdm(eval_loader, desc=f"Eval {mode_name}", leave=False, dynamic_ncols=True, disable=not is_main_process())
     with torch.inference_mode():
         for batch_idx, batch in enumerate(pbar):
+            if max_batches > 0 and batch_idx >= max_batches:
+                break
             geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, geo_log_density = unpack_batch(batch, params_dim)
 
             view_geo, view_log_density, _ = sample_geometry_view(
@@ -1774,6 +1785,11 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             print(f"[{config.model_name}] training signals -> surface: {fields['surface']} | volume: {fields['volume']}")
 
     use_surface_supervision = len(fields["surface"]) > 0
+    # Optional bounded execution used by one-batch smoke tests. Production
+    # configs leave these at zero and therefore traverse the full split.
+    max_train_batches = max(0, int(getattr(config, "max_train_batches", 0)))
+    max_eval_batches = max(0, int(getattr(config, "max_eval_batches", 0)))
+    save_checkpoints = bool(getattr(config, "save_checkpoints", True))
     set_dataset_epoch(train_data, 0)
     set_dataset_epoch(test_data, 0)
 
@@ -2233,6 +2249,8 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             use_latent_consistency = bool(getattr(config, "use_latent_consistency", False))
 
             for batch_idx, batch in enumerate(train_pbar):
+                if max_train_batches > 0 and batch_idx >= max_train_batches:
+                    break
                 geo_mesh, surf_mesh, surf_data, vol_mesh, vol_data, params, geo_log_density = unpack_batch(batch, params_dim)
                 primary_sampling_mode = str(getattr(config, "train_primary_sampling_mode", "uniform_wor"))
                 secondary_sampling_mode = str(getattr(config, "train_secondary_sampling_mode", "mixed"))
@@ -2945,6 +2963,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                 model_requires_density=model_requires_density,
                 cuda_batch_prefetch=cuda_batch_prefetch,
                 keep_cpu_indices=geometry_cpu_indices if keep_geometry_cpu_for_view_sampling else (),
+                max_batches=max_eval_batches,
             )
             shifted_metrics = evaluate_loader(
                 model=model,
@@ -2970,6 +2989,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                 model_requires_density=model_requires_density,
                 cuda_batch_prefetch=cuda_batch_prefetch,
                 keep_cpu_indices=geometry_cpu_indices if keep_geometry_cpu_for_view_sampling else (),
+                max_batches=max_eval_batches,
             )
             if is_dist_enabled():
                 dist.barrier()
@@ -3004,7 +3024,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
             if external_gradnorm is not None:
                 checkpoint_extra_metrics["external_gradnorm_state_dict"] = external_gradnorm.state_dict()
 
-            if robust_rel_l2 < best_robust_rel_l2 and is_main_process():
+            if save_checkpoints and robust_rel_l2 < best_robust_rel_l2 and is_main_process():
                 best_robust_rel_l2 = robust_rel_l2
                 torch.save(
                     build_training_checkpoint(
@@ -3024,7 +3044,7 @@ def run_consistency_training(cfg, model_ctor, model_requires_density):
                     "checkpoints/" + model_checkpoint_name + "_best.pt",
                 )
 
-            if is_main_process():
+            if save_checkpoints and is_main_process():
                 torch.save(
                     build_training_checkpoint(
                         epoch=ep,

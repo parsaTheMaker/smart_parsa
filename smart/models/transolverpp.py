@@ -20,13 +20,26 @@ def _distributed_sum(value):
 class PhysicsAttention1DEidetic(nn.Module):
     """Transolver++ Physics_Attention_1D_Eidetic."""
 
-    def __init__(self, dim, heads=8, dropout=0.0, slice_num=32):
+    def __init__(
+        self,
+        dim,
+        heads=8,
+        dropout=0.0,
+        slice_num=32,
+        slice_assignment_mode="official_gumbel",
+    ):
         super().__init__()
         if dim % heads != 0:
             raise ValueError(f"hidden dimension {dim} must be divisible by heads {heads}")
         self.dim_head = dim // heads
         self.heads = int(heads)
         self.slice_num = int(slice_num)
+        self.slice_assignment_mode = str(slice_assignment_mode)
+        if self.slice_assignment_mode not in {"official_gumbel", "deterministic_softmax"}:
+            raise ValueError(
+                "slice_assignment_mode must be 'official_gumbel' or "
+                f"'deterministic_softmax', received {self.slice_assignment_mode!r}"
+            )
         self.bias = nn.Parameter(torch.ones(1, heads, 1, 1) * 0.5)
         self.proj_temperature = nn.Sequential(
             nn.Linear(self.dim_head, self.slice_num),
@@ -56,11 +69,14 @@ class PhysicsAttention1DEidetic(nn.Module):
             temperature = self.proj_temperature(x_mid) + self.bias
             temperature = torch.clamp(temperature, min=0.01)
             slice_logits = self.in_project_slice(x_mid)
-            slice_weights = (
-                gumbel_softmax(slice_logits, temperature)
-                if self.training
-                else torch.softmax(slice_logits / temperature, dim=-1)
-            )
+            # Upstream Transolver++ applies Gumbel assignments in both train
+            # and eval mode. Switching to softmax only at eval changes the
+            # learned operator and caused the C-core evaluation regression.
+            if self.slice_assignment_mode == "official_gumbel":
+                slice_weights = gumbel_softmax(slice_logits, temperature)
+            else:
+                # Explicit legacy compatibility only; do not use for new runs.
+                slice_weights = torch.softmax(slice_logits / temperature, dim=-1)
             slice_norm = _distributed_sum(slice_weights.sum(dim=2))
             slice_token = torch.einsum("bhnc,bhng->bhgc", x_mid, slice_weights).contiguous()
             slice_token = _distributed_sum(slice_token)
@@ -106,12 +122,17 @@ class TransolverPlusBlock(nn.Module):
         last_layer=False,
         out_dim=1,
         slice_num=32,
+        slice_assignment_mode="official_gumbel",
     ):
         super().__init__()
         self.last_layer = bool(last_layer)
         self.ln_1 = nn.LayerNorm(hidden_dim)
         self.attn = PhysicsAttention1DEidetic(
-            hidden_dim, heads=num_heads, dropout=dropout, slice_num=slice_num
+            hidden_dim,
+            heads=num_heads,
+            dropout=dropout,
+            slice_num=slice_num,
+            slice_assignment_mode=slice_assignment_mode,
         )
         self.ln_2 = nn.LayerNorm(hidden_dim)
         self.mlp = TransolverPlusMLP(
@@ -156,6 +177,7 @@ class TransolverPPBase(nn.Module):
         dropout=0.1,
         mlp_ratio=2,
         slice_num=32,
+        slice_assignment_mode="official_gumbel",
         geometry_points=0,
         use_token_type_embeddings=False,
     ):
@@ -196,6 +218,7 @@ class TransolverPPBase(nn.Module):
                     last_layer=index == n_layers - 1,
                     out_dim=self.surface_channels + self.volume_channels,
                     slice_num=slice_num,
+                    slice_assignment_mode=slice_assignment_mode,
                 )
                 for index in range(int(n_layers))
             ]

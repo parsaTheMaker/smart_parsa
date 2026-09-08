@@ -7,10 +7,40 @@ PYTHON=/home/parsa/miniconda3/envs/smart/bin/python
 # Override only for isolated smoke runs; the default is the final evidence
 # location used by the paper workflow.
 OUT="${REVIEWER_EVIDENCE_OUTPUT_DIR:-$ROOT/results/final/reviewer_evidence_20260901}"
+COHORT_REGISTRY="$ROOT/results/final/deal_canonical_evaluation/cohort_registry_all_architectures_v1.json"
 export PYTHONPATH="$ROOT/smart"
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+run_with_last_checkpoints() {
+  local rewritten=() argument
+  for argument in "$@"; do
+    if [[ "$argument" == *_best.pt ]]; then
+      argument="${argument%_best.pt}_last.pt"
+    fi
+    if [[ "$argument" == *=*_best.pt ]]; then
+      argument="${argument%_best.pt}_last.pt"
+    fi
+    if [[ "$argument" == *_last.pt ]]; then
+      local checkpoint_path="${argument#*=}"
+      if [[ ! -f "$checkpoint_path" ]]; then
+        printf 'Missing required last checkpoint: %s\n' "$checkpoint_path" >&2
+        return 1
+      fi
+    fi
+    rewritten+=("$argument")
+  done
+  "${rewritten[@]}"
+}
+
+cohort_ids() {
+  "$PYTHON" - "$COHORT_REGISTRY" "$1" <<'PY'
+import json, sys
+registry = json.load(open(sys.argv[1], encoding="utf-8"))
+print(",".join(map(str, registry["tasks"][sys.argv[2]]["selected_case_ids"])))
+PY
+}
 
 # Select every GPU with at least 85% of its memory free. CUDA_VISIBLE_DEVICES
 # remaps these physical IDs to consecutive local ordinals, which is exactly the
@@ -47,7 +77,7 @@ drivaerml() {
   local output="$OUT/drivaerml_frozen_test50_views10"
   local num_runs="${DRIVAER_NUM_RUNS:-50}"
   local views_per_mode="${DRIVAER_VIEWS_PER_MODE:-10}"
-  local expected_rows=$((num_runs * views_per_mode * 12 * 9))
+  local expected_rows=$((num_runs * views_per_mode * 2 * 9))
   local metrics_file="$output/per_view_metrics.csv"
 
   # The evaluator writes all scientific tables and plots before optional VTK
@@ -62,8 +92,8 @@ drivaerml() {
     fi
   fi
 
-  select_free_gpus 4
-  CUDA_VISIBLE_DEVICES="$GPU_IDS" "$PYTHON" "$ROOT/smart/scripts/compare_drivaerml_sampling_invariance.py" \
+  select_free_gpus "${REVIEWER_MIN_GPUS:-4}"
+  CUDA_VISIBLE_DEVICES="$GPU_IDS" run_with_last_checkpoints "$PYTHON" "$ROOT/smart/scripts/compare_drivaerml_sampling_invariance.py" \
     --num-runs "${DRIVAER_NUM_RUNS:-50}" --seed 42 --positive-shifts-only --active-shifts sine_y,sine_x \
     --active-geometry-sources angle,isotropic,voxel --geometry-decimation-factors 5,10 --geometry-label-preset v4 \
     --angle-decimated-vtp-dir /mnt/ssdraid/parsa/drivaerml_surface_vtp_remesh_v4/feature \
@@ -72,29 +102,21 @@ drivaerml() {
     --views-per-mode "${DRIVAER_VIEWS_PER_MODE:-10}" --view-batch-size "${DRIVAER_VIEW_BATCH_SIZE:-2}" --model-repeats 1 \
     --surface-query-points "${DRIVAER_SURFACE_QUERY_POINTS:-65536}" --volume-query-points "${DRIVAER_VOLUME_QUERY_POINTS:-65536}" \
     --batched-query-subregion-size "${DRIVAER_QUERY_CHUNK_SIZE:-65536}" --density-estimator kde --density-knn-k 16 --vtk-run-id 29 --plot-workers 4 \
+    --skip-representative-exports \
     --font-scale 1.2 --satloss-only-percent-labels --devices "$GPU_DEVICES" \
     --smart-checkpoint "$ROOT/checkpoints/smart-smart-drivaerml-131k16kwr-drivaerml-s42_best.pt" \
     --smart-satloss7-config drivaerml_satloss7_range100 \
     --smart-satloss7-checkpoint "$ROOT/checkpoints/smart-satloss7-range100-smart-satloss7-range100-from-smart-150ep-drivaerml-s42_best.pt" \
-    --transolverpp-checkpoint "$ROOT/checkpoints/transolverpp-transolverpp-drivaerml-uniform-epochseeded-gpu0-200ep-drivaerml-s42_best.pt" \
-    --transolverpp-satloss7-checkpoint "$ROOT/checkpoints/transolverpp-satloss7-transolverpp-satloss7-drivaerml-65k-drivaerml-s42_best.pt" \
-    --pointnet2-ssg-checkpoint "$ROOT/checkpoints/pointnet2-ssg-pointnet2-ssg-drivaerml-65k-v2-drivaerml-s42_best.pt" \
-    --pointnet2-ssg-satloss7-checkpoint "$ROOT/checkpoints/pointnet2-ssg-satloss7-pointnet2-ssg-satloss7-drivaerml-65k-drivaerml-s42_best.pt" \
-    --lno-checkpoint "$ROOT/checkpoints/lno-lno-drivaerml-65k-drivaerml-s42_best.pt" \
-    --lno-satloss7-checkpoint "$ROOT/checkpoints/lno-satloss7-lno-satloss7-drivaerml-65k-drivaerml-s42_best.pt" \
-    --mspt-checkpoint "$ROOT/checkpoints/mspt-mspt-drivaerml-uniform-epochseeded-gpu6-200ep-drivaerml-s42_best.pt" \
-    --mspt-satloss7-checkpoint "$ROOT/checkpoints/mspt-satloss7-mspt-satloss7-drivaerml-65k-drivaerml-s42_best.pt" \
-    --point-transformer-v3-config drivaerml_point_transformer_v3_density_sensitive \
-    --point-transformer-v3-satloss7-config drivaerml_point_transformer_v3_satloss7_density_sensitive \
-    --point-transformer-v3-checkpoint "$ROOT/checkpoints/point-transformer-v3-ptv3-density-sensitive-drivaerml-drivaerml-s42_best.pt" \
-    --point-transformer-v3-satloss7-checkpoint "$ROOT/checkpoints/point-transformer-v3-satloss7-ptv3-satloss7-density-sensitive-drivaerml-131k-drivaerml-s42_best.pt" \
     --output-dir "$output"
 }
 
 drivaerml_strategies() {
   local output="$OUT/drivaerml_frozen_strategies_test50_views10"
-  local run_ids="1,21,101,108,116,121,132,133,136,139,141,146,152,153,160,170,173,178,180,182,185,186,187,199,200,205,206,214,222,224,230,231,235,237,239,249,250,260,262,275,279,287,288,303,304,313,314,315,331,334"
-  local expected_rows=$((50 * 10 * 5 * 9))
+  local run_ids num_runs views_per_mode
+  run_ids=$(cohort_ids drivaerml)
+  num_runs=$(( $(tr -cd ',' <<< "$run_ids" | wc -c) + 1 ))
+  views_per_mode=${DRIVAER_STRATEGY_VIEWS_PER_MODE:-10}
+  local expected_rows=$((num_runs * views_per_mode * 5 * 9))
   local metrics_file="$output/per_view_metrics.csv"
 
   if [[ -s "$metrics_file" && -f "$output/aggregate_metrics.csv" && -f "$output/robustness_summary.csv" ]]; then
@@ -102,20 +124,20 @@ drivaerml_strategies() {
     observed_rows=$(( $(wc -l < "$metrics_file") - 1 ))
     if (( observed_rows == expected_rows )); then
       echo "[DrivAerML strategies] Reusing completed frozen metrics: $observed_rows rows in $output."
-      "$PYTHON" "$ROOT/smart/scripts/create_top20_paper_vs_frozen_tables.py" \
-        --output "$OUT/paper_vs_frozen_top20_diagnostic.pdf"
+      "$PYTHON" "$ROOT/smart/scripts/create_evaluation_diagnostic_tables.py" \
+        --output "$OUT/evaluation_diagnostic.pdf"
       return
     fi
   fi
 
-  select_free_gpus 4
-  CUDA_VISIBLE_DEVICES="$GPU_IDS" "$PYTHON" "$ROOT/smart/scripts/compare_drivaerml_sampling_invariance.py" \
-    --strategy-only --num-runs 50 --run-ids "$run_ids" --seed 42 --positive-shifts-only --active-shifts sine_y,sine_x \
+  select_free_gpus "${REVIEWER_MIN_GPUS:-4}"
+  CUDA_VISIBLE_DEVICES="$GPU_IDS" run_with_last_checkpoints "$PYTHON" "$ROOT/smart/scripts/compare_drivaerml_sampling_invariance.py" \
+    --strategy-only --num-runs "$num_runs" --run-ids "$run_ids" --seed 42 --positive-shifts-only --active-shifts sine_y,sine_x \
     --active-geometry-sources angle,isotropic,voxel --geometry-decimation-factors 5,10 --geometry-label-preset v4 \
     --angle-decimated-vtp-dir /mnt/ssdraid/parsa/drivaerml_surface_vtp_remesh_v4/feature \
     --isotropic-decimated-vtp-dir /mnt/ssdraid/parsa/drivaerml_surface_vtp_remesh_v4/quadric \
     --voxel-decimated-vtp-dir /mnt/ssdraid/parsa/drivaerml_surface_vtp_remesh_v4/voxel \
-    --views-per-mode 10 --view-batch-size 2 --model-repeats 1 \
+    --views-per-mode "$views_per_mode" --view-batch-size 2 --model-repeats 1 \
     --surface-query-points 65536 --volume-query-points 65536 --batched-query-subregion-size 65536 \
     --density-estimator kde --density-knn-k 16 --skip-representative-exports --plot-workers 8 --font-scale 1.2 \
     --satloss-only-percent-labels --devices "$GPU_DEVICES" \
@@ -130,16 +152,18 @@ drivaerml_strategies() {
     --smart-box-masked-checkpoint "$ROOT/checkpoints/smart-box-masked-boxmasked-drivaerml-dp12-bs2-drivaerml-s42_best.pt" \
     --smart-satloss7-checkpoint "$ROOT/checkpoints/smart-satloss7-range100-smart-satloss7-range100-from-smart-150ep-drivaerml-s42_best.pt" \
     --output-dir "$output"
-  "$PYTHON" "$ROOT/smart/scripts/create_top20_paper_vs_frozen_tables.py" \
-    --output "$OUT/paper_vs_frozen_top20_diagnostic.pdf"
+  "$PYTHON" "$ROOT/smart/scripts/create_evaluation_diagnostic_tables.py" \
+    --output "$OUT/evaluation_diagnostic.pdf"
 }
 
 pump() {
-  select_free_gpus 4
-  CUDA_VISIBLE_DEVICES="$GPU_IDS" "$PYTHON" "$ROOT/smart/scripts/compare_shift_endpoint_strategies.py" \
+  local run_ids
+  run_ids=$(cohort_ids pump)
+  select_free_gpus "${REVIEWER_MIN_GPUS:-4}"
+  CUDA_VISIBLE_DEVICES="$GPU_IDS" run_with_last_checkpoints "$PYTHON" "$ROOT/smart/scripts/compare_shift_endpoint_strategies.py" \
     --dataset pump --data-root /mnt/data/parsa/shift_pump_random1400_preprocessed \
     --study-summary /mnt/data/parsa/shift_pump_random1400_surface_vtp_remesh_v4/remeshing_v2_summary.json \
-    --case-selection test --selection-policy all_cases --include-original --original-base-only --num-runs 0 --seed 42 --views-per-test 10 --inference-batch-size 4 \
+    --case-selection test --selection-policy all_cases --run-ids "$run_ids" --include-original --original-base-only --num-runs 0 --seed 42 --views-per-test "${SHIFT_VIEWS_PER_TEST:-10}" --inference-batch-size 4 \
     --active-geometry-sources feature,quadric,voxel --geometry-decimation-factors 5,10 --geometry-label-preset v4 \
     --surface-query-points 65536 --volume-query-points 65536 --query-chunk-size 65536 --plot-scales linear,log \
     --font-scale 1.2 --min-free-gib 8 --devices "$GPU_DEVICES" \
@@ -154,11 +178,13 @@ pump() {
 }
 
 heat_exchanger() {
-  select_free_gpus 4
-  CUDA_VISIBLE_DEVICES="$GPU_IDS" "$PYTHON" "$ROOT/smart/scripts/compare_shift_endpoint_strategies.py" \
+  local run_ids
+  run_ids=$(cohort_ids heat_exchanger)
+  select_free_gpus "${REVIEWER_MIN_GPUS:-4}"
+  CUDA_VISIBLE_DEVICES="$GPU_IDS" run_with_last_checkpoints "$PYTHON" "$ROOT/smart/scripts/compare_shift_endpoint_strategies.py" \
     --dataset heat_exchanger --data-root /mnt/ssdraid/parsa/toy_heat_exchange_fem_v1 \
     --study-summary /mnt/ssdraid/parsa/toy_heat_exchange_surface_vtp_remesh_v4/remeshing_v2_summary.json \
-    --case-selection test --selection-policy all_cases --include-original --original-base-only --num-runs 0 --seed 42 --views-per-test 10 --inference-batch-size 4 \
+    --case-selection test --selection-policy all_cases --run-ids "$run_ids" --include-original --original-base-only --num-runs 0 --seed 42 --views-per-test "${SHIFT_VIEWS_PER_TEST:-10}" --inference-batch-size 4 \
     --active-geometry-sources feature,quadric --geometry-decimation-factors 5,10 --geometry-label-preset v4 \
     --surface-query-points 32768 --volume-query-points 32768 --query-chunk-size 32768 --plot-scales linear,log \
     --font-scale 1.2 --min-free-gib 8 --devices "$GPU_DEVICES" \
@@ -187,11 +213,11 @@ geometry() {
 documentation() {
   "$PYTHON" "$ROOT/smart/scripts/audit_toy_heat_exchange_generation.py" --data-root /mnt/ssdraid/parsa/toy_heat_exchange_fem_v1 --output-dir "$OUT/heat_exchanger_generation_audit"
   "$PYTHON" "$ROOT/smart/scripts/export_paper_task_cards.py" --output-json "$OUT/task_cards.json" --output-markdown "$OUT/task_cards.md" --output-latex "$OUT/task_cards.tex"
-  "$PYTHON" "$ROOT/smart/scripts/export_paper_reproducibility_snapshot.py" --output-dir "$OUT/reproducibility" --latex-output "$OUT/reproducibility/reproducibility_snapshot.tex" --config pump_base=pump --config pump_deal=pump_deal_from_smart_full --config heat_base=toy_heat_exchange --config heat_deal=toy_heat_exchange_satloss7 --checkpoint pump_base="$ROOT/checkpoints/smart-pump-random1400-base-16k-pump-s42_best.pt" --checkpoint pump_deal="$ROOT/checkpoints/smart-pump-deal-random1400-from-smart-150ep-pump-s42_best.pt" --checkpoint heat_base="$ROOT/checkpoints/smart-toy-heat-exchange-heat-exchange-base-ratio-aligned-toyheatexchange-s42_best.pt" --checkpoint heat_deal="$ROOT/checkpoints/smart-toy-heat-exchange-satloss7-heat-exchange-satloss-ratio-aligned-toyheatexchange-s42_best.pt"
+  run_with_last_checkpoints "$PYTHON" "$ROOT/smart/scripts/export_paper_reproducibility_snapshot.py" --output-dir "$OUT/reproducibility" --latex-output "$OUT/reproducibility/reproducibility_snapshot.tex" --config pump_base=pump --config pump_deal=pump_deal_from_smart_full --config heat_base=toy_heat_exchange --config heat_deal=toy_heat_exchange_satloss7 --checkpoint pump_base="$ROOT/checkpoints/smart-pump-random1400-base-16k-pump-s42_best.pt" --checkpoint pump_deal="$ROOT/checkpoints/smart-pump-deal-random1400-from-smart-150ep-pump-s42_best.pt" --checkpoint heat_base="$ROOT/checkpoints/smart-toy-heat-exchange-heat-exchange-base-ratio-aligned-toyheatexchange-s42_best.pt" --checkpoint heat_deal="$ROOT/checkpoints/smart-toy-heat-exchange-satloss7-heat-exchange-satloss-ratio-aligned-toyheatexchange-s42_best.pt"
 }
 
 case "${1:-}" in
   drivaerml|drivaerml_strategies|pump|heat_exchanger|bootstrap|geometry|documentation) "$1" ;;
-  all) drivaerml; pump; heat_exchanger; bootstrap; geometry; documentation ;;
+  all) drivaerml; drivaerml_strategies; pump; heat_exchanger; bootstrap; geometry; documentation ;;
   *) echo "Usage: bash $0 {drivaerml|drivaerml_strategies|pump|heat_exchanger|bootstrap|geometry|documentation|all}" >&2; exit 2 ;;
 esac

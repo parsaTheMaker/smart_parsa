@@ -13,6 +13,20 @@ export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1
 export VTK_SMP_MAX_THREADS=1
 
+run_with_last_checkpoints() {
+  local rewritten=() argument
+  for argument in "$@"; do
+    if [[ "$argument" == *_best.pt ]]; then
+      argument="${argument%_best.pt}_last.pt"
+    fi
+    if [[ "$argument" == *=*_best.pt ]]; then
+      argument="${argument%_best.pt}_last.pt"
+    fi
+    rewritten+=("$argument")
+  done
+  "${rewritten[@]}"
+}
+
 run_geometry() {
   "$PYTHON" "$ROOT/smart/scripts/validate_remesh_geometry.py" "$@"
 }
@@ -62,7 +76,7 @@ fi
   --output-json "$OUT/task_cards.json" \
   --output-markdown "$OUT/task_cards.md" \
   --output-latex "$OUT/task_cards.tex"
-"$PYTHON" "$ROOT/smart/scripts/export_paper_reproducibility_snapshot.py" \
+run_with_last_checkpoints "$PYTHON" "$ROOT/smart/scripts/export_paper_reproducibility_snapshot.py" \
   --output-dir "$OUT/reproducibility" \
   --latex-output "$OUT/reproducibility/reproducibility_snapshot.tex" \
   --config pump_base=pump --config pump_deal=pump_deal_from_smart_full \
@@ -71,7 +85,7 @@ fi
   --checkpoint pump_deal="$ROOT/checkpoints/smart-pump-deal-random1400-from-smart-150ep-pump-s42_best.pt" \
   --checkpoint heat_base="$ROOT/checkpoints/smart-toy-heat-exchange-heat-exchange-base-ratio-aligned-toyheatexchange-s42_best.pt" \
   --checkpoint heat_deal="$ROOT/checkpoints/smart-toy-heat-exchange-satloss7-heat-exchange-satloss-ratio-aligned-toyheatexchange-s42_best.pt"
-"$PYTHON" "$ROOT/smart/scripts/create_top20_paper_vs_frozen_tables.py" \
-  --output "$OUT/paper_vs_frozen_top20_diagnostic.pdf"
+"$PYTHON" "$ROOT/smart/scripts/create_evaluation_diagnostic_tables.py" \
+  --output "$OUT/evaluation_diagnostic.pdf"
 
 echo "Reviewer geometry and documentation evidence complete: $OUT"

@@ -1,0 +1,4 @@
+[submodule "paper/iclr2027/sharelatex_project"]
+	path = paper/iclr2027/sharelatex_project
+	url = https://git@sharelatex.tum.de/git/6a8c1b2f4ad3c526cb0420cf
+	branch = master

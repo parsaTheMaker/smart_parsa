@@ -1,0 +1,4 @@
+control	gpu	primary_beta	secondary_beta	interpretation
+beta0_pair	0	0	0	paired independent uniform sampling at the DeAL point budget
+beta1_pair	1	1	1	paired independent fixed sparse-region emphasis
+beta01_endpoints	2	0	1	deterministic beta endpoints without continuous beta variation

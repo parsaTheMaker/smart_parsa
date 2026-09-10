@@ -87,6 +87,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--methods", default="feature,quadric,voxel")
     parser.add_argument("--factors", default="5,10")
+    parser.add_argument(
+        "--conditions",
+        default="original,sine_x,sine_y,remesh",
+        help=(
+            "Comma-separated evaluation conditions. Use 'original' for aligned-input "
+            "accuracy; 'remesh' expands to every requested method and factor."
+        ),
+    )
     parser.add_argument("--num-cases", type=int, default=5)
     parser.add_argument("--case-ids", default="")
     parser.add_argument(
@@ -97,6 +105,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--views-per-condition", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--transolver-slice-assignment-mode",
+        choices=("official_gumbel", "deterministic_softmax"),
+        help="Override Transolver++ slice assignment to reproduce an archived evaluation runtime.",
+    )
     parser.add_argument("--output-dir", type=Path, required=True)
     return parser.parse_args()
 
@@ -379,10 +392,30 @@ def main() -> None:
             )
     validate_checkpoint_runtime_config(args.model, args.base_checkpoint, args.base_config)
     validate_checkpoint_runtime_config(args.model, args.deal_checkpoint, args.deal_config)
+    requested_conditions = [item.strip() for item in args.conditions.split(",") if item.strip()]
+    allowed_conditions = {"original", "sine_x", "sine_y", "remesh"}
+    unknown_conditions = sorted(set(requested_conditions) - allowed_conditions)
+    if unknown_conditions:
+        raise ValueError(f"Unknown conditions: {unknown_conditions}")
+    if not requested_conditions:
+        raise ValueError("At least one evaluation condition is required")
+    if any(condition != "original" for condition in requested_conditions) and "original" not in requested_conditions:
+        raise ValueError("The original condition is required as the representation-drift reference")
+    needs_remesh = "remesh" in requested_conditions
     methods = [item.strip() for item in args.methods.split(",") if item.strip()]
     factors = [int(item) for item in args.factors.split(",") if item.strip()]
     device = torch.device(args.device)
     base_cfg, deal_cfg = compose_config(args.base_config), compose_config(args.deal_config)
+    if args.transolver_slice_assignment_mode:
+        if args.model != "transolverpp":
+            raise ValueError("--transolver-slice-assignment-mode applies only to Transolver++")
+        for cfg in (base_cfg, deal_cfg):
+            OmegaConf.update(
+                cfg,
+                "experiment.architecture.slice_assignment_mode",
+                args.transolver_slice_assignment_mode,
+                force_add=True,
+            )
     budget = input_budget(deal_cfg)
     dataset_cfg = OmegaConf.create(OmegaConf.to_container(deal_cfg, resolve=True))
     dataset_cfg.experiment.data_path = str(args.data_root.resolve())
@@ -410,11 +443,12 @@ def main() -> None:
     else:
         indices = [
             index for index, case_id in enumerate(dataset.data)
-            if complete_remeshes(args.dataset, args.remesh_root, int(case_id), methods, factors)
+            if not needs_remesh
+            or complete_remeshes(args.dataset, args.remesh_root, int(case_id), methods, factors)
         ][: args.num_cases]
     if not requested and len(indices) != args.num_cases:
         raise RuntimeError(f"Found only {len(indices)} complete cases, requested {args.num_cases}")
-    missing_remeshes = [
+    missing_remeshes = [] if not needs_remesh else [
         int(dataset.data[index]) for index in indices
         if not complete_remeshes(args.dataset, args.remesh_root, int(dataset.data[index]), methods, factors)
     ]
@@ -436,41 +470,43 @@ def main() -> None:
         conditions = []
         for view in range(args.views_per_condition):
             view_seed = args.seed + case_id * 10_007 + view * 1_009
-            sine_x, _, _ = sample_geometry_view(
-                geo.unsqueeze(0), density.unsqueeze(0), budget, "sinusoidal_axis_mixture_wor",
-                0.0, 0.0, view_seed + 101, sinusoidal_axis=0, sinusoidal_mix_fraction=1.0,
-            )
-            sine_y, _, _ = sample_geometry_view(
-                geo.unsqueeze(0), density.unsqueeze(0), budget, "sinusoidal_axis_mixture_wor",
-                0.0, 0.0, view_seed + 211, sinusoidal_axis=1, sinusoidal_mix_fraction=1.0,
-            )
-            original, _, _ = sample_geometry_view(
-                geo.unsqueeze(0), density.unsqueeze(0), budget, "uniform_wor",
-                0.0, 0.0, view_seed + 17,
-            )
-            conditions.extend([
-                ("original", original[0], "", 0, view),
-                ("sine_x", sine_x[0], "", 0, view),
-                ("sine_y", sine_y[0], "", 0, view),
-            ])
-            for method in methods:
-                for factor in factors:
-                    path = remesh_path(args.dataset, args.remesh_root, case_id, method, factor)
-                    physical = remesh_geometry(
-                        path,
-                        budget,
-                        view_seed + factor * 10 + len(method),
-                        args.dataset,
-                    )
-                    conditions.append(
-                        (
-                            f"remesh_{method}_div{factor}",
-                            torch.from_numpy((physical - lower) / span),
-                            method,
-                            factor,
-                            view,
+            if "original" in requested_conditions:
+                original, _, _ = sample_geometry_view(
+                    geo.unsqueeze(0), density.unsqueeze(0), budget, "uniform_wor",
+                    0.0, 0.0, view_seed + 17,
+                )
+                conditions.append(("original", original[0], "", 0, view))
+            if "sine_x" in requested_conditions:
+                sine_x, _, _ = sample_geometry_view(
+                    geo.unsqueeze(0), density.unsqueeze(0), budget, "sinusoidal_axis_mixture_wor",
+                    0.0, 0.0, view_seed + 101, sinusoidal_axis=0, sinusoidal_mix_fraction=1.0,
+                )
+                conditions.append(("sine_x", sine_x[0], "", 0, view))
+            if "sine_y" in requested_conditions:
+                sine_y, _, _ = sample_geometry_view(
+                    geo.unsqueeze(0), density.unsqueeze(0), budget, "sinusoidal_axis_mixture_wor",
+                    0.0, 0.0, view_seed + 211, sinusoidal_axis=1, sinusoidal_mix_fraction=1.0,
+                )
+                conditions.append(("sine_y", sine_y[0], "", 0, view))
+            if needs_remesh:
+                for method in methods:
+                    for factor in factors:
+                        path = remesh_path(args.dataset, args.remesh_root, case_id, method, factor)
+                        physical = remesh_geometry(
+                            path,
+                            budget,
+                            view_seed + factor * 10 + len(method),
+                            args.dataset,
                         )
-                    )
+                        conditions.append(
+                            (
+                                f"remesh_{method}_div{factor}",
+                                torch.from_numpy((physical - lower) / span),
+                                method,
+                                factor,
+                                view,
+                            )
+                        )
         cases.append((case_id, surf_q, surf_y, vol_q, vol_y, params, conditions))
 
     print(f"dataset={args.dataset} model={args.model} cases={[case[0] for case in cases]} budget={budget}", flush=True)
@@ -561,7 +597,9 @@ def main() -> None:
             "case_ids": [case[0] for case in cases],
             "encoder_budget": budget,
             "query_budgets": {"surface": int(dataset.surface_points), "volume": int(dataset.volume_points)},
-        "views_per_condition": args.views_per_condition,
+            "views_per_condition": args.views_per_condition,
+            "requested_conditions": requested_conditions,
+            "transolver_slice_assignment_mode_override": args.transolver_slice_assignment_mode,
         "seed": args.seed,
         "case_seed_rule": "seed + case_id * 1000003",
             "remesh_methods": methods,

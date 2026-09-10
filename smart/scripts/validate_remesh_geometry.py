@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """Quantitatively audit geometric preservation of remeshed VTP surfaces.
 
-Distances are symmetric, point-to-triangle surface distances evaluated with
-VTK's compiled distance filter.  Normal deviation uses nearest sampled surface
-vertices and is explicitly labelled as an orientation-agnostic approximation.
-The script deliberately separates mesh distortion from density redistribution.
+Distances use area-weighted triangle samples and VTK point-to-surface queries.
+Normal deviation compares sampled source-face normals with the exact closest
+target triangle. The script deliberately separates mesh distortion from density
+redistribution and ignores stored points that are not referenced by triangles.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -63,10 +64,13 @@ def read_polydata(vtk, path: Path):
         raise RuntimeError(f"Unable to read nonempty VTP: {path}")
     triangle = vtk.vtkTriangleFilter()
     triangle.SetInputData(poly)
-    triangle.PassVertsOn()
+    triangle.PassVertsOff()
     triangle.PassLinesOff()
     triangle.Update()
-    return triangle.GetOutput()
+    output = triangle.GetOutput()
+    if output.GetNumberOfPolys() == 0:
+        raise RuntimeError(f"PolyData has no polygonal surface: {path}")
+    return output
 
 
 def sampled_vertex_polydata(vtk, numpy_to_vtk, numpy_to_vtkIdTypeArray, points: np.ndarray):
@@ -83,10 +87,46 @@ def sampled_vertex_polydata(vtk, numpy_to_vtk, numpy_to_vtkIdTypeArray, points: 
     return poly
 
 
-def sample_indices(count: int, budget: int, seed: int) -> np.ndarray:
-    if count <= budget:
-        return np.arange(count, dtype=np.int64)
-    return np.random.default_rng(seed).choice(count, size=budget, replace=False)
+def triangle_geometry(vtk_to_numpy, poly) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return points, triangle IDs, areas, and unit face normals."""
+    points = np.asarray(vtk_to_numpy(poly.GetPoints().GetData()), dtype=np.float64)
+    packed = np.asarray(vtk_to_numpy(poly.GetPolys().GetData()), dtype=np.int64)
+    if packed.size % 4 != 0:
+        raise RuntimeError("Triangulated polygon connectivity is not packed in four-value cells.")
+    cells = packed.reshape(-1, 4)
+    if not np.all(cells[:, 0] == 3):
+        raise RuntimeError("vtkTriangleFilter produced a non-triangle polygon.")
+    triangle_ids = cells[:, 1:]
+    vertices = points[triangle_ids]
+    cross = np.cross(vertices[:, 1] - vertices[:, 0], vertices[:, 2] - vertices[:, 0])
+    double_area = np.linalg.norm(cross, axis=1)
+    if not np.any(double_area > 0.0):
+        raise RuntimeError("Triangulated surface has no positive-area cells.")
+    normals = cross / np.maximum(double_area[:, None], 1.0e-30)
+    return points, triangle_ids, 0.5 * double_area, normals
+
+
+def sample_surface(
+    points: np.ndarray,
+    triangle_ids: np.ndarray,
+    areas: np.ndarray,
+    normals: np.ndarray,
+    budget: int,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Draw deterministic area-uniform points and their triangle normals."""
+    rng = np.random.default_rng(seed)
+    probabilities = areas / areas.sum()
+    selected = rng.choice(len(areas), size=budget, replace=True, p=probabilities)
+    triangle_points = points[triangle_ids[selected]]
+    root_u = np.sqrt(rng.random(budget))
+    v = rng.random(budget)
+    samples = (
+        (1.0 - root_u)[:, None] * triangle_points[:, 0]
+        + (root_u * (1.0 - v))[:, None] * triangle_points[:, 1]
+        + (root_u * v)[:, None] * triangle_points[:, 2]
+    )
+    return samples, normals[selected]
 
 
 def point_to_surface_distances(vtk, vtk_to_numpy, numpy_to_vtk, numpy_to_vtkIdTypeArray, points: np.ndarray, target):
@@ -103,34 +143,29 @@ def point_to_surface_distances(vtk, vtk_to_numpy, numpy_to_vtk, numpy_to_vtkIdTy
     return np.abs(np.asarray(vtk_to_numpy(values), dtype=np.float64))
 
 
-def point_normals(vtk, vtk_to_numpy, poly):
-    normals = vtk.vtkPolyDataNormals()
-    normals.SetInputData(poly)
-    normals.ComputePointNormalsOn()
-    normals.ComputeCellNormalsOff()
-    normals.SplittingOff()
-    normals.ConsistencyOn()
-    normals.AutoOrientNormalsOff()
-    normals.Update()
-    output = normals.GetOutput()
-    data = output.GetPointData().GetNormals()
-    if data is None:
-        raise RuntimeError("Could not compute point normals.")
-    return output, np.asarray(vtk_to_numpy(data), dtype=np.float64)
-
-
-def sampled_normal_deviation(vtk, vtk_to_numpy, source, target, budget: int, seed: int) -> np.ndarray:
-    source_with_normals, source_normals = point_normals(vtk, vtk_to_numpy, source)
-    target_with_normals, target_normals = point_normals(vtk, vtk_to_numpy, target)
-    source_points = np.asarray(vtk_to_numpy(source_with_normals.GetPoints().GetData()), dtype=np.float64)
-    target_points = np.asarray(vtk_to_numpy(target_with_normals.GetPoints().GetData()), dtype=np.float64)
-    indices = sample_indices(len(source_points), budget, seed)
-    locator = vtk.vtkStaticPointLocator()
-    locator.SetDataSet(target_with_normals)
+def sampled_normal_deviation(
+    vtk,
+    source_points: np.ndarray,
+    source_normals: np.ndarray,
+    target,
+    target_normals: np.ndarray,
+) -> np.ndarray:
+    """Compare face normals at samples with the exact closest target cells."""
+    if target.GetNumberOfCells() != target.GetNumberOfPolys():
+        raise RuntimeError("Closest-cell normal matching requires a polygon-only target.")
+    locator = vtk.vtkStaticCellLocator()
+    locator.SetDataSet(target)
     locator.BuildLocator()
-    nearest = np.fromiter((locator.FindClosestPoint(source_points[index]) for index in indices), dtype=np.int64, count=len(indices))
-    source_unit = source_normals[indices] / np.maximum(np.linalg.norm(source_normals[indices], axis=1, keepdims=True), 1.0e-12)
-    target_unit = target_normals[nearest] / np.maximum(np.linalg.norm(target_normals[nearest], axis=1, keepdims=True), 1.0e-12)
+    nearest = np.empty(len(source_points), dtype=np.int64)
+    closest = [0.0, 0.0, 0.0]
+    cell_id = vtk.reference(0)
+    sub_id = vtk.reference(0)
+    distance_squared = vtk.reference(0.0)
+    for index, point in enumerate(source_points):
+        locator.FindClosestPoint(point, closest, cell_id, sub_id, distance_squared)
+        nearest[index] = int(cell_id)
+    source_unit = source_normals / np.maximum(np.linalg.norm(source_normals, axis=1, keepdims=True), 1.0e-12)
+    target_unit = target_normals[nearest]
     # Global winding may legitimately differ after simplification. This reports
     # local orientation mismatch independent of a global sign flip.
     cosine = np.clip(np.abs(np.einsum("ij,ij->i", source_unit, target_unit)), 0.0, 1.0)
@@ -149,7 +184,16 @@ def topology_counts(vtk, poly) -> dict[str, int]:
         edges.ColoringOff()
         edges.Update()
         return int(edges.GetOutput().GetNumberOfCells())
-    return {"boundary_edges": count("boundary"), "nonmanifold_edges": count("nonmanifold")}
+    connectivity = vtk.vtkConnectivityFilter()
+    connectivity.SetInputData(poly)
+    connectivity.SetExtractionModeToAllRegions()
+    connectivity.ColorRegionsOff()
+    connectivity.Update()
+    return {
+        "boundary_edges": count("boundary"),
+        "nonmanifold_edges": count("nonmanifold"),
+        "connected_components": int(connectivity.GetNumberOfExtractedRegions()),
+    }
 
 
 def surface_area(vtk, poly) -> float:
@@ -171,22 +215,37 @@ def original_path(dataset: str, source_dir: Path, remesh: Path) -> Path:
     raise AssertionError(dataset)
 
 
-def validate_one(payload: tuple[str, str, str, str, int, int, int]) -> dict[str, object]:
-    dataset, source_text, remesh_text, method, factor, distance_samples, normal_samples = payload
+def validate_one(payload: tuple[str, str, str, str, int, int, int, int]) -> dict[str, object]:
+    dataset, source_text, remesh_text, method, factor, distance_samples, normal_samples, base_seed = payload
     vtk, vtk_to_numpy, numpy_to_vtk, numpy_to_vtkIdTypeArray = require_vtk()
     source_path, remesh_path = Path(source_text), Path(remesh_text)
     source = read_polydata(vtk, source_path)
     output = read_polydata(vtk, remesh_path)
-    source_points = np.asarray(vtk_to_numpy(source.GetPoints().GetData()), dtype=np.float64)
-    output_points = np.asarray(vtk_to_numpy(output.GetPoints().GetData()), dtype=np.float64)
-    seed = abs(hash((str(remesh_path), factor))) % (2**31 - 1)
-    source_sample = source_points[sample_indices(len(source_points), distance_samples, seed)]
-    output_sample = output_points[sample_indices(len(output_points), distance_samples, seed + 1)]
+    source_points, source_ids, source_areas, source_normals = triangle_geometry(vtk_to_numpy, source)
+    output_points, output_ids, output_areas, output_normals = triangle_geometry(vtk_to_numpy, output)
+    digest = hashlib.blake2b(f"{remesh_path}|{factor}|{base_seed}".encode(), digest_size=8).digest()
+    seed = int.from_bytes(digest, byteorder="little") % (2**31 - 1)
+    source_sample, _ = sample_surface(
+        source_points, source_ids, source_areas, source_normals, distance_samples, seed
+    )
+    output_sample, _ = sample_surface(
+        output_points, output_ids, output_areas, output_normals, distance_samples, seed + 1
+    )
     forward = point_to_surface_distances(vtk, vtk_to_numpy, numpy_to_vtk, numpy_to_vtkIdTypeArray, source_sample, output)
     reverse = point_to_surface_distances(vtk, vtk_to_numpy, numpy_to_vtk, numpy_to_vtkIdTypeArray, output_sample, source)
     all_distance = np.concatenate((forward, reverse))
-    normal_forward = sampled_normal_deviation(vtk, vtk_to_numpy, source, output, normal_samples, seed + 2)
-    normal_reverse = sampled_normal_deviation(vtk, vtk_to_numpy, output, source, normal_samples, seed + 3)
+    source_normal_points, source_normal_vectors = sample_surface(
+        source_points, source_ids, source_areas, source_normals, normal_samples, seed + 2
+    )
+    output_normal_points, output_normal_vectors = sample_surface(
+        output_points, output_ids, output_areas, output_normals, normal_samples, seed + 3
+    )
+    normal_forward = sampled_normal_deviation(
+        vtk, source_normal_points, source_normal_vectors, output, output_normals
+    )
+    normal_reverse = sampled_normal_deviation(
+        vtk, output_normal_points, output_normal_vectors, source, source_normals
+    )
     all_normals = np.concatenate((normal_forward, normal_reverse))
     bounds = source.GetBounds()
     diagonal = float(np.linalg.norm(np.asarray([bounds[1] - bounds[0], bounds[3] - bounds[2], bounds[5] - bounds[4]], dtype=np.float64)))
@@ -199,8 +258,10 @@ def validate_one(payload: tuple[str, str, str, str, int, int, int]) -> dict[str,
         "factor": factor,
         "source_vtp": str(source_path),
         "remesh_vtp": str(remesh_path),
-        "source_vertices": int(source.GetNumberOfPoints()),
-        "remesh_vertices": int(output.GetNumberOfPoints()),
+        "source_stored_points": int(source.GetNumberOfPoints()),
+        "remesh_stored_points": int(output.GetNumberOfPoints()),
+        "source_vertices": int(np.unique(source_ids).size),
+        "remesh_vertices": int(np.unique(output_ids).size),
         "source_triangles": int(source.GetNumberOfPolys()),
         "remesh_triangles": int(output.GetNumberOfPolys()),
         "source_area": source_area,
@@ -218,8 +279,15 @@ def validate_one(payload: tuple[str, str, str, str, int, int, int]) -> dict[str,
         "remesh_boundary_edges": output_topology["boundary_edges"],
         "source_nonmanifold_edges": source_topology["nonmanifold_edges"],
         "remesh_nonmanifold_edges": output_topology["nonmanifold_edges"],
-        "distance_samples_per_direction": min(distance_samples, len(source_points), len(output_points)),
-        "normal_samples_per_direction": min(normal_samples, len(source_points), len(output_points)),
+        "source_connected_components": source_topology["connected_components"],
+        "remesh_connected_components": output_topology["connected_components"],
+        "topology_failure": int(
+            source_topology["connected_components"] != output_topology["connected_components"]
+            or bool(source_topology["boundary_edges"]) != bool(output_topology["boundary_edges"])
+            or bool(source_topology["nonmanifold_edges"]) != bool(output_topology["nonmanifold_edges"])
+        ),
+        "distance_samples_per_direction": distance_samples,
+        "normal_samples_per_direction": normal_samples,
     }
 
 
@@ -258,7 +326,19 @@ def main() -> int:
     if not candidates:
         raise FileNotFoundError("No matching original/remeshed VTP pairs found.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    jobs = [(args.dataset, str(source), str(remesh), method, factor, args.distance_samples, args.normal_samples) for source, remesh, method, factor in candidates]
+    jobs = [
+        (
+            args.dataset,
+            str(source),
+            str(remesh),
+            method,
+            factor,
+            args.distance_samples,
+            args.normal_samples,
+            args.seed,
+        )
+        for source, remesh, method, factor in candidates
+    ]
     records: list[dict[str, object]] = []
     failures: list[dict[str, str]] = []
     with ProcessPoolExecutor(max_workers=min(args.workers, len(jobs))) as pool:
@@ -288,10 +368,7 @@ def main() -> int:
                 "normal_deviation_mean_degrees_mean": float(np.mean([row["normal_deviation_mean_degrees"] for row in subset])),
                 "normal_deviation_p95_degrees_mean": float(np.mean([row["normal_deviation_p95_degrees"] for row in subset])),
                 "mean_triangle_reduction": float(np.mean([row["source_triangles"] / max(row["remesh_triangles"], 1) for row in subset])),
-                "topology_changed_cases": int(sum(
-                    row["source_boundary_edges"] != row["remesh_boundary_edges"] or row["source_nonmanifold_edges"] != row["remesh_nonmanifold_edges"]
-                    for row in subset
-                )),
+                "topology_failure_cases": int(sum(row["topology_failure"] for row in subset)),
             })
     with (args.output_dir / "remesh_geometry_summary.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(summaries[0]) if summaries else ["method"])
@@ -301,8 +378,9 @@ def main() -> int:
         "source_dir": str(args.source_dir),
         "remesh_dir": str(args.remesh_dir),
         "methods": sorted(methods), "factors": sorted(factors),
-        "distance_definition": "symmetric sampled point-to-triangle surface distance via vtkDistancePolyDataFilter",
-        "normal_definition": "orientation-agnostic nearest-vertex normal deviation; approximate diagnostic",
+        "distance_definition": "symmetric area-weighted triangle samples to target triangle surface via vtkDistancePolyDataFilter",
+        "normal_definition": "orientation-agnostic area-weighted source-face normal to exact closest target-triangle normal",
+        "topology_definition": "connected-component count and boundary/non-manifold status must be preserved",
         "validated_cases": sorted(selected_cases), "records": len(records), "failures": failures, "summary": summaries,
     }, indent=2) + "\n", encoding="utf-8")
     print(f"Validated {len(records)} remeshes with {len(failures)} failures; outputs in {args.output_dir}")

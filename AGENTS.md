@@ -18,3 +18,4 @@ Shared invariants:
 - Keep generated build artifacts and interpreter caches out of version-control commits.
 - Use the existing project visual language unless the task explicitly calls for a redesign.
 - In LaTeX prose, keep one physical source line per semantic paragraph and rely on soft editor wrapping. Phrase-level edits must patch only the relevant words without hard-wrapping or reflowing the surrounding paragraph; preserve intentional blank-line paragraph boundaries and block environments.
+- Unless the user explicitly requests otherwise, mark newly added manuscript text with green highlighting and replacement wording with yellow highlighting. Use the paper's `\addition{}` and `\change{}` macros rather than setting highlight colors inline.

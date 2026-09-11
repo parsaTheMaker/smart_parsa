@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export native-query error maps for the strongest canonical qualitative case."""
+"""Export native-query error maps for a low-DeAL, large-gap qualitative case."""
 
 from __future__ import annotations
 
@@ -75,7 +75,13 @@ def parse_args() -> argparse.Namespace:
     prepare.add_argument("--per-case-metrics", type=Path, required=True)
     prepare.add_argument("--native-mesh", type=Path, required=True)
     prepare.add_argument("--native-field-source", type=Path)
-    prepare.add_argument("--pump-slice-z", type=float, default=-0.055)
+    prepare.add_argument("--pump-slice-z", type=float)
+    prepare.add_argument("--pump-slice-fraction", type=float, default=0.605)
+    prepare.add_argument("--heat-slice-fraction", type=float, default=0.5)
+    prepare.add_argument("--balanced-top-k", type=int, default=1)
+    prepare.add_argument("--min-channels", type=int, default=0)
+    prepare.add_argument("--waviness-category")
+    prepare.add_argument("--candidate-split", choices=("validation", "all"), default="validation")
     prepare.add_argument("--seed", type=int, default=42)
     prepare.add_argument("--bundle", type=Path, required=True)
     prepare.add_argument("--query-mesh", type=Path, required=True)
@@ -295,7 +301,17 @@ def ranked_cases(path: Path, metric: str) -> list[dict[str, float | int]]:
                 "gap": base_mean - deal_mean,
             }
         )
-    return sorted(rankings, key=lambda row: (float(row["gap"]), int(row["case_id"])), reverse=True)
+    if not rankings:
+        return rankings
+    deal_values = np.asarray([row["deal_mean"] for row in rankings], dtype=np.float64)
+    gap_values = np.asarray([row["gap"] for row in rankings], dtype=np.float64)
+    deal_span = max(float(np.ptp(deal_values)), 1.0e-12)
+    gap_span = max(float(np.ptp(gap_values)), 1.0e-12)
+    for row in rankings:
+        normalized_deal = (float(row["deal_mean"]) - float(deal_values.min())) / deal_span
+        normalized_gap_deficit = (float(gap_values.max()) - float(row["gap"])) / gap_span
+        row["balanced_score"] = float(np.hypot(normalized_deal, normalized_gap_deficit))
+    return sorted(rankings, key=lambda row: (float(row["balanced_score"]), int(row["case_id"])))
 
 
 def dataset_context(config_name: str, data_root: Path, run_id: int, seed: int):
@@ -308,7 +324,12 @@ def dataset_context(config_name: str, data_root: Path, run_id: int, seed: int):
     )
     if spatial_dim != 3:
         raise ValueError("Only 3D datasets are supported")
-    dataset = validation
+    if run_id in validation.data:
+        dataset = validation
+    elif run_id in train.data:
+        dataset = train
+    else:
+        raise ValueError(f"Case {run_id} is absent from both configured dataset splits")
     dataset.set_epoch(0)
     if hasattr(dataset, "geometry_epoch_seeded_sampling"):
         dataset.geometry_epoch_seeded_sampling = True
@@ -339,10 +360,18 @@ def query_data(args: argparse.Namespace) -> tuple[vtk.vtkPolyData, np.ndarray, n
         return surface, points, np.linalg.norm(values, axis=1), "native FEM surface"
     if args.dataset == "pump":
         volume = read_unstructured_grid(args.native_mesh)
+        volume_bounds = volume.GetBounds()
+        slice_z = (
+            float(args.pump_slice_z)
+            if args.pump_slice_z is not None
+            else volume_bounds[4]
+            + float(args.pump_slice_fraction) * (volume_bounds[5] - volume_bounds[4])
+        )
+        args.pump_slice_z = slice_z
         slice_mesh = native_volume_slice(
             volume,
             normal=(0.0, 0.0, 1.0),
-            origin=(0.0, 0.0, float(args.pump_slice_z)),
+            origin=(0.0, 0.0, slice_z),
         )
         points = np.asarray(vtk_to_numpy(slice_mesh.GetPoints().GetData()), dtype=np.float32)
         velocity = np.asarray(
@@ -356,8 +385,8 @@ def query_data(args: argparse.Namespace) -> tuple[vtk.vtkPolyData, np.ndarray, n
     volume = tetrahedral_mesh(points, tetrahedra)
     add_point_array(volume, "temperature", temperature)
     bounds = volume.GetBounds()
-    mid_y = 0.5 * (bounds[2] + bounds[3])
-    slice_mesh = native_volume_slice(volume, normal=(0.0, 1.0, 0.0), origin=(0.0, mid_y, 0.0))
+    slice_y = bounds[2] + float(args.heat_slice_fraction) * (bounds[3] - bounds[2])
+    slice_mesh = native_volume_slice(volume, normal=(0.0, 1.0, 0.0), origin=(0.0, slice_y, 0.0))
     query_points = np.asarray(vtk_to_numpy(slice_mesh.GetPoints().GetData()), dtype=np.float32)
     ground_truth = np.asarray(
         vtk_to_numpy(slice_mesh.GetPointData().GetArray("temperature")), dtype=np.float32
@@ -370,9 +399,34 @@ def prepare_bundle(args: argparse.Namespace) -> None:
 
     spec = TASKS[args.dataset]
     rankings = ranked_cases(args.per_case_metrics, str(spec["selection_metric"]))
-    if not rankings or int(rankings[0]["case_id"]) != args.run_id:
-        leader = None if not rankings else rankings[0]
-        raise ValueError(f"Case {args.run_id} is not the largest-gap candidate: {leader}")
+    constrained_selection = args.min_channels > 0 or args.waviness_category
+    eligible_ids: list[int] | None = None
+    if constrained_selection:
+        if args.dataset != "heat_exchanger":
+            raise ValueError("Geometry-constrained selection is currently defined only for heat exchange")
+        manifest = json.loads((args.data_root / "preprocessed_manifest.json").read_text())
+        eligible_ids = []
+        candidate_ids = list(manifest["validation_ids"])
+        if args.candidate_split == "all":
+            candidate_ids += list(manifest["train_ids"])
+        for case_id in candidate_ids:
+            parameters = json.loads(
+                (args.data_root / f"case_{int(case_id):05d}" / "case_metadata.json").read_text()
+            )["parameters"]
+            if len(parameters["channels"]) < args.min_channels:
+                continue
+            if args.waviness_category and parameters["waviness_category"] != args.waviness_category:
+                continue
+            eligible_ids.append(int(case_id))
+        if args.run_id not in eligible_ids:
+            raise ValueError(f"Case {args.run_id} does not satisfy the geometry constraints")
+    elif not rankings or args.run_id not in {
+        int(row["case_id"]) for row in rankings[: max(1, args.balanced_top_k)]
+    }:
+        leaders = rankings[: max(1, args.balanced_top_k)]
+        raise ValueError(
+            f"Case {args.run_id} is not in the allowed balanced low-error/large-gap pool: {leaders}"
+        )
     cfg, dataset, item, _ = dataset_context(args.config, args.data_root, args.run_id, args.seed)
     geometry, _, _, _, _, _, density = item
     budget = input_budget(cfg)
@@ -421,12 +475,33 @@ def prepare_bundle(args: argparse.Namespace) -> None:
         "dataset": args.dataset,
         "run_id": args.run_id,
         "selection": {
-            "rule": "largest Base-minus-DeAL mean error gap over every displayed shifted condition",
+            "rule": (
+                "geometry-constrained candidate pool whose generated native-query relative-L2 outputs "
+                "are ranked jointly for low DeAL error and a large Base-minus-DeAL gap"
+                if constrained_selection
+                else (
+                    "native-slice-readable selection from the top balanced candidates ranked by normalized "
+                    "distance to low DeAL relative error and large Base-minus-DeAL relative-error gap"
+                    if args.balanced_top_k > 1
+                    else "minimum normalized distance to low DeAL relative error and large Base-minus-DeAL relative-error gap"
+                )
+            ),
             "metric": spec["selection_metric"],
             "source": str(args.per_case_metrics.resolve()),
             "source_sha256": sha256(args.per_case_metrics),
-            "selected": rankings[0],
+            "selected": (
+                None
+                if constrained_selection
+                else next(row for row in rankings if int(row["case_id"]) == args.run_id)
+            ),
             "rankings": rankings,
+            "balanced_top_k": max(1, args.balanced_top_k),
+            "eligible_case_ids": eligible_ids,
+            "constraints": {
+                "minimum_channels": args.min_channels,
+                "waviness_category": args.waviness_category,
+                "candidate_split": args.candidate_split,
+            },
         },
         "conditions": [
             {"name": name, "encoder_source": source} for name, source in zip(names, sources)
@@ -437,6 +512,10 @@ def prepare_bundle(args: argparse.Namespace) -> None:
         "query_points": int(query_points.shape[0]),
         "field": spec["field"],
         "pump_slice_z": float(args.pump_slice_z) if args.dataset == "pump" else None,
+        "pump_slice_fraction": float(args.pump_slice_fraction) if args.dataset == "pump" else None,
+        "heat_slice_fraction": (
+            float(args.heat_slice_fraction) if args.dataset == "heat_exchanger" else None
+        ),
         "bundle": str(args.bundle.resolve()),
         "query_mesh": str(args.query_mesh.resolve()),
     }
